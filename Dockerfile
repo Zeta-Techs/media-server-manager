@@ -1,19 +1,21 @@
-# 使用 Alpine Linux 作为基础镜像
-FROM python:3.8-alpine
+FROM python:3.11.13-alpine3.22
 
-# 将工作目录设置为 /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
-# 将当前目录的内容复制到容器的 /app 目录中
-COPY . /app
+RUN addgroup -S -g 10001 msm && adduser -S -D -H -u 10001 -G msm msm
 
-# 安装需要的 Python 库
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 将启动脚本添加到镜像中
-COPY start.sh /start.sh
-RUN chmod +x /start.sh
+COPY . /app
+RUN mkdir -p /app/config \
+    && chown -R msm:msm /app \
+    && chmod +x /app/start.sh
 
-# 设置容器的启动命令
-ENTRYPOINT ["/start.sh"]
-CMD ["python", "chinese-localization-for-plex.py"]
+USER msm
+
+ENTRYPOINT ["/app/start.sh"]
+CMD ["python", "-m", "media_server_manager_web"]

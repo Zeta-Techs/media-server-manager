@@ -1,0 +1,751 @@
+from __future__ import annotations
+
+import json
+import os
+import secrets
+import shutil
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional
+
+from media_server_manager.core import CONFIG_DIR, TEMPLATE_TAGS_FILE, ServerConfig, split_skip_libraries
+
+SCHEMA_VERSION = 4
+DB_FILE = CONFIG_DIR / "media_server_manager.db"
+DEFAULT_USERNAME = "admin"
+
+
+class IncompatibleSchemaError(RuntimeError):
+    pass
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def new_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+class ManagedConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        result = super().__exit__(exc_type, exc_value, traceback)
+        self.close()
+        return result
+
+
+def connect(db_file: Path | None = None) -> sqlite3.Connection:
+    db_file = Path(db_file or DB_FILE)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_file, timeout=30, check_same_thread=False, factory=ManagedConnection)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+@contextmanager
+def get_db(db_file: Path | None = None) -> Iterator[sqlite3.Connection]:
+    conn = connect(db_file)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def row_to_dict(row: sqlite3.Row | None) -> Optional[Dict[str, Any]]:
+    return dict(row) if row is not None else None
+
+
+def rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
+    return [dict(row) for row in rows]
+
+
+def _existing_schema_version(db_file: Path) -> int | None:
+    if not db_file.exists() or db_file.stat().st_size == 0:
+        return None
+    uri = f"{db_file.resolve().as_uri()}?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True) as db:
+        db.row_factory = sqlite3.Row
+        tables = {
+            row["name"]
+            for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+        }
+        if not tables:
+            return None
+        if "schema_meta" not in tables:
+            raise IncompatibleSchemaError(
+                "检测到旧版数据库。请先运行 `python -m media_server_manager_admin reset-db --backup`。"
+            )
+        row = db.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
+        return int(row["version"]) if row else 0
+
+
+def init_db(db_file: Path | None = None) -> None:
+    db_file = Path(db_file or DB_FILE)
+    version = _existing_schema_version(db_file)
+    if version not in (None, 2, 3, SCHEMA_VERSION):
+        raise IncompatibleSchemaError(
+            f"数据库版本 {version} 与应用版本 {SCHEMA_VERSION} 不兼容。"
+            "请运行 `python -m media_server_manager_admin reset-db --backup`。"
+        )
+
+    with get_db(db_file) as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                ip_address TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_attempts_lookup
+                ON auth_attempts(username, ip_address, created_at);
+
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                token TEXT NOT NULL,
+                skip_libraries TEXT NOT NULL DEFAULT '',
+                pinyin_mode TEXT NOT NULL DEFAULT 'first_letter',
+                auth_source TEXT NOT NULL DEFAULT 'manual',
+                webhook_secret TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS oauth_flows (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                pin_id INTEGER NOT NULL,
+                token TEXT NOT NULL DEFAULT '',
+                resources TEXT NOT NULL DEFAULT '[]',
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                type TEXT NOT NULL,
+                server_id INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('queued','running','succeeded','failed','cancelled','interrupted')),
+                stage TEXT NOT NULL DEFAULT '',
+                current_library TEXT NOT NULL DEFAULT '',
+                total INTEGER NOT NULL DEFAULT 0,
+                processed INTEGER NOT NULL DEFAULT 0,
+                changes INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '{}',
+                worker_id TEXT NOT NULL DEFAULT '',
+                retry_of INTEGER,
+                created_at TEXT NOT NULL,
+                claimed_at TEXT,
+                started_at TEXT,
+                cancel_requested_at TEXT,
+                finished_at TEXT,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY(retry_of) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, id);
+            CREATE INDEX IF NOT EXISTS idx_jobs_server_status ON jobs(server_id, status);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_one_running_per_server
+                ON jobs(server_id) WHERE status = 'running';
+
+            CREATE TABLE IF NOT EXISTS job_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_job_logs_job_id ON job_logs(job_id, id);
+
+            CREATE TABLE IF NOT EXISTS worker_heartbeats (
+                worker_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                concurrency INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                schedule_type TEXT NOT NULL CHECK (schedule_type IN ('cron', 'interval')),
+                schedule_value TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                next_run_at TEXT,
+                last_run_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run_at);
+
+            CREATE TABLE IF NOT EXISTS change_sets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL,
+                server_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT '{}',
+                source_change_set_id INTEGER,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_change_set_id) REFERENCES change_sets(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                change_set_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL DEFAULT 0,
+                media_type TEXT NOT NULL DEFAULT '',
+                rating_key TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                field TEXT NOT NULL,
+                old_value TEXT NOT NULL DEFAULT 'null',
+                new_value TEXT NOT NULL DEFAULT 'null',
+                old_locked INTEGER,
+                apply_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (apply_status IN ('pending','applied','conflict','failed')),
+                apply_error TEXT NOT NULL DEFAULT '',
+                applied INTEGER NOT NULL DEFAULT 0,
+                rollback_status TEXT NOT NULL DEFAULT '',
+                rollback_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                applied_at TEXT,
+                rolled_back_at TEXT,
+                FOREIGN KEY(change_set_id) REFERENCES change_sets(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                UNIQUE(change_set_id, rating_key, field)
+            );
+
+            CREATE TABLE IF NOT EXISTS webhook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'received',
+                result TEXT NOT NULL DEFAULT '',
+                source_ip TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_events_created ON webhook_events(created_at);
+
+            CREATE TABLE IF NOT EXISTS webhook_rate_limits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                source_ip TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_webhook_rate_lookup
+                ON webhook_rate_limits(server_id, source_ip, created_at);
+
+            CREATE TABLE IF NOT EXISTS webhook_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                event TEXT NOT NULL,
+                action TEXT NOT NULL CHECK (action IN ('localize','notify','record')),
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS tag_mappings (
+                source TEXT PRIMARY KEY,
+                target TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS collection_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                match_field TEXT NOT NULL,
+                match_value TEXT NOT NULL,
+                collection_title TEXT NOT NULL,
+                title_sort_mode TEXT NOT NULL DEFAULT 'pinyin',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS collection_rule_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id INTEGER NOT NULL,
+                job_id INTEGER,
+                status TEXT NOT NULL,
+                matched_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(rule_id) REFERENCES collection_rules(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tag_suggestions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                field TEXT NOT NULL,
+                source TEXT NOT NULL,
+                suggested TEXT NOT NULL DEFAULT '',
+                count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                UNIQUE(server_id, field, source),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                channel_type TEXT NOT NULL DEFAULT 'webhook',
+                url TEXT NOT NULL,
+                events TEXT NOT NULL DEFAULT '[]',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS episode_match_overrides (
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                plex_rating_key TEXT NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(server_id, library_id, plex_rating_key),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS episode_audit_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'running',
+                options TEXT NOT NULL DEFAULT '{}',
+                total_shows INTEGER NOT NULL DEFAULT 0,
+                checked_shows INTEGER NOT NULL DEFAULT 0,
+                missing_count INTEGER NOT NULL DEFAULT 0,
+                unmatched_count INTEGER NOT NULL DEFAULT 0,
+                ambiguous_count INTEGER NOT NULL DEFAULT 0,
+                ignored_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS episode_audit_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                show_title TEXT NOT NULL,
+                plex_rating_key TEXT NOT NULL DEFAULT '',
+                tmdb_id INTEGER,
+                tmdb_title TEXT NOT NULL DEFAULT '',
+                match_source TEXT NOT NULL DEFAULT '',
+                season INTEGER,
+                episode INTEGER,
+                air_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL,
+                details TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES episode_audit_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS episode_audit_ignores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                show_title TEXT NOT NULL DEFAULT '',
+                plex_rating_key TEXT NOT NULL DEFAULT '',
+                tmdb_id INTEGER,
+                season INTEGER,
+                episode INTEGER,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS continue_watching_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                mode TEXT NOT NULL DEFAULT 'preview',
+                status TEXT NOT NULL DEFAULT 'running',
+                candidate_count INTEGER NOT NULL DEFAULT 0,
+                applied_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                finished_at TEXT,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS continue_watching_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                show_title TEXT NOT NULL DEFAULT '',
+                show_rating_key TEXT NOT NULL DEFAULT '',
+                episode_rating_key TEXT NOT NULL,
+                season INTEGER NOT NULL DEFAULT 0,
+                episode INTEGER NOT NULL DEFAULT 0,
+                episode_title TEXT NOT NULL DEFAULT '',
+                duration INTEGER NOT NULL DEFAULT 0,
+                planned_offset INTEGER NOT NULL DEFAULT 0,
+                current_offset INTEGER NOT NULL DEFAULT 0,
+                view_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'candidate',
+                result TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES continue_watching_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS tmdb_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tmdb_id INTEGER NOT NULL,
+                media_type TEXT NOT NULL CHECK (media_type IN ('movie','tv','season','episode')),
+                parent_tmdb_id INTEGER,
+                season_number INTEGER,
+                episode_number INTEGER,
+                title TEXT NOT NULL DEFAULT '',
+                original_title TEXT NOT NULL DEFAULT '',
+                release_date TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                overview TEXT NOT NULL DEFAULT '',
+                poster_path TEXT NOT NULL DEFAULT '',
+                backdrop_path TEXT NOT NULL DEFAULT '',
+                still_path TEXT NOT NULL DEFAULT '',
+                genres TEXT NOT NULL DEFAULT '[]',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                fetched_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL DEFAULT '',
+                checksum TEXT NOT NULL DEFAULT '',
+                UNIQUE(media_type, tmdb_id, season_number, episode_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tmdb_items_lookup ON tmdb_items(media_type, release_date, title);
+            CREATE INDEX IF NOT EXISTS idx_tmdb_items_parent ON tmdb_items(parent_tmdb_id, media_type);
+
+            CREATE TABLE IF NOT EXISTS tmdb_relations (
+                parent_id INTEGER NOT NULL,
+                child_id INTEGER NOT NULL,
+                parent_type TEXT NOT NULL,
+                child_type TEXT NOT NULL,
+                season_number INTEGER,
+                episode_number INTEGER,
+                PRIMARY KEY(parent_id, child_id, parent_type, child_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS tmdb_sync_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER,
+                media_types TEXT NOT NULL DEFAULT '[]',
+                filters TEXT NOT NULL DEFAULT '{}',
+                current_page INTEGER NOT NULL DEFAULT 0,
+                total_pages INTEGER NOT NULL DEFAULT 0,
+                processed INTEGER NOT NULL DEFAULT 0,
+                errors INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'queued',
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE SET NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tmdb_sync_pages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                media_type TEXT NOT NULL,
+                page INTEGER NOT NULL,
+                checksum TEXT NOT NULL DEFAULT '',
+                fetched_at TEXT NOT NULL,
+                UNIQUE(run_id, media_type, page),
+                FOREIGN KEY(run_id) REFERENCES tmdb_sync_runs(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS tmdb_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_type TEXT NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                season_number INTEGER,
+                episode_number INTEGER,
+                image_type TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                cache_path TEXT NOT NULL,
+                mime_type TEXT NOT NULL DEFAULT 'image/jpeg',
+                checksum TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                updated_at TEXT NOT NULL,
+                UNIQUE(media_type, tmdb_id, season_number, episode_number, image_type)
+            );
+
+            CREATE TABLE IF NOT EXISTS plex_inventory_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                rating_key TEXT NOT NULL,
+                plex_type TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                year INTEGER,
+                parent_rating_key TEXT NOT NULL DEFAULT '',
+                season_number INTEGER,
+                episode_number INTEGER,
+                tmdb_id INTEGER,
+                imdb_id TEXT NOT NULL DEFAULT '',
+                tvdb_id TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                scanned_at TEXT NOT NULL,
+                UNIQUE(server_id, library_id, rating_key),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_plex_inventory_ids ON plex_inventory_items(server_id, tmdb_id, plex_type);
+
+            CREATE TABLE IF NOT EXISTS media_match_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_type TEXT NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                season_number INTEGER,
+                episode_number INTEGER,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER,
+                status TEXT NOT NULL,
+                match_source TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                plex_rating_key TEXT NOT NULL DEFAULT '',
+                details TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(media_type, tmdb_id, season_number, episode_number, server_id, library_id),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_match_status ON media_match_results(server_id, status, media_type);
+
+            CREATE TABLE IF NOT EXISTS anime_seasons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                year INTEGER NOT NULL,
+                quarter TEXT NOT NULL CHECK (quarter IN ('Q1','Q2','Q3','Q4')),
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'historical',
+                sync_policy TEXT NOT NULL DEFAULT 'weekly',
+                last_synced_at TEXT,
+                next_sync_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(year, quarter)
+            );
+
+            CREATE TABLE IF NOT EXISTS anime_season_items (
+                season_id INTEGER NOT NULL,
+                tmdb_id INTEGER NOT NULL,
+                discover_rank INTEGER NOT NULL DEFAULT 0,
+                popularity REAL NOT NULL DEFAULT 0,
+                vote_average REAL NOT NULL DEFAULT 0,
+                first_discovered_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(season_id, tmdb_id),
+                FOREIGN KEY(season_id) REFERENCES anime_seasons(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS anime_manual_overrides (
+                tmdb_id INTEGER PRIMARY KEY,
+                year INTEGER NOT NULL,
+                quarter TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS anime_show_schedule (
+                tmdb_id INTEGER PRIMARY KEY,
+                last_aired_episode_date TEXT,
+                last_aired_season INTEGER,
+                last_aired_episode INTEGER,
+                next_air_date TEXT,
+                next_air_season INTEGER,
+                next_air_episode INTEGER,
+                schedule_source TEXT NOT NULL DEFAULT 'tmdb',
+                last_schedule_checked_at TEXT,
+                next_sync_at TEXT,
+                active_until TEXT,
+                sync_mode TEXT NOT NULL DEFAULT 'history_weekly',
+                schedule_status TEXT NOT NULL DEFAULT 'unknown',
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_anime_schedule_due ON anime_show_schedule(next_sync_at);
+
+            CREATE TABLE IF NOT EXISTS anime_sync_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tmdb_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                scheduled_at TEXT NOT NULL,
+                executed_at TEXT,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                error TEXT NOT NULL DEFAULT '',
+                job_id INTEGER,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_anime_sync_events_due ON anime_sync_events(status, scheduled_at);
+
+            CREATE TABLE IF NOT EXISTS anime_match_results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tmdb_id INTEGER NOT NULL,
+                media_type TEXT NOT NULL CHECK (media_type IN ('tv','season','episode')),
+                season_number INTEGER,
+                episode_number INTEGER,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER,
+                status TEXT NOT NULL,
+                match_source TEXT NOT NULL DEFAULT '',
+                confidence REAL NOT NULL DEFAULT 0,
+                plex_rating_key TEXT NOT NULL DEFAULT '',
+                details TEXT NOT NULL DEFAULT '{}',
+                updated_at TEXT NOT NULL,
+                UNIQUE(tmdb_id, media_type, season_number, episode_number, server_id, library_id),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_anime_match_lookup ON anime_match_results(server_id, status, tmdb_id);
+            """
+        )
+        db.execute(
+            "INSERT INTO schema_meta (id, version, created_at) VALUES (1, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET version = excluded.version",
+            (SCHEMA_VERSION, utcnow()),
+        )
+        _seed_tags(db)
+    try:
+        os.chmod(db_file, 0o600)
+    except OSError:
+        pass
+
+
+def _seed_tags(db: sqlite3.Connection) -> None:
+    count = db.execute("SELECT COUNT(*) AS count FROM tag_mappings").fetchone()["count"]
+    if count or not TEMPLATE_TAGS_FILE.exists():
+        return
+    tags = json.loads(TEMPLATE_TAGS_FILE.read_text(encoding="utf-8"))
+    db.executemany(
+        "INSERT INTO tag_mappings (source, target) VALUES (?, ?)",
+        [(str(source), str(target)) for source, target in tags.items()],
+    )
+
+
+def reset_database(db_file: Path | None = None, backup: bool = True) -> Path | None:
+    db_file = Path(db_file or DB_FILE)
+    backup_path: Path | None = None
+    if db_file.exists():
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup_path = db_file.with_name(f"{db_file.name}.backup-{stamp}")
+        if backup:
+            shutil.move(str(db_file), str(backup_path))
+        else:
+            db_file.unlink()
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{db_file}{suffix}")
+        if sidecar.exists():
+            if backup and backup_path is not None:
+                shutil.move(str(sidecar), f"{backup_path}{suffix}")
+            else:
+                sidecar.unlink()
+    init_db(db_file)
+    return backup_path
+
+
+def server_config_from_row(
+    row: sqlite3.Row | Dict[str, Any], db_file: Path | None = None
+) -> ServerConfig:
+    data = dict(row)
+    client_identifier = get_setting("plex_client_identifier", db_file) or "media-server-manager"
+    return ServerConfig(
+        name=data.get("name", ""),
+        address=data["address"],
+        token=data["token"],
+        skip_libraries=split_skip_libraries(data.get("skip_libraries", "")),
+        pinyin_mode=data.get("pinyin_mode", "first_letter"),
+        client_identifier=client_identifier,
+    )
+
+
+def decode_payload(value: str | None) -> Dict[str, Any]:
+    try:
+        payload = json.loads(value or "{}")
+        return payload if isinstance(payload, dict) else {}
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def get_setting(key: str, db_file: Path | None = None) -> str:
+    with get_db(db_file) as db:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else ""
+
+
+def set_setting(key: str, value: str, db_file: Path | None = None) -> None:
+    with get_db(db_file) as db:
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+
+def load_tags(db_file: Path | None = None) -> Dict[str, str]:
+    with get_db(db_file) as db:
+        rows = db.execute("SELECT source, target FROM tag_mappings ORDER BY source").fetchall()
+    return {row["source"]: row["target"] for row in rows}
+
+
+def save_tags(tags: Dict[str, str], db_file: Path | None = None) -> None:
+    with get_db(db_file) as db:
+        db.execute("DELETE FROM tag_mappings")
+        db.executemany(
+            "INSERT INTO tag_mappings (source, target) VALUES (?, ?)",
+            sorted((source, target) for source, target in tags.items()),
+        )
+
+

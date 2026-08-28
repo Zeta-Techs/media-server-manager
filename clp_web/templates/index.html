@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CLP WebUI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  </head>
+  <body>
+    <div id="auth-screen" class="auth-screen" hidden>
+      <form id="auth-form" class="auth-panel">
+        <h1>CLP WebUI</h1>
+        <p id="auth-copy"></p>
+        <label>
+          用户名
+          <input name="username" autocomplete="username" value="admin">
+        </label>
+        <label>
+          密码
+          <input name="password" type="password" autocomplete="current-password">
+        </label>
+        <button type="submit" class="primary">进入</button>
+        <div id="auth-error" class="error"></div>
+      </form>
+    </div>
+
+    <div id="app" class="app" hidden>
+      <header class="sidebar topbar" role="banner">
+        <a class="brand" href="#" aria-label="CLP 概览" data-view="overview">
+          <span class="brand-mark" aria-hidden="true">C</span>
+          <span class="brand-copy"><strong>CLP</strong><small>Chinese Localization for Plex</small></span>
+        </a>
+        <nav aria-label="主导航">
+          <button class="nav active" data-view="overview"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#layout-dashboard"></use></svg>概览</button>
+          <button class="nav" data-view="servers"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#server"></use></svg>服务器</button>
+          <button class="nav" data-view="localization"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#languages"></use></svg>本地化</button>
+          <button class="nav" data-view="jobs"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#list-checks"></use></svg>任务中心</button>
+          <button class="nav" data-view="automation"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#workflow"></use></svg>自动化</button>
+          <button class="nav" data-view="tools"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#library"></use></svg>媒体库工具</button>
+          <button class="nav" data-view="system"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#settings-2"></use></svg>系统</button>
+        </nav>
+        <div class="topbar-actions">
+          <span id="topbar-worker" class="topbar-status"><span class="status-dot" aria-hidden="true"></span>Worker 检查中</span>
+          <button id="logout" class="ghost" aria-label="退出登录" title="退出登录"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#log-out"></use></svg><span>退出</span></button>
+        </div>
+      </header>
+
+      <main class="content">
+        <section id="view-overview" class="view active">
+          <div class="toolbar hero-band">
+            <div>
+              <span class="eyebrow">CLP CONTROL ROOM</span>
+              <h2>概览</h2>
+              <p>查看服务器、任务和自动化运行状态。</p>
+            </div>
+            <div class="hero-actions">
+              <span class="hero-art" aria-hidden="true"><i></i><i></i><i></i></span>
+              <button id="refresh-overview" type="button" class="icon-button" aria-label="刷新概览" title="刷新概览"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#refresh-cw"></use></svg><span>刷新</span></button>
+            </div>
+          </div>
+          <div id="overview-cards" class="metric-grid"></div>
+          <section class="shelf-section" aria-labelledby="overview-media-title">
+            <div class="shelf-heading">
+              <div><span class="eyebrow">PLEX LIBRARY</span><h3 id="overview-media-title">最近加入</h3></div>
+              <span class="shelf-caption">来自已启用服务器</span>
+            </div>
+            <div id="overview-media" class="media-shelf" aria-live="polite"></div>
+          </section>
+          <div class="split">
+            <div class="panel shelf-panel">
+              <h3>最近任务</h3>
+              <div id="overview-recent-jobs" class="list"></div>
+            </div>
+            <div class="panel shelf-panel">
+              <h3>需要关注</h3>
+              <div id="overview-alerts" class="list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-servers" class="view">
+          <div class="toolbar">
+            <div>
+              <h2>服务器</h2>
+              <p>添加 Plex 服务器、测试连接、管理跳过媒体库。</p>
+            </div>
+            <div class="button-row">
+              <button id="plex-oauth-start" class="primary" type="button">使用 Plex 授权添加</button>
+              <button id="new-server" type="button">手动新增</button>
+            </div>
+          </div>
+          <div id="oauth-panel" class="panel oauth-panel" hidden>
+            <h3>Plex 授权导入</h3>
+            <p id="oauth-message">点击授权后会打开 Plex 登录页面，完成后回到这里选择服务器。</p>
+            <div id="oauth-server-list" class="list"></div>
+          </div>
+          <div class="split">
+            <div class="panel">
+              <h3>已保存服务器</h3>
+              <div id="server-list" class="list"></div>
+            </div>
+            <form id="server-form" class="panel">
+              <h3>服务器详情</h3>
+              <input type="hidden" name="id">
+              <label>名称<input name="name" placeholder="Plex Server"></label>
+              <label>地址<input name="address" placeholder="http://127.0.0.1:32400"></label>
+              <label>Token<input name="token" type="password" placeholder="X-Plex-Token"></label>
+              <label>拼音模式
+                <select name="pinyin_mode">
+                  <option value="first_letter">首字母</option>
+                  <option value="full_spell">全拼</option>
+                </select>
+              </label>
+              <details class="advanced">
+                <summary>高级：跳过媒体库</summary>
+                <label>跳过媒体库<input name="skip_libraries" placeholder="库名1；库名2"></label>
+                <div class="button-row">
+                  <button id="load-server-libraries" type="button">拉取媒体库</button>
+                </div>
+                <div id="server-library-list" class="check-list"></div>
+              </details>
+              <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+              <div class="button-row">
+                <button type="submit" class="primary">保存</button>
+                <button type="button" id="test-server">测试连接</button>
+                <button type="button" id="copy-server-webhook">复制 Webhook URL</button>
+                <button type="button" id="rotate-server-webhook">轮换 Webhook 密钥</button>
+                <button type="button" id="delete-server" class="danger">删除</button>
+              </div>
+              <div id="server-message" class="message"></div>
+            </form>
+          </div>
+        </section>
+
+        <section id="view-localization" class="view">
+          <div class="toolbar">
+            <div>
+              <h2>本地化</h2>
+              <p>创建本地化任务，维护标签映射和标签推荐。</p>
+            </div>
+          </div>
+          <div class="tabs">
+            <button class="tab active" data-tab="localize-task">任务向导</button>
+            <button class="tab" data-tab="tag-map">标签映射</button>
+            <button class="tab" data-tab="tag-suggest">标签推荐</button>
+          </div>
+
+          <div id="tab-localize-task" class="tab-panel active">
+            <form id="localize-form" class="panel">
+              <h3>创建本地化任务</h3>
+              <div class="form-grid">
+                <label>服务器<select id="localize-server" name="server_id"></select></label>
+                <label>模式
+                  <select name="mode">
+                    <option value="dry_run">仅预览</option>
+                    <option value="apply">确认执行</option>
+                  </select>
+                </label>
+              </div>
+              <div class="button-row">
+                <button id="localize-load-libraries" type="button">选择媒体库</button>
+                <button id="localize-all-preset" type="button">使用全量预设</button>
+              </div>
+              <div id="localize-library-list" class="check-list"></div>
+              <div class="form-grid">
+                <label>添加时间
+                  <select id="localize-added-filter" name="added_filter">
+                    <option value="">全部媒体</option>
+                    <option value="1">最近 1 天</option>
+                    <option value="3">最近 3 天</option>
+                    <option value="5">最近 5 天</option>
+                    <option value="7">最近 7 天</option>
+                    <option value="custom">自定义天数</option>
+                  </select>
+                </label>
+                <label id="localize-custom-days-row" hidden>自定义天数<input id="localize-custom-days" name="custom_days" type="number" min="1" step="1" placeholder="例如 14"></label>
+              </div>
+              <details class="advanced">
+                <summary>高级筛选</summary>
+                <div class="form-grid">
+                  <label>媒体库 ID<input name="library_ids" placeholder="留空为全部；多个用逗号"></label>
+                  <label>媒体类型<input name="media_types" placeholder="movie, show, artist"></label>
+                </div>
+              </details>
+              <div class="check-row">
+                <label class="check"><input name="field_titleSort" type="checkbox" checked> 标题排序</label>
+                <label class="check"><input name="field_genre" type="checkbox" checked> Genre</label>
+                <label class="check"><input name="field_style" type="checkbox" checked> Style</label>
+                <label class="check"><input name="field_mood" type="checkbox" checked> Mood</label>
+                <label class="check"><input name="field_collections" type="checkbox" checked> 合集标题排序</label>
+              </div>
+              <button type="submit" class="primary">创建任务</button>
+              <div id="localize-message" class="message"></div>
+            </form>
+          </div>
+
+          <div id="tab-tag-map" class="tab-panel">
+            <div class="toolbar compact-toolbar">
+              <div>
+                <h3>标签映射</h3>
+                <p>编辑英文标签到中文标签的映射。</p>
+              </div>
+              <div class="button-row">
+                <button id="add-tag" type="button">添加标签</button>
+                <button id="save-tags" class="primary" type="button">保存标签</button>
+              </div>
+            </div>
+            <div class="panel tag-tools">
+              <label>搜索标签<input id="tag-search" placeholder="输入英文或中文标签"></label>
+              <details class="advanced">
+                <summary>高级：JSON 导入/导出</summary>
+                <div class="button-row">
+                  <button id="export-tags-json" type="button">导出 JSON</button>
+                  <button id="toggle-tags-json" type="button">导入 JSON</button>
+                </div>
+                <textarea id="tags-editor" spellcheck="false" hidden></textarea>
+              </details>
+            </div>
+            <div class="panel">
+              <div id="tags-table" class="tag-table"></div>
+            </div>
+            <div id="tags-message" class="message"></div>
+          </div>
+
+          <div id="tab-tag-suggest" class="tab-panel">
+            <div class="panel tag-tools">
+              <h3>标签推荐</h3>
+              <div class="button-row">
+                <select id="tag-suggestion-server"></select>
+                <button id="scan-tag-suggestions" type="button">扫描未映射标签</button>
+                <button id="add-selected-suggestions" type="button">加入选中推荐</button>
+              </div>
+              <div id="tag-suggestions" class="list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-jobs" class="view">
+          <div class="toolbar">
+            <div>
+              <h2>任务中心</h2>
+              <p>查看后台任务、实时日志、变更记录和回滚。</p>
+            </div>
+            <button id="refresh-jobs" type="button">刷新任务</button>
+          </div>
+          <div class="split jobs-layout">
+            <div class="panel">
+              <h3>任务历史</h3>
+              <div id="job-list" class="list"></div>
+            </div>
+            <div class="panel log-panel">
+              <div class="job-head">
+                <h3 id="job-title">实时进度</h3>
+                <button id="cancel-job" class="danger small">取消排队</button>
+                <button id="retry-job" class="small" disabled>重试</button>
+              </div>
+              <div class="progress">
+                <div><span>状态</span><strong id="job-status">-</strong></div>
+                <div><span>媒体库</span><strong id="job-library">-</strong></div>
+                <div><span>进度</span><strong id="job-progress">-</strong></div>
+                <div><span>变更</span><strong id="job-changes">0</strong></div>
+                <div><span>错误</span><strong id="job-errors">0</strong></div>
+              </div>
+              <pre id="job-logs" class="logs"></pre>
+              <h3>变更记录</h3>
+              <div class="button-row">
+                <button id="load-changes" type="button">查看变更</button>
+                <button id="apply-preview-job" class="primary" type="button">执行此预览</button>
+                <button id="rollback-job" class="danger" type="button">回滚该任务</button>
+              </div>
+              <div id="job-changes-list" class="list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-automation" class="view">
+          <div class="toolbar">
+            <div>
+              <h2>自动化</h2>
+              <p>配置定时任务、Webhook 规则和通知渠道。</p>
+            </div>
+          </div>
+          <div class="tabs">
+            <button class="tab active" data-tab="schedule">定时</button>
+            <button class="tab" data-tab="webhook">Webhook</button>
+            <button class="tab" data-tab="notification">通知</button>
+          </div>
+
+          <div id="tab-schedule" class="tab-panel active">
+            <div class="split">
+              <form id="schedule-form" class="panel">
+                <h3>定时本地化</h3>
+                <input type="hidden" name="id">
+                <label>名称<input name="name" placeholder="每天晚上处理"></label>
+                <label>服务器<select name="server_id"></select></label>
+                <label>任务模式
+                  <select name="task_mode">
+                    <option value="apply">确认执行</option>
+                    <option value="dry_run">仅预览</option>
+                  </select>
+                </label>
+                <label>频率
+                  <select id="schedule-mode" name="mode">
+                    <option value="daily">每天</option>
+                    <option value="weekly">每周</option>
+                    <option value="monthly">每月</option>
+                    <option value="interval">每隔一段时间</option>
+                    <option value="cron">自定义 Cron</option>
+                  </select>
+                </label>
+                <div id="schedule-time-fields">
+                  <label>时间<input id="schedule-time" type="time" value="22:30"></label>
+                </div>
+                <div id="schedule-weekly-fields" hidden>
+                  <label>星期
+                    <select id="schedule-weekday">
+                      <option value="mon">周一</option>
+                      <option value="tue">周二</option>
+                      <option value="wed">周三</option>
+                      <option value="thu">周四</option>
+                      <option value="fri">周五</option>
+                      <option value="sat">周六</option>
+                      <option value="sun">周日</option>
+                    </select>
+                  </label>
+                </div>
+                <div id="schedule-monthly-fields" hidden>
+                  <label>日期<input id="schedule-day" type="number" min="1" max="31" value="1"></label>
+                </div>
+                <div id="schedule-interval-fields" hidden>
+                  <label>间隔数值<input id="schedule-interval-number" type="number" min="1" value="3"></label>
+                  <label>单位
+                    <select id="schedule-interval-unit">
+                      <option value="hours">小时</option>
+                      <option value="minutes">分钟</option>
+                    </select>
+                  </label>
+                </div>
+                <details id="schedule-cron-fields" class="advanced" hidden>
+                  <summary>高级：Cron 表达式</summary>
+                  <label>Cron 表达式<input id="schedule-cron" placeholder="30 22 * * *"></label>
+                </details>
+                <input type="hidden" name="schedule_type">
+                <input type="hidden" name="schedule_value">
+                <p id="schedule-preview" class="hint"></p>
+                <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+                <button type="submit" class="primary">保存定时任务</button>
+                <div id="schedule-message" class="message"></div>
+              </form>
+              <div class="panel">
+                <h3>定时任务</h3>
+                <div id="schedule-list" class="list"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="tab-webhook" class="tab-panel">
+            <div id="webhook-list" class="grid-list"></div>
+            <div class="split">
+              <form id="webhook-rule-form" class="panel">
+                <h3>Webhook 规则</h3>
+                <input type="hidden" name="id">
+                <label>服务器<select id="webhook-rule-server" name="server_id"></select></label>
+                <label>事件<input name="event" value="library.new"></label>
+                <label>动作
+                  <select name="action">
+                    <option value="localize">新增媒体自动本地化</option>
+                    <option value="notify">发送通知</option>
+                    <option value="record">仅记录</option>
+                  </select>
+                </label>
+                <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+                <button type="submit" class="primary">保存规则</button>
+                <div id="webhook-rule-message" class="message"></div>
+              </form>
+              <div class="panel">
+                <h3>事件历史</h3>
+                <div id="webhook-events" class="list"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="tab-notification" class="tab-panel">
+            <div class="split">
+              <form id="notification-form" class="panel">
+                <h3>通知渠道</h3>
+                <input type="hidden" name="id">
+                <label>名称<input name="name" placeholder="家庭自动化 Webhook"></label>
+                <label>Webhook URL<input name="url" placeholder="https://example.com/webhook"></label>
+                <div class="check-row">
+                  <label class="check"><input name="event_job_succeeded" type="checkbox" checked> 任务成功</label>
+                  <label class="check"><input name="event_job_failed" type="checkbox" checked> 任务失败</label>
+                  <label class="check"><input name="event_webhook_event" type="checkbox"> Webhook 事件</label>
+                </div>
+                <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+                <button type="submit" class="primary">保存通知渠道</button>
+                <div id="notification-message" class="message"></div>
+              </form>
+              <div class="panel">
+                <h3>已配置渠道</h3>
+                <div id="notification-list" class="list"></div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-tools" class="view">
+          <div class="toolbar">
+            <div>
+              <h2>媒体库工具</h2>
+              <p>运行 Plex 维护操作、生成合集命中报告，并检查电视剧缺集。</p>
+            </div>
+          </div>
+          <div class="tabs">
+            <button class="tab active" data-tab="maintenance">维护</button>
+            <button class="tab" data-tab="collections">合集命中</button>
+            <button class="tab" data-tab="continue-watching">继续观看</button>
+            <button class="tab" data-tab="episode-audit">缺集检查</button>
+          </div>
+
+          <div id="tab-maintenance" class="tab-panel active">
+            <form id="maintenance-form" class="panel">
+              <h3>媒体库维护</h3>
+              <div class="form-grid">
+                <label>服务器<select id="maintenance-server" name="server_id"></select></label>
+                <label>操作
+                  <select name="action">
+                    <option value="scan_library">扫描媒体库</option>
+                    <option value="refresh_metadata">刷新单个项目元数据</option>
+                    <option value="analyze_metadata">分析单个项目</option>
+                  </select>
+                </label>
+              </div>
+              <div class="button-row">
+                <button id="maintenance-load-libraries" type="button">选择媒体库</button>
+              </div>
+              <div id="maintenance-library-list" class="check-list"></div>
+              <details class="advanced">
+                <summary>高级：单个项目操作</summary>
+                <div class="form-grid">
+                  <label>媒体库 ID<input name="library_id" placeholder="扫描媒体库时填写"></label>
+                  <label>Rating Key<input name="rating_key" placeholder="刷新/分析项目时填写"></label>
+                </div>
+              </details>
+              <button type="submit" class="primary">加入任务队列</button>
+              <div id="maintenance-message" class="message"></div>
+            </form>
+          </div>
+
+          <div id="tab-collections" class="tab-panel">
+            <div class="notice">当前合集功能用于生成命中报告，尚不会直接写入或创建 Plex 合集。</div>
+            <div class="split">
+              <form id="collection-form" class="panel">
+                <h3>合集命中规则</h3>
+                <input type="hidden" name="id">
+                <label>规则名称<input name="name" placeholder="动作电影合集"></label>
+                <label>服务器<select id="collection-server" name="server_id"></select></label>
+                <label>媒体库 ID<input name="library_id" placeholder="例如 1"></label>
+                <label>匹配字段
+                  <select name="match_field">
+                    <option value="title">标题</option>
+                    <option value="genre">Genre</option>
+                    <option value="style">Style</option>
+                    <option value="mood">Mood</option>
+                  </select>
+                </label>
+                <label>匹配关键词<input name="match_value" placeholder="Action"></label>
+                <label>报告名称<input name="collection_title" placeholder="动作电影"></label>
+                <label class="check"><input name="enabled" type="checkbox" checked> 启用</label>
+                <div class="button-row">
+                  <button type="submit" class="primary">保存规则</button>
+                  <button id="preview-collection" type="button">预览命中</button>
+                  <button id="run-collection" type="button">生成命中报告</button>
+                </div>
+                <div id="collection-message" class="message"></div>
+              </form>
+              <div class="panel">
+                <h3>命中规则</h3>
+                <div id="collection-list" class="list"></div>
+                <h3>预览结果</h3>
+                <div id="collection-preview" class="list"></div>
+              </div>
+            </div>
+          </div>
+
+          <div id="tab-continue-watching" class="tab-panel">
+            <div class="notice">该工具会通过写入少量播放进度来尝试触发 Plex 继续观看，Plex 首页可能需要刷新后才显示。</div>
+            <div class="split">
+              <form id="continue-watching-form" class="panel">
+                <h3>生成继续观看候选</h3>
+                <div class="form-grid">
+                  <label>服务器<select id="continue-watching-server" name="server_id"></select></label>
+                  <label>电视剧库<input name="library_id" readonly placeholder="请选择电视剧库"></label>
+                </div>
+                <div class="button-row">
+                  <button id="continue-watching-load-libraries" type="button">选择电视剧库</button>
+                </div>
+                <div id="continue-watching-library-list" class="check-list"></div>
+                <button type="submit" class="primary">生成候选</button>
+                <div id="continue-watching-message" class="message"></div>
+              </form>
+              <div class="panel">
+                <h3>历史记录</h3>
+                <div id="continue-watching-runs" class="list"></div>
+              </div>
+            </div>
+            <div class="panel compact-toolbar">
+              <div class="toolbar compact">
+                <div>
+                  <h3>候选剧集</h3>
+                  <p>勾选后执行，CLP 会尝试把这些剧集加入 Plex 继续观看。</p>
+                </div>
+                <button id="continue-watching-apply" class="primary" type="button">执行选中候选</button>
+              </div>
+              <div id="continue-watching-items" class="list"></div>
+            </div>
+          </div>
+
+          <div id="tab-episode-audit" class="tab-panel">
+            <div class="split">
+              <form id="episode-audit-form" class="panel">
+                <h3>剧集缺失检查</h3>
+                <label>TMDB API Key<input id="tmdb-api-key" name="api_key" type="password" placeholder="粘贴 TMDB API Key"></label>
+                <div class="button-row">
+                  <button id="save-tmdb-key" type="button">保存 TMDB Key</button>
+                  <span id="tmdb-key-status" class="meta"></span>
+                </div>
+                <div class="form-grid">
+                  <label>服务器<select id="episode-audit-server" name="server_id"></select></label>
+                  <label>电视剧库<input name="library_id" readonly placeholder="请选择电视剧库"></label>
+                </div>
+                <div class="button-row">
+                  <button id="episode-audit-load-libraries" type="button">选择电视剧库</button>
+                </div>
+                <div id="episode-audit-library-list" class="check-list"></div>
+                <div class="check-row">
+                  <label class="check"><input name="ignore_specials" type="checkbox" checked> 忽略特别篇第 0 季</label>
+                  <label class="check"><input name="ignore_future" type="checkbox" checked> 忽略未来播出集</label>
+                  <label class="check"><input name="only_ended" type="checkbox"> 只检查已完结剧</label>
+                </div>
+                <button type="submit" class="primary">开始检查</button>
+                <div id="episode-audit-message" class="message"></div>
+              </form>
+              <div class="panel">
+                <h3>检查历史</h3>
+                <div id="episode-audit-runs" class="list"></div>
+              </div>
+            </div>
+            <div class="panel">
+              <div class="toolbar compact">
+                <div>
+                  <h3>检查结果</h3>
+                  <p id="episode-audit-summary">选择一次检查查看缺失剧集。</p>
+                </div>
+                <div class="button-row">
+                  <input id="episode-audit-search" placeholder="搜索剧名">
+                  <label class="check inline-check"><input id="episode-audit-only-missing" type="checkbox" checked> 只看有缺失</label>
+                  <label class="check inline-check"><input id="episode-audit-show-complete" type="checkbox"> 显示完整剧</label>
+                  <label class="check inline-check"><input id="episode-audit-show-ignored" type="checkbox" checked> 显示已忽略</label>
+                  <button id="export-episode-audit-json" type="button">导出 JSON</button>
+                  <button id="export-episode-audit-csv" type="button">导出 CSV</button>
+                </div>
+              </div>
+              <div id="episode-audit-report" class="list"></div>
+              <details class="advanced">
+                <summary>高级：查看明细列表</summary>
+                <div class="button-row">
+                  <select id="episode-audit-status-filter">
+                    <option value="">全部状态</option>
+                    <option value="present">已有</option>
+                    <option value="missing">缺失</option>
+                    <option value="ignored_missing">已忽略缺失</option>
+                    <option value="ignored_show">已忽略整部剧</option>
+                    <option value="unmatched_show">未匹配</option>
+                    <option value="ambiguous_match">低置信度</option>
+                  </select>
+                </div>
+                <div id="episode-audit-items" class="list"></div>
+              </details>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-system" class="view">
+          <div class="toolbar">
+            <div>
+              <h2>系统</h2>
+              <p>诊断连接、队列、定时任务和数据库状态。</p>
+            </div>
+            <button id="run-diagnostics" class="primary" type="button">运行诊断</button>
+          </div>
+          <form id="password-form" class="panel">
+            <h3>修改管理员密码</h3>
+            <div class="form-grid">
+              <label>当前密码<input name="current_password" type="password" autocomplete="current-password"></label>
+              <label>新密码<input name="new_password" type="password" minlength="10" autocomplete="new-password"></label>
+            </div>
+            <button type="submit" class="primary">修改密码</button>
+            <div id="password-message" class="message"></div>
+          </form>
+          <div id="diagnostics-list" class="grid-list"></div>
+        </section>
+      </main>
+    </div>
+
+    <script>
+      window.CLP_INITIALIZED = {{ 'true' if initialized else 'false' }};
+    </script>
+    <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>
