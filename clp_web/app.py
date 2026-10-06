@@ -879,15 +879,48 @@ def create_app() -> Flask:
     def update_library_settings(server_id: int, library_id: int):
         data = request.get_json(force=True) or {}
         mode = str(data.get("animation_mode") or "auto")
+        sort_key = data.get("sort_key")
+        sort_direction = data.get("sort_direction")
         if mode not in {"auto", "animation", "normal"}:
             return api_error("动画媒体库模式无效", "invalid_animation_mode", 400)
+        allowed_sort_keys = {"name", "original_title", "year", "added_at", "release_date", "first_episode_date", "latest_added_at", "rating", "audience_rating", "duration", "season_count", "episode_count", "content_rating", "genre"}
+        if sort_key is not None and str(sort_key) not in allowed_sort_keys:
+            return api_error("媒体库排序字段无效", "invalid_media_library_sort", 400)
+        if sort_direction is not None and str(sort_direction) not in {"asc", "desc"}:
+            return api_error("媒体库排序方向无效", "invalid_media_library_sort_direction", 400)
         with connect() as db:
-            library = db.execute("SELECT title, plex_type FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            library = db.execute("SELECT title, plex_type, display_order FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
             if library is None:
                 return api_error("媒体库尚未同步，请先从媒体服务器重新拉取", "library_cache_missing", 404)
-            db.execute("UPDATE media_libraries SET animation_mode = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (mode, utcnow(), server_id, library_id))
+            assignments = ["animation_mode = ?", "updated_at = ?"]
+            values = [mode, utcnow()]
+            if sort_key is not None:
+                assignments.append("sort_key = ?"); values.append(str(sort_key))
+            if sort_direction is not None:
+                assignments.append("sort_direction = ?"); values.append(str(sort_direction))
+            values.extend([server_id, library_id])
+            db.execute(f"UPDATE media_libraries SET {', '.join(assignments)} WHERE server_id = ? AND library_id = ?", values)
             db.commit()
-        return jsonify({"ok": True, "animation_mode": mode, "is_animation": _library_is_animation(mode, library["title"], library["plex_type"])})
+        return jsonify({"ok": True, "animation_mode": mode, "sort_key": sort_key, "sort_direction": sort_direction, "is_animation": _library_is_animation(mode, library["title"], library["plex_type"])})
+
+    @servers_bp.put("/api/servers/<int:server_id>/media-library/order")
+    @login_required
+    def update_media_library_order(server_id: int):
+        data = request.get_json(force=True) or {}
+        order = data.get("order") or []
+        if not isinstance(order, list) or any(str(item).strip() == "" for item in order):
+            return api_error("媒体库顺序无效", "invalid_media_library_order", 400)
+        with connect() as db:
+            existing = {int(row["library_id"]) for row in db.execute("SELECT library_id FROM media_libraries WHERE server_id = ?", (server_id,)).fetchall()}
+            try:
+                requested = [int(item) for item in order]
+            except (TypeError, ValueError):
+                return api_error("媒体库顺序无效", "invalid_media_library_order", 400)
+            if set(requested) != existing or len(requested) != len(existing):
+                return api_error("媒体库顺序必须包含全部媒体库", "invalid_media_library_order", 400)
+            db.executemany("UPDATE media_libraries SET display_order = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", [(index, utcnow(), server_id, library_id) for index, library_id in enumerate(requested)])
+            db.commit()
+        return jsonify({"ok": True, "order": requested})
 
     @servers_bp.get("/api/servers/<int:server_id>/media-image")
     @login_required
@@ -928,7 +961,7 @@ def create_app() -> Flask:
                                       jobs.current_library AS job_current_library, jobs.processed AS job_processed,
                                       jobs.total AS job_total, jobs.error AS job_error
                                FROM media_libraries LEFT JOIN jobs ON jobs.id = media_libraries.sync_job_id
-                               WHERE media_libraries.server_id = ? ORDER BY media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
+                               WHERE media_libraries.server_id = ? ORDER BY media_libraries.display_order, media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
         if not libraries:
             try:
                 with connect() as db:
@@ -943,7 +976,7 @@ def create_app() -> Flask:
                                               jobs.current_library AS job_current_library, jobs.processed AS job_processed,
                                               jobs.total AS job_total, jobs.error AS job_error
                                        FROM media_libraries LEFT JOIN jobs ON jobs.id = media_libraries.sync_job_id
-                                       WHERE media_libraries.server_id = ? ORDER BY media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
+                                       WHERE media_libraries.server_id = ? ORDER BY media_libraries.display_order, media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
             except Exception as exc:
                 return api_error(str(exc), "media_library_bootstrap_failed", 400)
         with connect() as db:
@@ -952,8 +985,8 @@ def create_app() -> Flask:
                 count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library["library_id"])).fetchone()["count"]
                 output.append({"id": int(library["library_id"]), "title": library["title"], "plex_type": int(library["plex_type"]),
                                "kind": "movie" if int(library["plex_type"]) == 1 else "show" if int(library["plex_type"]) == 2 else "collection",
-                               "items": [], "item_count": int(count), "animation_mode": library["animation_mode"],
-                               "auto_animation": bool(library["auto_animation"]), "is_animation": _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]),
+                               "items": [], "item_count": int(count), "animation_mode": library["animation_mode"], "sort_key": library["sort_key"], "sort_direction": library["sort_direction"],
+                               "display_order": int(library["display_order"] or 0), "auto_animation": bool(library["auto_animation"]), "is_animation": _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]),
                                "plex_synced_at": library["plex_synced_at"], "tmdb_synced_at": library["tmdb_synced_at"],
                                "sync_status": library["job_status"] or library["sync_status"], "sync_job_id": library["sync_job_id"],
                                "sync_error": library["job_error"] or library["sync_error"], "sync_stage": library["job_stage"] or "",

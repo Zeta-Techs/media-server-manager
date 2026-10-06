@@ -613,6 +613,23 @@ def init_db(db_file: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_media_match_status ON media_match_results(server_id, status, media_type);
             """
         )
+        # Added after the initial media-library cache schema.  Keep this as a
+        # lightweight migration so existing installations retain their data.
+        media_library_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_libraries)").fetchall()}
+        if "display_order" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0")
+            current_server = None
+            index = 0
+            for row in db.execute("SELECT server_id, library_id FROM media_libraries ORDER BY server_id, title COLLATE NOCASE").fetchall():
+                if row["server_id"] != current_server:
+                    current_server = row["server_id"]
+                    index = 0
+                db.execute("UPDATE media_libraries SET display_order = ? WHERE server_id = ? AND library_id = ?", (index, row["server_id"], row["library_id"]))
+                index += 1
+        if "sort_key" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''")
+        if "sort_direction" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN sort_direction TEXT NOT NULL DEFAULT 'asc'")
         db.execute(
             "INSERT INTO schema_meta (id, version, created_at) VALUES (1, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET version = excluded.version",

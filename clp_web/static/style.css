@@ -724,6 +724,10 @@ input::placeholder, textarea::placeholder { color: #6e6e7b; }
 label { color: var(--muted); }
 label.check { color: var(--text); }
 .notice { border-color: rgba(255, 196, 83, .3); background: rgba(255, 196, 83, .1); color: #ffd98d; }
+.media-library-sync-status { margin-bottom: 4px; padding: 8px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.media-library-tabs + .media-library-sync-status { margin-top: 4px; }
+.media-library-tabs [draggable="true"] { cursor: grab; }
+.media-library-tabs [draggable="true"].dragging { opacity: .45; }
 .progress div { border-color: rgba(255, 255, 255, .1); border-radius: 11px; background: rgba(255, 255, 255, .04); }
 .logs { border: 1px solid rgba(255, 255, 255, .1); border-radius: 12px; color: #d8d8e5; }
 .message { color: var(--success); }
