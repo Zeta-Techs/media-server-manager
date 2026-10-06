@@ -163,6 +163,24 @@ class TaskManager:
                         db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
                         db.commit()
                     raise
+            elif job_type == "media_library_show_recheck":
+                library_id = int(payload["library_id"])
+                server_id = int(payload["server_id"])
+                rating_key = str(payload["rating_key"])
+                progress = lambda p: self._progress(job_id, p)
+                cancelled = lambda: self._cancel_requested(job_id)
+                sync_media_library(self.db_file, server_id, library_id, progress=progress,
+                                   cancelled=cancelled, rating_keys={rating_key})
+                self._reset_progress(job_id, "tmdb_media_library")
+                sync_media_library_tmdb(self.db_file, server_id, library_id,
+                                        progress=progress, cancelled=cancelled,
+                                        rating_keys={rating_key},
+                                        logger=lambda message: self._log(job_id, message), strict_errors=True)
+                with connect(self.db_file) as db:
+                    count = db.execute("SELECT COUNT(*) FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key=? AND plex_type='episode' AND rating_key LIKE 'tmdb:%'", (server_id,library_id,rating_key)).fetchone()[0]
+                    db.execute("UPDATE media_library_recheck_requests SET missing_count=? WHERE id=? AND job_id=?", (count,payload.get("auto_recheck_request_id"),job_id))
+                    db.commit()
+                self._log(job_id, f"剧集 {rating_key} 自动重检完成：缺失/待发布 {count} 集。")
             elif job_type == "media_library_tmdb_refresh":
                 library_id = int(payload["library_id"])
                 try:

@@ -15,6 +15,7 @@ from typing import Any
 from clp_web.db import DB_FILE, connect, decode_payload, utcnow
 from clp_web.scheduling import next_run_at
 from clp_web.tasks import TaskManager
+from clp_web.rechecks import enqueue_due_rechecks
 
 
 def worker_is_healthy(db_file: Path | None = None, stale_seconds: int = 15) -> bool:
@@ -64,6 +65,7 @@ class Worker:
         if now - self._last_schedule_check >= 1:
             self._last_schedule_check = now
             self._enqueue_due_schedules()
+            enqueue_due_rechecks(self.db_file)
         if now - self._last_cleanup >= 3600:
             self._last_cleanup = now
             self._cleanup_history()
@@ -122,7 +124,8 @@ class Worker:
     def _claim_next_job(self, active_servers: set[int]) -> tuple[int, int] | None:
         with connect(self.db_file) as db:
             db.execute("BEGIN IMMEDIATE")
-            clauses = ["jobs.status = 'queued'", "servers.enabled = 1"]
+            clauses = ["jobs.status = 'queued'", "servers.enabled = 1",
+                       "NOT EXISTS (SELECT 1 FROM jobs active WHERE active.server_id=jobs.server_id AND active.status='running')"]
             params: list[Any] = []
             if active_servers:
                 placeholders = ",".join("?" for _ in active_servers)

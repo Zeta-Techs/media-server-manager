@@ -42,6 +42,7 @@ from .security import (
 )
 from .services import TERMINAL_JOB_STATUSES, JobQueue
 from .catalog import sync_media_library_full
+from .rechecks import request_recheck
 
 
 def _air_date(metadata: dict[str, Any]) -> str:
@@ -881,6 +882,9 @@ def create_app() -> Flask:
         mode = str(data.get("animation_mode") or "auto")
         sort_key = data.get("sort_key")
         sort_direction = data.get("sort_direction")
+        auto_recheck = data.get("auto_recheck_new_episodes")
+        if "auto_recheck_new_episodes" in data and not isinstance(auto_recheck, bool):
+            return api_error("自动重检开关必须是布尔值", "invalid_auto_recheck", 400)
         if mode not in {"auto", "animation", "normal"}:
             return api_error("动画媒体库模式无效", "invalid_animation_mode", 400)
         allowed_sort_keys = {"name", "original_title", "year", "added_at", "release_date", "first_episode_date", "latest_added_at", "rating", "audience_rating", "duration", "season_count", "episode_count", "content_rating", "genre"}
@@ -889,19 +893,25 @@ def create_app() -> Flask:
         if sort_direction is not None and str(sort_direction) not in {"asc", "desc"}:
             return api_error("媒体库排序方向无效", "invalid_media_library_sort_direction", 400)
         with connect() as db:
-            library = db.execute("SELECT title, plex_type, display_order FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
             if library is None:
                 return api_error("媒体库尚未同步，请先从媒体服务器重新拉取", "library_cache_missing", 404)
+            if "animation_mode" not in data:
+                mode = library["animation_mode"]
             assignments = ["animation_mode = ?", "updated_at = ?"]
             values = [mode, utcnow()]
             if sort_key is not None:
                 assignments.append("sort_key = ?"); values.append(str(sort_key))
             if sort_direction is not None:
                 assignments.append("sort_direction = ?"); values.append(str(sort_direction))
+            if auto_recheck is not None:
+                if int(library["plex_type"]) != 2:
+                    return api_error("只有电视剧媒体库支持新增剧集自动重检", "invalid_auto_recheck_library", 400)
+                assignments.append("auto_recheck_new_episodes = ?"); values.append(1 if bool(auto_recheck) else 0)
             values.extend([server_id, library_id])
             db.execute(f"UPDATE media_libraries SET {', '.join(assignments)} WHERE server_id = ? AND library_id = ?", values)
             db.commit()
-        return jsonify({"ok": True, "animation_mode": mode, "sort_key": sort_key, "sort_direction": sort_direction, "is_animation": _library_is_animation(mode, library["title"], library["plex_type"])})
+        return jsonify({"ok": True, "animation_mode": mode, "sort_key": sort_key, "sort_direction": sort_direction, "auto_recheck_new_episodes": bool(auto_recheck) if auto_recheck is not None else None, "is_animation": _library_is_animation(mode, library["title"], library["plex_type"])})
 
     @servers_bp.put("/api/servers/<int:server_id>/media-library/order")
     @login_required
@@ -985,7 +995,7 @@ def create_app() -> Flask:
                 count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library["library_id"])).fetchone()["count"]
                 output.append({"id": int(library["library_id"]), "title": library["title"], "plex_type": int(library["plex_type"]),
                                "kind": "movie" if int(library["plex_type"]) == 1 else "show" if int(library["plex_type"]) == 2 else "collection",
-                               "items": [], "item_count": int(count), "animation_mode": library["animation_mode"], "sort_key": library["sort_key"], "sort_direction": library["sort_direction"],
+                               "items": [], "item_count": int(count), "animation_mode": library["animation_mode"], "sort_key": library["sort_key"], "sort_direction": library["sort_direction"], "auto_recheck_new_episodes": bool(library["auto_recheck_new_episodes"]),
                                "display_order": int(library["display_order"] or 0), "auto_animation": bool(library["auto_animation"]), "is_animation": _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]),
                                "plex_synced_at": library["plex_synced_at"], "tmdb_synced_at": library["tmdb_synced_at"],
                                "sync_status": library["job_status"] or library["sync_status"], "sync_job_id": library["sync_job_id"],
@@ -2294,6 +2304,7 @@ def create_app() -> Flask:
         normalized = {"event": event_name, "Metadata": metadata}
         summary = str(metadata.get("title") or metadata.get("ratingKey") or event_name)[:500]
         with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
             cur = db.execute(
                 """
                 INSERT INTO webhook_events (
@@ -2310,6 +2321,8 @@ def create_app() -> Flask:
                 ),
             )
             event_id = int(cur.lastrowid or 0)
+            recheck_result = request_recheck(db, server_id, event_name, metadata)
+            db.execute("UPDATE webhook_events SET result=? WHERE id=?", (recheck_result,event_id))
             rules = db.execute(
                 "SELECT * FROM webhook_rules WHERE server_id = ? AND event = ? AND enabled = 1",
                 (server_id, event_name),

@@ -564,6 +564,30 @@ def init_db(db_file: Path | None = None) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_media_libraries_server ON media_libraries(server_id, plex_type);
 
+            CREATE TABLE IF NOT EXISTS media_library_recheck_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                rating_key TEXT NOT NULL,
+                first_event_at TEXT NOT NULL,
+                last_event_at TEXT NOT NULL,
+                next_run_at TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','running','succeeded','retrying','failed')),
+                job_id INTEGER,
+                last_error TEXT NOT NULL DEFAULT '',
+                dispatched_event_at TEXT NOT NULL DEFAULT '',
+                missing_count INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(server_id, library_id, rating_key),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_library_recheck_due
+                ON media_library_recheck_requests(status, next_run_at);
+
             CREATE TABLE IF NOT EXISTS media_library_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 server_id INTEGER NOT NULL,
@@ -626,6 +650,13 @@ def init_db(db_file: Path | None = None) -> None:
                     index = 0
                 db.execute("UPDATE media_libraries SET display_order = ? WHERE server_id = ? AND library_id = ?", (index, row["server_id"], row["library_id"]))
                 index += 1
+        if "auto_recheck_new_episodes" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN auto_recheck_new_episodes INTEGER NOT NULL DEFAULT 0")
+        recheck_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_library_recheck_requests)").fetchall()}
+        if "dispatched_event_at" not in recheck_columns:
+            db.execute("ALTER TABLE media_library_recheck_requests ADD COLUMN dispatched_event_at TEXT NOT NULL DEFAULT ''")
+        if "missing_count" not in recheck_columns:
+            db.execute("ALTER TABLE media_library_recheck_requests ADD COLUMN missing_count INTEGER")
         if "sort_key" not in media_library_columns:
             db.execute("ALTER TABLE media_libraries ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''")
         if "sort_direction" not in media_library_columns:

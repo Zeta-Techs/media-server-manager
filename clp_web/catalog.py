@@ -288,7 +288,12 @@ def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=
             auto_animation=excluded.auto_animation, sync_status='running', sync_error='', updated_at=excluded.updated_at
         """, (server_id, library_id, title, plex_type, 1 if _library_is_animation(title, plex_type) else 0, now))
         db.commit()
-    items = plex.list_library_collections(library_id) if plex_type == 3 else plex.list_library_items(library_id, plex_type)
+    if rating_keys:
+        items = [plex.get_metadata(key) for key in sorted(rating_keys)]
+        if any(str(item.get("type") or "") != "show" for item in items):
+            raise ValueError("目标不是电视剧")
+    else:
+        items = plex.list_library_collections(library_id) if plex_type == 3 else plex.list_library_items(library_id, plex_type)
     count = 0
     seen_keys: set[str] = set()
     if rating_keys:
@@ -300,7 +305,7 @@ def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=
             item_type = str(item.get("type") or ("collection" if plex_type == 3 else "show" if plex_type == 2 else "movie"))
             if item.get("ratingKey"):
                 seen_keys.add(str(item["ratingKey"]))
-            if item_type == "show":
+            if item_type == "show" and not rating_keys:
                 try:
                     item = plex.get_metadata(str(item.get("ratingKey") or ""))
                 except Exception:
@@ -351,7 +356,7 @@ def sync_media_library_full(db_file: Path, server_id: int, library_id: int, prog
 
 
 def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, progress=None, cancelled=None,
-                            rating_keys: set[str] | None = None, logger=None) -> int:
+                            rating_keys: set[str] | None = None, logger=None, strict_errors: bool = False) -> int:
     token = get_setting("tmdb_api_key", db_file)
     if not token:
         raise ValueError("请先保存 TMDB API Key")
@@ -366,6 +371,13 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
             rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type IN ('show','movie') ORDER BY id", (server_id, library_id)).fetchall()
     tmdb = TMDBClient(token)
     processed = 0
+    failures = []
+    def report_failure(message: str) -> None:
+        failures.append(message)
+        if logger:
+            logger(message)
+    if strict_errors and not rows:
+        raise ValueError("未找到需要重新检查的电视剧缓存")
     for row in rows:
         if cancelled and cancelled():
             raise TaskCancelled("任务已取消")
@@ -380,8 +392,11 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
                     tmdb_id = int(matches[0].get("id") or 0) or None
                     if tmdb_id:
                         payload["external_ids"] = {**ids, "tmdb": tmdb_id}
-            except Exception:
+            except Exception as exc:
+                report_failure(f"TMDB 搜索失败：{row['title']}：{exc}")
                 tmdb_id = None
+        if not tmdb_id:
+            report_failure(f"未找到 TMDB 匹配：{row['title']}")
         if tmdb_id:
             details = None
             try:
@@ -390,8 +405,8 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
                 cached_details = payload.get("tmdb")
                 if isinstance(cached_details, dict) and cached_details:
                     details = cached_details
-                if logger:
-                    logger(f"TMDB 详情获取失败：{row['title']}（{tmdb_id}）：{exc}")
+                else:
+                    report_failure(f"TMDB 详情获取失败：{row['title']}（{tmdb_id}）：{exc}")
             if details:
               try:
                 with connect(db_file) as db:
@@ -411,8 +426,8 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
                                 if cached_season:
                                     cached = decode_payload(cached_season["raw_json"])
                                     season_details = cached.get("tmdb") if isinstance(cached.get("tmdb"), dict) else None
-                                if logger:
-                                    logger(f"TMDB 季详情获取失败：{row['title']} S{season_number:02d}（{tmdb_id}）：{exc}")
+                                if not season_details:
+                                    report_failure(f"TMDB 季详情获取失败：{row['title']} S{season_number:02d}（{tmdb_id}）：{exc}")
                                 if not season_details:
                                     continue
                             season_key = f"tmdb-season:{tmdb_id}:{season_number}"
@@ -444,11 +459,12 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
                                       json.dumps({"tmdb": expected, "expected": True}, ensure_ascii=False), utcnow()))
                     db.commit()
               except Exception as exc:
-                if logger:
-                    logger(f"TMDB 缺集写入失败：{row['title']}（{tmdb_id}）：{exc}")
+                report_failure(f"TMDB 缺集写入失败：{row['title']}（{tmdb_id}）：{exc}")
         processed += 1
         if progress:
             progress({"processed_delta": 1, "total": len(rows), "stage": "tmdb_media_library"})
+    if strict_errors and failures:
+        raise RuntimeError("；".join(failures))
     with connect(db_file) as db:
         db.execute("UPDATE media_libraries SET tmdb_synced_at = ?, sync_status = 'idle', updated_at = ? WHERE server_id = ? AND library_id = ?", (utcnow(), utcnow(), server_id, library_id))
         db.commit()

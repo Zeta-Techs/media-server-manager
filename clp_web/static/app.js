@@ -30,7 +30,9 @@ async function bootstrap() {
   }
   showApp();
   await refreshInitial();
-  const savedView = window.location.pathname === "/media-library/detail" ? "media-library-detail" : (new URLSearchParams(window.location.search).get("view") || sessionStorage.getItem("clp-active-view") || "overview");
+  const requestedView = new URLSearchParams(window.location.search).get("view") || sessionStorage.getItem("clp-active-view") || "overview";
+  const allowedViews = new Set(["overview", "servers", "media-library", "media-library-detail", "localization", "jobs", "automation", "system"]);
+  const savedView = window.location.pathname === "/media-library/detail" ? "media-library-detail" : (allowedViews.has(requestedView) ? requestedView : "overview");
   await switchView(savedView);
 }
 
@@ -42,9 +44,10 @@ async function refreshInitial() {
 }
 
 async function refreshAll() {
-  await Promise.all([loadOverview(), loadServers(), loadJobs(), loadSchedules(), loadCollectionRules(), loadWebhookData(), loadNotifications()]);
+  await Promise.all([loadOverview(), loadServers(), loadJobs(), loadSchedules(), loadWebhookData(), loadNotifications()]);
+  await loadTmdbSettings();
   await loadTags();
-  ["overview", "servers", "localization", "jobs", "automation", "tools", "system"].forEach((view) => state.loadedViews.add(view));
+  ["overview", "servers", "localization", "jobs", "automation", "system"].forEach((view) => state.loadedViews.add(view));
 }
 
 function setMessage(selector, message, isError = false) {
@@ -127,8 +130,7 @@ async function ensureViewData(view) {
     await Promise.all([loadServers(), loadSchedules(), loadWebhookData(), loadNotifications()]);
     await updateSchedulePreview();
   }
-  if (view === "tools") await Promise.all([loadServers(), loadCollectionRules(), loadContinueWatchingRuns(), loadEpisodeAuditSettings(), loadEpisodeAuditRuns()]);
-  if (view === "system") await loadDiagnostics();
+  if (view === "system") await Promise.all([loadDiagnostics(), loadTmdbSettings()]);
   state.loadedViews.add(view);
 }
 
@@ -164,10 +166,6 @@ function renderServers() {
 function fillServerSelects() {
   const options = state.servers.map((server) => `<option value="${server.id}">${escapeHtml(server.name)}</option>`).join("");
   $("#localize-server").innerHTML = options;
-  $("#maintenance-server").innerHTML = options;
-  $("#collection-server").innerHTML = options;
-  $("#continue-watching-server").innerHTML = options;
-  $("#episode-audit-server").innerHTML = options;
   $("#media-library-server").innerHTML = options;
   $("#webhook-rule-server").innerHTML = options;
   $("#tag-suggestion-server").innerHTML = options;
@@ -214,6 +212,25 @@ function renderMediaLibrarySyncStatus(library) {
   return parts.join(" · ");
 }
 
+function renderMediaLibraryAutoRecheck(library, serverId) {
+  const field = $("#media-library-auto-recheck-field");
+  const input = $("#media-library-auto-recheck");
+  const help = $("#media-library-auto-recheck-help");
+  const isShow = library?.kind === "show";
+  field.hidden = !isShow;
+  input.checked = isShow && Boolean(library.auto_recheck_new_episodes);
+  help.hidden = !isShow;
+  const server = state.servers.find((item) => String(item.id) === String(serverId));
+  help.textContent = "自动重检需要 Plex 配置 Webhook 并发送 library.new 事件；同一电视剧连续新增集会等待 5 分钟合并，失败后重试一次。";
+  if (server?.webhook_url) {
+    const link = document.createElement("a");
+    link.href = server.webhook_url;
+    link.textContent = " 查看当前服务器 Webhook 地址";
+    link.addEventListener("click", (event) => { event.preventDefault(); window.prompt("将此地址添加到 Plex Webhook 设置", server.webhook_url); });
+    help.append(link);
+  }
+}
+
 async function refreshMediaLibrarySyncStatus(serverId) {
   const result = await api(`/api/servers/${serverId}/media-library`);
   const selected = (result.libraries || []).find((library) => String(library.id) === String(state.mediaLibrarySelectedId));
@@ -248,6 +265,7 @@ function renderMediaLibrary(libraries, serverId) {
   const animationMode = $("#media-library-animation-mode");
   if (animationMode) animationMode.value = libraries.find((library) => String(library.id) === String(state.mediaLibrarySelectedId))?.animation_mode || "auto";
   const syncLibrary = libraries.find((library) => String(library.id) === String(state.mediaLibrarySelectedId));
+  renderMediaLibraryAutoRecheck(syncLibrary, serverId);
   if (syncLibrary) {
     state.mediaLibrarySort = syncLibrary.sort_key || state.mediaLibrarySort;
     state.mediaLibraryDirection = syncLibrary.sort_direction || state.mediaLibraryDirection;
@@ -309,6 +327,7 @@ async function selectMediaLibrary(libraryId, serverId) {
   state.mediaLibrarySelectedId = libraryId;
   state.mediaLibraryPage = 1;
   const library = state.mediaLibraryData.find((item) => String(item.id) === String(libraryId));
+  renderMediaLibraryAutoRecheck(library, serverId);
   if (library?.is_animation) {
     state.mediaLibrarySort = "first_episode_date";
     state.mediaLibraryDirection = "desc";
@@ -703,6 +722,22 @@ $("#media-library-animation-mode")?.addEventListener("change", async () => {
   const libraryId = state.mediaLibrarySelectedId;
   if (!serverId || !libraryId) return;
   try { await api(`/api/servers/${serverId}/libraries/${libraryId}/settings`, { method: "PUT", body: JSON.stringify({ animation_mode: $("#media-library-animation-mode").value }) }); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
+});
+$("#media-library-auto-recheck")?.addEventListener("change", async (event) => {
+  const input = event.currentTarget;
+  const serverId = $("#media-library-server").value;
+  const libraryId = state.mediaLibrarySelectedId;
+  const enabled = input.checked;
+  input.disabled = true;
+  try {
+    await api(`/api/servers/${serverId}/libraries/${libraryId}/settings`, { method: "PUT", body: JSON.stringify({ auto_recheck_new_episodes: enabled }) });
+    const library = state.mediaLibraryData.find((item) => String(item.id) === String(libraryId));
+    if (library) library.auto_recheck_new_episodes = enabled;
+    setMessage("#media-library-message", enabled ? "已开启该媒体库新增剧集自动重检" : "已关闭该媒体库新增剧集自动重检");
+  } catch (error) {
+    input.checked = !enabled;
+    setMessage("#media-library-message", error.message, true);
+  } finally { input.disabled = false; }
 });
 $("#media-library-page-size")?.addEventListener("change", () => { state.mediaLibraryPageSize = $("#media-library-page-size").value; state.mediaLibraryPage = 1; rerenderSelectedMediaLibrary($("#media-library-server").value); });
 $("#media-library-sort")?.addEventListener("change", async () => { state.mediaLibrarySort = $("#media-library-sort").value; state.mediaLibraryPage = 1; rerenderSelectedMediaLibrary($("#media-library-server").value); const serverId = $("#media-library-server").value; const libraryId = state.mediaLibrarySelectedId; if (serverId && libraryId) { try { await api(`/api/servers/${serverId}/libraries/${libraryId}/settings`, { method: "PUT", body: JSON.stringify({ animation_mode: $("#media-library-animation-mode").value, sort_key: state.mediaLibrarySort, sort_direction: state.mediaLibraryDirection }) }); } catch (error) { setMessage("#media-library-message", error.message, true); } } });
@@ -1139,41 +1174,6 @@ function changeStatusText(status) {
   }[status] || "待应用";
 }
 
-$("#maintenance-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const data = Object.fromEntries(new FormData(event.currentTarget).entries());
-  try {
-    const result = await api("/api/maintenance/jobs", {
-      method: "POST",
-      body: JSON.stringify({
-        server_id: Number(data.server_id),
-        action: data.action,
-        library_id: data.library_id ? Number(data.library_id) : undefined,
-        rating_key: data.rating_key || undefined,
-      }),
-    });
-    setMessage("#maintenance-message", "维护任务已加入队列。");
-    await loadJobs();
-    await loadOverview();
-    goToJobs(result.id);
-  } catch (error) {
-    setMessage("#maintenance-message", error.message, true);
-  }
-});
-
-$("#maintenance-load-libraries").addEventListener("click", async () => {
-  const serverId = $("#maintenance-server").value;
-  if (!serverId) return;
-  try {
-    const libraries = await api(`/api/servers/${serverId}/libraries`);
-    renderLibraryPicker("#maintenance-library-list", libraries, (selected) => {
-      $("#maintenance-form").library_id.value = selected[0] || "";
-    }, { single: true });
-  } catch (error) {
-    setMessage("#maintenance-message", error.message, true);
-  }
-});
-
 async function loadSchedules() {
   state.schedules = await api("/api/schedules");
   renderSchedules();
@@ -1361,202 +1361,11 @@ function renderLibraryPicker(selector, libraries, onChange, options = {}) {
   update();
 }
 
-async function loadCollectionRules() {
-  try {
-    state.collectionRules = await api("/api/collection-rules");
-    renderCollectionRules();
-  } catch (_) {}
-}
-
-$("#collection-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const data = Object.fromEntries(new FormData(form).entries());
-  data.server_id = Number(data.server_id);
-  data.library_id = Number(data.library_id);
-  data.enabled = form.enabled.checked;
-  const id = data.id;
-  delete data.id;
-  try {
-    await api(id ? `/api/collection-rules/${id}` : "/api/collection-rules", {
-      method: id ? "PUT" : "POST",
-      body: JSON.stringify(data),
-    });
-    setMessage("#collection-message", "合集规则已保存。");
-    form.reset();
-    form.enabled.checked = true;
-    await loadCollectionRules();
-  } catch (error) {
-    setMessage("#collection-message", error.message, true);
-  }
-});
-
-function renderCollectionRules() {
-  const list = $("#collection-list");
-  list.innerHTML = "";
-  state.collectionRules.forEach((rule) => {
-    const item = document.createElement("div");
-    item.className = "item";
-    item.innerHTML = `
-      <strong>${escapeHtml(rule.name)}</strong>
-      <div class="meta">${escapeHtml(rule.server_name)} · 库 ${rule.library_id} · ${escapeHtml(rule.match_field)} 包含 ${escapeHtml(rule.match_value)}</div>
-      <div class="meta">报告：${escapeHtml(rule.collection_title)} · ${rule.enabled ? "启用" : "停用"}</div>
-      <div class="button-row"><button class="edit" type="button">编辑</button><button class="danger delete" type="button">删除</button></div>
-    `;
-    item.querySelector(".edit").addEventListener("click", () => fillCollectionForm(rule));
-    item.querySelector(".delete").addEventListener("click", async () => {
-      await api(`/api/collection-rules/${rule.id}`, { method: "DELETE" });
-      await loadCollectionRules();
-    });
-    list.appendChild(item);
-  });
-}
-
-function fillCollectionForm(rule) {
-  const form = $("#collection-form");
-  form.id.value = rule.id;
-  form.name.value = rule.name;
-  form.server_id.value = rule.server_id;
-  form.library_id.value = rule.library_id;
-  form.match_field.value = rule.match_field;
-  form.match_value.value = rule.match_value;
-  form.collection_title.value = rule.collection_title;
-  form.enabled.checked = Boolean(rule.enabled);
-}
-
-$("#preview-collection").addEventListener("click", async () => {
-  const id = $("#collection-form").id.value;
-  if (!id) return setMessage("#collection-message", "请先保存规则。", true);
-  try {
-    const result = await api(`/api/collection-rules/${id}/preview`, { method: "POST", body: "{}" });
-    setMessage("#collection-message", "预览任务已加入队列，可在任务中心查看命中日志。");
-    await loadJobs();
-    goToJobs(result.id);
-  } catch (error) {
-    setMessage("#collection-message", error.message, true);
-  }
-});
-
-$("#run-collection").addEventListener("click", async () => {
-  const id = $("#collection-form").id.value;
-  if (!id) return setMessage("#collection-message", "请先保存规则。", true);
-  const result = await api(`/api/collection-rules/${id}/run`, { method: "POST", body: JSON.stringify({ preview: false }) });
-  await loadJobs();
-  await loadOverview();
-  goToJobs(result.id);
-});
-
-$("#continue-watching-load-libraries").addEventListener("click", async () => {
-  const serverId = $("#continue-watching-server").value;
-  if (!serverId) return;
-  try {
-    const libraries = (await api(`/api/servers/${serverId}/libraries`)).filter((library) => Number(library.type) === 2);
-    renderLibraryPicker(
-      "#continue-watching-library-list",
-      libraries,
-      (selected) => {
-        $("#continue-watching-form").library_id.value = selected[0] || "";
-      },
-      { single: true }
-    );
-  } catch (error) {
-    setMessage("#continue-watching-message", error.message, true);
-  }
-});
-
-$("#continue-watching-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const data = Object.fromEntries(new FormData(form).entries());
-  if (!data.library_id) return setMessage("#continue-watching-message", "请选择电视剧库。", true);
-  try {
-    const result = await api("/api/continue-watching/preview", {
-      method: "POST",
-      body: JSON.stringify({ server_id: Number(data.server_id), library_id: Number(data.library_id) }),
-    });
-    setMessage("#continue-watching-message", "继续观看候选预览任务已创建。");
-    await loadJobs();
-    await loadOverview();
-    goToJobs(result.id);
-  } catch (error) {
-    setMessage("#continue-watching-message", error.message, true);
-  }
-});
-
-async function loadContinueWatchingRuns() {
-  try {
-    state.continueWatchingRuns = await api("/api/continue-watching/runs");
-    renderContinueWatchingRuns();
-  } catch (_) {}
-}
-
-function renderContinueWatchingRuns() {
-  const list = $("#continue-watching-runs");
-  list.innerHTML = state.continueWatchingRuns.length
-    ? state.continueWatchingRuns
-        .map(
-          (run) => `
-            <div class="item">
-              <strong>#${run.id} ${escapeHtml(run.mode)} · ${escapeHtml(run.status)}</strong>
-              <div class="meta">${escapeHtml(run.server_name)} · 候选 ${run.candidate_count} · 成功 ${run.applied_count} · 失败 ${run.error_count}</div>
-              <div class="button-row">
-                <button type="button" class="view-run" data-id="${run.id}">查看候选</button>
-                ${run.job_id ? `<button type="button" class="view-job" data-id="${run.job_id}">任务</button>` : ""}
-              </div>
-            </div>`
-        )
-        .join("")
-    : '<div class="item">暂无继续观看记录。</div>';
-  list.querySelectorAll(".view-run").forEach((button) => button.addEventListener("click", () => selectContinueWatchingRun(Number(button.dataset.id))));
-  list.querySelectorAll(".view-job").forEach((button) => button.addEventListener("click", () => goToJobs(Number(button.dataset.id))));
-}
-
-async function selectContinueWatchingRun(runId) {
-  state.selectedContinueWatchingRun = runId;
-  state.continueWatchingItems = await api(`/api/continue-watching/runs/${runId}/items`);
-  renderContinueWatchingItems();
-}
-
-function renderContinueWatchingItems() {
-  const list = $("#continue-watching-items");
-  list.innerHTML = state.continueWatchingItems.length
-    ? state.continueWatchingItems
-        .map((item) => {
-          const label = `S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}`;
-          return `
-            <div class="item continue-item">
-              <label class="check"><input type="checkbox" value="${item.id}" ${item.status === "candidate" ? "checked" : ""} ${item.status === "candidate" ? "" : "disabled"}> <strong>${escapeHtml(item.show_title)} · ${label}</strong></label>
-              <div class="meta">${escapeHtml(item.episode_title)} · 计划进度 ${Math.round((item.planned_offset || 0) / 1000)} 秒 · 当前进度 ${Math.round((item.current_offset || 0) / 1000)} 秒 · ${escapeHtml(item.status)}</div>
-              ${item.result ? `<div class="meta">${escapeHtml(item.result)}</div>` : ""}
-            </div>`;
-        })
-        .join("")
-    : '<div class="item">暂无候选。预览任务完成后点击历史记录中的“查看候选”。</div>';
-}
-
-$("#continue-watching-apply").addEventListener("click", async () => {
-  const itemIds = $$("#continue-watching-items input[type='checkbox']:checked").map((input) => Number(input.value));
-  if (!itemIds.length) return setMessage("#continue-watching-message", "请选择要执行的候选剧集。", true);
-  if (!confirm("将为选中的剧集写入少量播放进度，尝试加入 Plex 继续观看。继续？")) return;
-  try {
-    const result = await api("/api/continue-watching/apply", {
-      method: "POST",
-      body: JSON.stringify({ item_ids: itemIds }),
-    });
-    setMessage("#continue-watching-message", "继续观看执行任务已创建。");
-    await loadJobs();
-    await loadOverview();
-    goToJobs(result.id);
-  } catch (error) {
-    setMessage("#continue-watching-message", error.message, true);
-  }
-});
-
-async function loadEpisodeAuditSettings() {
+async function loadTmdbSettings() {
   try {
     const settings = await api("/api/settings/tmdb");
-    $("#tmdb-key-status").textContent = settings.configured ? "已保存" : "未配置";
-    if ($("#system-tmdb-key-status")) $("#system-tmdb-key-status").textContent = settings.configured ? "已保存" : "未配置";
+    const status = $("#system-tmdb-key-status");
+    if (status) status.textContent = settings.configured ? "已保存" : "未配置";
   } catch (_) {}
 }
 
@@ -1568,378 +1377,6 @@ $("#system-tmdb-form")?.addEventListener("submit", async (event) => {
     $("#system-tmdb-key-status").textContent = "已保存";
     setMessage("#system-tmdb-message", "TMDB API Key 已保存。");
   } catch (error) { setMessage("#system-tmdb-message", error.message, true); }
-});
-
-$("#save-tmdb-key").addEventListener("click", async () => {
-  try {
-    await api("/api/settings/tmdb", {
-      method: "POST",
-      body: JSON.stringify({ api_key: $("#tmdb-api-key").value }),
-    });
-    $("#tmdb-api-key").value = "";
-    $("#tmdb-key-status").textContent = "已保存";
-    setMessage("#episode-audit-message", "TMDB API Key 已保存。");
-  } catch (error) {
-    setMessage("#episode-audit-message", error.message, true);
-  }
-});
-
-$("#episode-audit-load-libraries").addEventListener("click", async () => {
-  const serverId = $("#episode-audit-server").value;
-  if (!serverId) return;
-  try {
-    const libraries = (await api(`/api/servers/${serverId}/libraries`)).filter((library) => Number(library.type) === 2);
-    renderLibraryPicker(
-      "#episode-audit-library-list",
-      libraries,
-      (selected) => {
-        $("#episode-audit-form").library_id.value = selected[0] || "";
-      },
-      { single: true }
-    );
-  } catch (error) {
-    setMessage("#episode-audit-message", error.message, true);
-  }
-});
-
-$("#episode-audit-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const data = Object.fromEntries(new FormData(form).entries());
-  if (!data.library_id) return setMessage("#episode-audit-message", "请选择电视剧库。", true);
-  try {
-    const result = await api("/api/episode-audits", {
-      method: "POST",
-      body: JSON.stringify({
-        server_id: Number(data.server_id),
-        library_id: Number(data.library_id),
-        options: {
-          ignore_specials: form.ignore_specials.checked,
-          ignore_future: form.ignore_future.checked,
-          only_ended: form.only_ended.checked,
-        },
-      }),
-    });
-    setMessage("#episode-audit-message", "缺集检查任务已创建，可在任务中心查看进度。");
-    await loadJobs();
-    await loadOverview();
-    goToJobs(result.id);
-  } catch (error) {
-    setMessage("#episode-audit-message", error.message, true);
-  }
-});
-
-async function loadEpisodeAuditRuns() {
-  try {
-    state.episodeAuditRuns = await api("/api/episode-audits");
-    renderEpisodeAuditRuns();
-  } catch (_) {}
-}
-
-function renderEpisodeAuditRuns() {
-  const list = $("#episode-audit-runs");
-  list.innerHTML = state.episodeAuditRuns.length
-    ? state.episodeAuditRuns
-        .map(
-          (run) => `
-            <div class="item">
-              <strong>#${run.id} ${escapeHtml(run.status)} · 库 ${run.library_id}</strong>
-              <div class="meta">${escapeHtml(run.server_name)} · 已检查 ${run.checked_shows}/${run.total_shows} · 缺失 ${run.missing_count} · 已忽略 ${run.ignored_count || 0} · 未匹配 ${run.unmatched_count}</div>
-              <div class="button-row">
-                <button type="button" class="view-run" data-id="${run.id}">查看结果</button>
-                ${run.job_id ? `<button type="button" class="view-job" data-id="${run.job_id}">任务</button>` : ""}
-              </div>
-            </div>`
-        )
-        .join("")
-    : '<div class="item">暂无缺集检查记录。</div>';
-  list.querySelectorAll(".view-run").forEach((button) => button.addEventListener("click", () => selectEpisodeAuditRun(Number(button.dataset.id))));
-  list.querySelectorAll(".view-job").forEach((button) => button.addEventListener("click", () => goToJobs(Number(button.dataset.id))));
-}
-
-async function selectEpisodeAuditRun(runId) {
-  state.selectedEpisodeAudit = runId;
-  const run = state.episodeAuditRuns.find((item) => item.id === runId) || (await api(`/api/episode-audits/${runId}`));
-  $("#episode-audit-summary").textContent = `#${run.id} · 缺失 ${run.missing_count} 集 · 已忽略 ${run.ignored_count || 0} 项 · 未匹配 ${run.unmatched_count} 部 · 低置信度 ${run.ambiguous_count} 部`;
-  await loadEpisodeAuditReport();
-  await loadEpisodeAuditItems();
-}
-
-async function loadEpisodeAuditReport() {
-  if (!state.selectedEpisodeAudit) return;
-  state.episodeAuditReport = await api(`/api/episode-audits/${state.selectedEpisodeAudit}/report`);
-  renderEpisodeAuditReport();
-}
-
-async function loadEpisodeAuditItems() {
-  if (!state.selectedEpisodeAudit) return;
-  const params = new URLSearchParams();
-  const status = $("#episode-audit-status-filter").value;
-  const q = $("#episode-audit-search").value.trim();
-  if (status) params.set("status", status);
-  if (q) params.set("q", q);
-  state.episodeAuditItems = await api(`/api/episode-audits/${state.selectedEpisodeAudit}/items?${params.toString()}`);
-  renderEpisodeAuditItems();
-}
-
-$("#episode-audit-status-filter").addEventListener("change", loadEpisodeAuditItems);
-["episode-audit-only-missing", "episode-audit-show-complete", "episode-audit-show-ignored"].forEach((id) => {
-  const el = document.getElementById(id);
-  if (el) el.addEventListener("change", () => {
-    renderEpisodeAuditReport();
-    loadEpisodeAuditItems();
-  });
-});
-$("#episode-audit-search").addEventListener("input", () => {
-  clearTimeout(state.episodeAuditSearchTimer);
-  state.episodeAuditSearchTimer = setTimeout(() => {
-    renderEpisodeAuditReport();
-    loadEpisodeAuditItems();
-  }, 250);
-});
-
-function renderEpisodeAuditItems() {
-  const list = $("#episode-audit-items");
-  list.innerHTML = state.episodeAuditItems.length
-    ? state.episodeAuditItems
-        .map((item) => {
-          const details = item.details || {};
-          const episodeLabel = item.season ? `S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : "-";
-          return `
-            <div class="item">
-              <strong>${escapeHtml(item.show_title)} · ${escapeHtml(episodeLabel)}</strong>
-              <div class="meta">${escapeHtml(item.status)} · ${escapeHtml(item.match_source || "未匹配")} · TMDB ${escapeHtml(item.tmdb_id || "-")} ${escapeHtml(item.tmdb_title || "")}</div>
-              <div class="meta">${escapeHtml(details.episode_title || "")}${item.air_date ? ` · ${escapeHtml(item.air_date)}` : ""}${details.error ? ` · ${escapeHtml(details.error)}` : ""}</div>
-              ${item.status === "missing" ? `<div class="button-row"><button type="button" class="ignore-episode" data-id="${item.id}">忽略这一集</button><button type="button" class="ignore-show" data-id="${item.id}">忽略整部剧</button></div>` : ""}
-            </div>`;
-        })
-        .join("")
-    : '<div class="item">当前筛选下没有结果。</div>';
-  bindEpisodeAuditIgnoreButtons(list);
-}
-
-function renderEpisodeAuditReport() {
-  const container = $("#episode-audit-report");
-  const report = state.episodeAuditReport;
-  if (!report) {
-    container.innerHTML = "";
-    return;
-  }
-  const summary = report.summary || {};
-  const groups = filterEpisodeAuditGroups(report.groups || []);
-  $("#episode-audit-summary").textContent = `#${report.run.id} · ${summary.shows_with_missing} 部剧有缺失 · 已有 ${summary.present_episodes || 0} 集 · 缺 ${summary.missing_episodes} 集 · 已忽略 ${summary.ignored_items} 项 · 未匹配 ${summary.unmatched_shows} 部`;
-  container.innerHTML = `
-    ${summary.legacy_summary_only ? '<div class="notice">这是旧版报告，只包含缺失/忽略摘要；重新扫描后可显示完整绿色格子。</div>' : ""}
-    <div class="metric-grid audit-metrics">
-      <div class="metric"><span>有缺失的剧</span><strong>${summary.shows_with_missing || 0}</strong></div>
-      <div class="metric"><span>已有集数</span><strong>${summary.present_episodes || 0}</strong></div>
-      <div class="metric"><span>缺失集数</span><strong>${summary.missing_episodes || 0}</strong></div>
-      <div class="metric"><span>已忽略</span><strong>${summary.ignored_items || 0}</strong></div>
-      <div class="metric"><span>未匹配</span><strong>${summary.unmatched_shows || 0}</strong></div>
-    </div>
-    ${
-      groups.length
-        ? groups.map(renderEpisodeAuditGroup).join("")
-        : '<div class="item">当前筛选下没有需要处理的缺集报表。</div>'
-    }
-  `;
-  bindEpisodeAuditIgnoreButtons(container);
-  bindEpisodeMatchOverrideButtons(container);
-}
-
-function filterEpisodeAuditGroups(groups) {
-  const query = ($("#episode-audit-search").value || "").toLowerCase();
-  const onlyMissing = $("#episode-audit-only-missing")?.checked;
-  const showComplete = $("#episode-audit-show-complete")?.checked;
-  return groups.filter((group) => {
-    const matchesQuery = !query || group.show_title.toLowerCase().includes(query) || String(group.tmdb_title || "").toLowerCase().includes(query);
-    if (!matchesQuery) return false;
-    if (onlyMissing && !showComplete && !group.missing_count && !group.unmatched && !group.ambiguous) return false;
-    if (!showComplete && !group.missing_count && !group.ignored_count && !group.unmatched && !group.ambiguous) return false;
-    return true;
-  });
-}
-
-function renderEpisodeAuditGroup(group) {
-  const matrixEpisodes = (group.seasons || []).flatMap((season) => season.episodes || []);
-  const missing = matrixEpisodes.filter((episode) => episode.status === "missing").concat(group.episodes || []);
-  const ignored = matrixEpisodes.filter((episode) => episode.status?.startsWith("ignored")).concat(group.ignored || []);
-  const presentCount = group.present_count || matrixEpisodes.filter((episode) => episode.status === "present").length;
-  const showIgnored = $("#episode-audit-show-ignored")?.checked;
-  const badges = [];
-  if (group.unmatched) badges.push("未匹配");
-  if (group.ambiguous) badges.push("低置信度");
-  return `
-    <div class="item audit-group">
-      <div class="audit-group-head">
-        <div>
-          <strong>${escapeHtml(group.show_title)}</strong>
-          <div class="meta">TMDB ${escapeHtml(group.tmdb_id || "-")} ${escapeHtml(group.tmdb_title || "")} · ${escapeHtml(group.match_source || "未匹配")} ${badges.length ? `· ${badges.map(escapeHtml).join(" · ")}` : ""}</div>
-        </div>
-        <div class="audit-counts">已有 ${presentCount} · 缺 ${group.missing_count} · 忽略 ${group.ignored_count}</div>
-      </div>
-      ${renderEpisodeCalendar(group, showIgnored)}
-      ${
-        group.ambiguous && (group.candidates || []).length
-          ? `<div class="button-row match-override" data-rating-key="${escapeHtml(group.plex_rating_key)}">
-              <select>${group.candidates
-                .map(
-                  (candidate) =>
-                    `<option value="${candidate.id}">${escapeHtml(candidate.name)} ${escapeHtml(candidate.first_air_date || "")}</option>`
-                )
-                .join("")}</select>
-              <button type="button" class="save-match-override">使用此 TMDB 匹配</button>
-            </div>`
-          : ""
-      }
-      ${
-        ignored.length && showIgnored
-          ? `<div class="meta">已忽略：${ignored.map((episode) => `${escapeHtml(episode.label)}${episode.reason ? `（${escapeHtml(episode.reason)}）` : ""}`).join("、")}</div>`
-          : ""
-      }
-      ${missing.length || group.unmatched || group.ambiguous ? `<div class="button-row"><button type="button" class="ignore-show" data-id="${missing[0]?.id || ignored[0]?.id || group.representative_item_id || ""}" ${missing[0]?.id || ignored[0]?.id || group.representative_item_id ? "" : "disabled"}>忽略整部剧</button></div>` : ""}
-    </div>`;
-}
-
-function renderEpisodeCalendar(group, showIgnored) {
-  const seasons = group.seasons || [];
-  if (!seasons.length) {
-    const fallback = group.episodes || [];
-    if (!fallback.length) return '<div class="meta">这份旧报告没有完整剧集矩阵，重新扫描后会显示绿色/红色格子。</div>';
-    return `<div class="episode-chip-row">${fallback.map((episode) => renderEpisodeCell(episode, showIgnored)).join("")}</div>`;
-  }
-  return `
-    <div class="episode-calendar">
-      ${seasons
-        .map((season) => {
-          const episodes = (season.episodes || []).filter((episode) => showIgnored || !String(episode.status || "").startsWith("ignored"));
-          if (!episodes.length) return "";
-          return `
-            <div class="episode-season-row">
-              <div class="season-label">S${String(season.season).padStart(2, "0")}</div>
-              <div class="episode-cell-row">${episodes.map((episode) => renderEpisodeCell(episode, showIgnored)).join("")}</div>
-            </div>`;
-        })
-        .join("")}
-    </div>`;
-}
-
-function renderEpisodeCell(episode, showIgnored) {
-  const status = episode.status || "missing";
-  if (!showIgnored && status.startsWith("ignored")) return "";
-  const title = [episode.label, episode.title, episode.air_date, statusText(status), episode.reason].filter(Boolean).join(" · ");
-  const canIgnore = status === "missing";
-  return `
-    <button
-      type="button"
-      class="episode-cell status-${escapeHtml(status)} ${canIgnore ? "ignore-episode" : ""}"
-      data-id="${episode.id || episode.item_id || ""}"
-      title="${escapeHtml(title)}"
-      ${canIgnore ? "" : "disabled"}
-    >
-      ${escapeHtml(episode.label)}
-    </button>`;
-}
-
-function statusText(status) {
-  const labels = {
-    present: "已有",
-    missing: "缺失",
-    ignored_missing: "已忽略缺失",
-    ignored_show: "已忽略整部剧",
-    unmatched_show: "未匹配",
-    ambiguous_match: "低置信度",
-  };
-  return labels[status] || status;
-}
-
-function bindEpisodeAuditIgnoreButtons(container) {
-  container.querySelectorAll(".ignore-episode").forEach((button) => {
-    button.addEventListener("click", () => ignoreEpisodeAuditItem(Number(button.dataset.id), "episode"));
-  });
-  container.querySelectorAll(".ignore-show").forEach((button) => {
-    button.addEventListener("click", () => ignoreEpisodeAuditItem(Number(button.dataset.id), "show"));
-  });
-}
-
-function bindEpisodeMatchOverrideButtons(container) {
-  container.querySelectorAll(".save-match-override").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const row = button.closest(".match-override");
-      const run = state.episodeAuditReport?.run;
-      if (!row || !run) return;
-      await api("/api/episode-match-overrides", {
-        method: "PUT",
-        body: JSON.stringify({
-          server_id: run.server_id,
-          library_id: run.library_id,
-          plex_rating_key: row.dataset.ratingKey,
-          tmdb_id: Number(row.querySelector("select").value),
-        }),
-      });
-      button.textContent = "已保存，下次检查生效";
-      button.disabled = true;
-    });
-  });
-}
-
-async function ignoreEpisodeAuditItem(itemId, scope) {
-  if (!itemId) return;
-  const reason = prompt(scope === "show" ? "忽略整部剧的原因（可留空）" : "忽略这一集的原因（可留空）", "");
-  if (reason === null) return;
-  await api("/api/episode-audit-ignores/from-item", {
-    method: "POST",
-    body: JSON.stringify({ item_id: itemId, scope, reason }),
-  });
-  setMessage("#episode-audit-message", scope === "show" ? "已忽略整部剧。" : "已忽略这一集。");
-  await loadEpisodeAuditRuns();
-  await loadEpisodeAuditReport();
-  await loadEpisodeAuditItems();
-}
-
-$("#export-episode-audit-json").addEventListener("click", () => {
-  downloadText(`episode-audit-${state.selectedEpisodeAudit || "results"}.json`, JSON.stringify(state.episodeAuditReport || state.episodeAuditItems, null, 2), "application/json");
-});
-
-$("#export-episode-audit-csv").addEventListener("click", () => {
-  const rows = [["show_title", "status", "match_source", "tmdb_id", "tmdb_title", "season", "episode", "label", "air_date", "episode_title"]];
-  const groups = state.episodeAuditReport?.groups || [];
-  groups.forEach((group) => {
-    (group.seasons || []).forEach((season) => {
-      (season.episodes || []).forEach((episode) => {
-        rows.push([
-          group.show_title,
-          episode.status,
-          group.match_source,
-          group.tmdb_id || "",
-          group.tmdb_title || "",
-          episode.season || "",
-          episode.episode || "",
-          episode.label || "",
-          episode.air_date || "",
-          episode.title || "",
-        ]);
-      });
-    });
-  });
-  if (rows.length === 1) {
-    state.episodeAuditItems.forEach((item) => {
-      rows.push([
-        item.show_title,
-        item.status,
-        item.match_source,
-        item.tmdb_id || "",
-        item.tmdb_title || "",
-        item.season || "",
-        item.episode || "",
-        item.season ? `S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}` : "",
-        item.air_date || "",
-        (item.details || {}).episode_title || "",
-      ]);
-    });
-  }
-  const csv = rows.map((row) => row.map(csvCell).join(",")).join("\n");
-  downloadText(`episode-audit-${state.selectedEpisodeAudit || "results"}.csv`, csv, "text/csv;charset=utf-8");
 });
 
 async function loadWebhookData() {
@@ -2255,21 +1692,6 @@ function splitCsv(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
-}
-
-function csvCell(value) {
-  const text = String(value ?? "");
-  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
-}
-
-function downloadText(filename, content, type) {
-  const blob = new Blob([content], { type });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
 }
 
 window.addEventListener("beforeunload", (event) => {

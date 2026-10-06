@@ -28,6 +28,7 @@ JOB_TYPES = {
     "media_library_refresh",
     "media_library_tmdb_refresh",
     "media_library_full_refresh",
+    "media_library_show_recheck",
 }
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 
@@ -148,6 +149,9 @@ class JobQueue:
         source = self.get_job(source_job_id)
         if source["status"] not in {"failed", "cancelled", "interrupted"}:
             raise ValueError("只有失败、取消或中断的任务可以重试")
+        if source["type"] == "media_library_show_recheck":
+            from .rechecks import retry_recheck
+            return retry_recheck(self.db_file, source)
         return self.create_job(
             source["type"], int(source["server_id"]), source.get("payload") or {}, source_job_id
         )
