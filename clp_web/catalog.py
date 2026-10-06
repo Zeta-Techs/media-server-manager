@@ -225,6 +225,19 @@ def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadat
           json.dumps({**metadata, "external_ids": ids}, ensure_ascii=False), utcnow()))
 
 
+def _remove_expected_episode_placeholder(db: Any, server_id: int, library_id: int,
+                                         parent_rating_key: str, season_number: int,
+                                         episode_number: int) -> None:
+    """Remove a TMDB expected-episode row once Plex has the real episode."""
+    db.execute(
+        """DELETE FROM media_library_items
+           WHERE server_id = ? AND library_id = ? AND parent_rating_key = ?
+             AND plex_type = 'episode' AND season_number = ? AND episode_number = ?
+             AND rating_key LIKE 'tmdb:%'""",
+        (server_id, library_id, parent_rating_key, season_number, episode_number),
+    )
+
+
 def _library_is_animation(title: str, plex_type: int) -> bool:
     if int(plex_type) != 2:
         return False
@@ -267,13 +280,19 @@ def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=
                 for season in plex.get_children(show_key):
                     if season.get("ratingKey"):
                         seen_keys.add(str(season["ratingKey"]))
-                    season_no = int(season.get("index") or season.get("parentIndex") or 0)
+                    season_index = season.get("index")
+                    if season_index is None:
+                        season_index = season.get("parentIndex")
+                    season_no = int(season_index or 0)
                     _upsert_media_library_item(db, server_id, library_id, season, "season", show_key, season_no, None)
                 for episode in plex.list_show_episodes(show_key):
                     if episode.get("ratingKey"):
                         seen_keys.add(str(episode["ratingKey"]))
+                    season_no = int(episode.get("parentIndex") or 0)
+                    episode_no = int(episode.get("index") or 0)
                     _upsert_media_library_item(db, server_id, library_id, episode, "episode", show_key,
-                                               int(episode.get("parentIndex") or 0), int(episode.get("index") or 0))
+                                               season_no, episode_no)
+                    _remove_expected_episode_placeholder(db, server_id, library_id, show_key, season_no, episode_no)
             db.commit()
         count += 1
         if progress:

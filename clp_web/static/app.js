@@ -456,9 +456,16 @@ async function handleMediaRecheck(event) {
     const fresh = await api(`/api/servers/${serverId}/media-library/recheck`, { method: "POST", body: JSON.stringify({ library_id: Number(button.dataset.libraryId), rating_key: button.dataset.ratingKey }) });
     const card = button.closest(".show-card");
     if (card) {
-      card.outerHTML = renderShowCard(fresh, serverId);
-      const replacement = document.querySelector(`.media-recheck[data-rating-key="${CSS.escape(fresh.rating_key)}"]`);
-      replacement?.addEventListener("click", handleMediaRecheck);
+      // Quarter cards highlight the season that placed the show in the
+      // current quarter. Preserve that focus after refreshing the show data;
+      // otherwise every season is rendered as an older, grey card.
+      const cardKey = card.dataset.showCard || "";
+      const prefix = `${fresh.rating_key}-`;
+      const focusSeason = cardKey.startsWith(prefix) ? Number(cardKey.slice(prefix.length)) : null;
+      card.outerHTML = renderShowCard(fresh, serverId, Number.isFinite(focusSeason) ? focusSeason : null);
+      const replacement = document.querySelector(`[data-show-card="${CSS.escape(cardKey)}"]`);
+      replacement?.querySelector(".media-recheck")?.addEventListener("click", handleMediaRecheck);
+      replacement?.querySelector(".media-detail-link")?.addEventListener("click", () => openMediaDetail(fresh.rating_key, fresh.library_id, "show"));
       bindMediaKindToggles();
       bindSeasonToggles();
     }

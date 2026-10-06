@@ -41,7 +41,7 @@ from .security import (
     verify_password,
 )
 from .services import TERMINAL_JOB_STATUSES, JobQueue
-from .catalog import _upsert_media_library_item
+from .catalog import _remove_expected_episode_placeholder, _upsert_media_library_item
 
 
 def _air_date(metadata: dict[str, Any]) -> str:
@@ -129,12 +129,23 @@ def _show_payload(plex: PlexServer, show: dict[str, Any], library_id: int) -> di
         season_rows = []
     def season_number_for(row: dict[str, Any]) -> int:
         try:
-            return int(row.get("index") or row.get("parentIndex") or 0)
+            value = row.get("index")
+            if value is None:
+                value = row.get("parentIndex")
+            return int(value or 0)
         except (TypeError, ValueError):
             return 0
     known_seasons = {season_number_for(row) for row in season_rows}
     for season_number in sorted(set(known_seasons) | set(episodes_by_season)):
-        season = next((row for row in season_rows if season_number_for(row) == season_number), {})
+        matching_seasons = [row for row in season_rows if season_number_for(row) == season_number]
+        season = matching_seasons[0] if matching_seasons else {}
+        for candidate in matching_seasons[1:]:
+            if (
+                str(season.get("title") or "").strip().casefold() == "specials"
+                and str(candidate.get("title") or "").strip().casefold() != "specials"
+                and season_number > 0
+            ):
+                season = candidate
         episodes = sorted(episodes_by_season.get(season_number, []), key=lambda item: item["episode"])
         dates = [item["air_date"] for item in episodes if item["air_date"]]
         release_date = min(dates) if dates else _air_date(season)
@@ -227,21 +238,56 @@ def _quarter_entries(show: dict[str, Any], library_id: int, plex: PlexServer) ->
 def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any, library: Any) -> dict[str, Any]:
     show = dict(show_row)
     seasons = []
-    season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' ORDER BY season_number", (server_id, library_id, show["rating_key"])).fetchall()
+    season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' ORDER BY season_number, id", (server_id, library_id, show["rating_key"])).fetchall()
+
+    # A Plex library can expose an anomalous ``Specials`` row with index 0,
+    # while its cached season number has been normalised to 1.  If we render
+    # rows independently, that row duplicates the real Season 1 card.  Group
+    # by the normalised season number and choose the most useful source row:
+    # real Plex seasons beat expected TMDB placeholders, and a named season
+    # beats an anomalous ``Specials`` label for season numbers greater than 0.
+    seasons_by_number: dict[int, dict[str, Any]] = {}
     for season_row in season_rows:
         season = dict(season_row)
-        episodes = []
+        season_number = int(season.get("season_number") or 0)
+        existing = seasons_by_number.get(season_number)
+        if existing is None:
+            seasons_by_number[season_number] = season
+            continue
+        existing_raw = decode_payload(existing.get("raw_json"))
+        season_raw = decode_payload(season.get("raw_json"))
+        existing_expected = existing_raw.get("expected") is True or str(existing.get("rating_key") or "").startswith("tmdb")
+        season_expected = season_raw.get("expected") is True or str(season.get("rating_key") or "").startswith("tmdb")
+        existing_specials = str(existing.get("title") or "").strip().casefold() == "specials"
+        season_specials = str(season.get("title") or "").strip().casefold() == "specials"
+        if (
+            (existing_expected and not season_expected)
+            or (existing_specials and not season_specials and season_number > 0)
+        ):
+            seasons_by_number[season_number] = season
+
+    for season_number in sorted(seasons_by_number):
+        season = seasons_by_number[season_number]
+        episodes_by_number = {}
         episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? ORDER BY episode_number", (server_id, library_id, show["rating_key"], season["season_number"])).fetchall()
         for episode_row in episode_rows:
             episode = dict(episode_row)
             expected = decode_payload(episode.get("raw_json")).get("expected") is True or str(episode.get("rating_key") or "").startswith("tmdb:")
-            episodes.append({"rating_key": episode["rating_key"], "season": int(episode["season_number"] or 0), "episode": int(episode["episode_number"] or 0),
-                             "title": episode["title"], "air_date": episode["release_date"], "duration": episode["duration"] or 0,
-                             "thumb": episode["thumb"], "added_at": episode["added_at"], "expected": expected, "missing": expected})
+            payload = {"rating_key": episode["rating_key"], "season": int(episode["season_number"] or 0), "episode": int(episode["episode_number"] or 0),
+                       "title": episode["title"], "air_date": episode["release_date"], "duration": episode["duration"] or 0,
+                       "thumb": episode["thumb"], "added_at": episode["added_at"], "expected": expected, "missing": expected}
+            episode_number = payload["episode"]
+            existing = episodes_by_number.get(episode_number)
+            # A real Plex row supersedes a TMDB expected placeholder with the
+            # same season/episode number. Keep the placeholder only while the
+            # episode is genuinely absent from Plex.
+            if existing is None or (existing.get("missing") and not expected):
+                episodes_by_number[episode_number] = payload
+        episodes = [episodes_by_number[number] for number in sorted(episodes_by_number)]
         dates = [item["air_date"] for item in episodes if item.get("air_date")]
         release_date = min(dates) if dates else season["release_date"] or ""
-        seasons.append({"season": int(season["season_number"] or 0), "title": season["title"] or f"第 {season['season_number']} 季",
-                        "release_date": release_date, "bucket": "特别篇" if int(season["season_number"] or 0) == 0 else _season_bucket(release_date),
+        seasons.append({"season": season_number, "title": season["title"] or f"第 {season_number} 季",
+                        "release_date": release_date, "bucket": "特别篇" if season_number == 0 else _season_bucket(release_date),
                         "episodes": episodes})
     raw = decode_payload(show.get("raw_json"))
     item = {key: show.get(key) for key in ("rating_key", "title", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "content_rating", "genre", "thumb", "art")}
@@ -979,10 +1025,16 @@ def create_app() -> Flask:
             with connect() as db:
                 _upsert_media_library_item(db, server_id, library_id, metadata, "show")
                 for season in plex.get_children(rating_key):
-                    season_no = int(season.get("index") or season.get("parentIndex") or 0)
+                    season_index = season.get("index")
+                    if season_index is None:
+                        season_index = season.get("parentIndex")
+                    season_no = int(season_index or 0)
                     _upsert_media_library_item(db, server_id, library_id, season, "season", rating_key, season_no, None)
                 for episode in plex.list_show_episodes(rating_key):
-                    _upsert_media_library_item(db, server_id, library_id, episode, "episode", rating_key, int(episode.get("parentIndex") or 0), int(episode.get("index") or 0))
+                    season_no = int(episode.get("parentIndex") or 0)
+                    episode_no = int(episode.get("index") or 0)
+                    _upsert_media_library_item(db, server_id, library_id, episode, "episode", rating_key, season_no, episode_no)
+                    _remove_expected_episode_placeholder(db, server_id, library_id, rating_key, season_no, episode_no)
                 library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
                 db.commit()
                 return jsonify(_cached_show_payload(db, server_id, library_id, db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, rating_key)).fetchone(), library))
