@@ -317,8 +317,37 @@ function renderAnimationQuarterPage(groups, serverId, liveItems = []) {
     map[group.label] = sortQuarterItems(group.items || []);
     return map;
   }, {});
+  const directoryGroups = groups.reduce((map, group) => {
+    const label = String(group.label || "");
+    const yearMatch = label.match(/^(\d{4})\s+/);
+    // Prefix keys so JavaScript does not reorder numeric year properties.
+    const key = yearMatch ? `year-${yearMatch[1]}` : `special-${label}`;
+    if (!map[key]) map[key] = { year: yearMatch ? yearMatch[1] : label, total: 0, quarters: [] };
+    map[key].total += (group.items || []).length;
+    map[key].quarters.push({ label, count: (group.items || []).length });
+    return map;
+  }, {});
+  const directoryMarkup = Object.values(directoryGroups).map((yearGroup) => {
+    const title = yearGroup.year;
+    const isYear = /^\d{4}$/.test(title);
+    const quarterBySlot = yearGroup.quarters.reduce((slots, quarter) => {
+      const match = quarter.label.match(/\bQ([1-4])\b/);
+      if (match) slots[match[1]] = quarter;
+      return slots;
+    }, {});
+    const quarterSlots = isYear ? ["4", "3", "2", "1"].map((slot) => {
+      const quarter = quarterBySlot[slot];
+      if (!quarter) return '<span class="quarter-slot empty" aria-hidden="true">&nbsp;</span>';
+      const shortLabel = (quarter.label.includes("/") ? quarter.label.split("/").pop().trim() : quarter.label).replace(/番$/, "");
+      return `<a href="#quarter-${encodeURIComponent(quarter.label)}" title="${escapeHtml(quarter.label)}"><span>${escapeHtml(shortLabel)}</span><b>${quarter.count}</b></a>`;
+    }).join("") : yearGroup.quarters.map(({ label, count }) => {
+      const shortLabel = (label.includes("/") ? label.split("/").pop().trim() : label).replace(/番$/, "");
+      return `<a href="#quarter-${encodeURIComponent(label)}" title="${escapeHtml(label)}"><span>${escapeHtml(shortLabel)}</span><b>${count}</b></a>`;
+    }).join("");
+    return `<section class="quarter-year-card${isYear ? "" : " special"}"><div class="quarter-year-heading"><strong>${escapeHtml(title)}</strong><span>${yearGroup.total}</span></div><div class="quarter-year-items">${quarterSlots}</div></section>`;
+  }).join("");
   const liveMarkup = liveItems.length ? `<section class="panel quarter-group"><div class="library-heading"><div><span class="eyebrow">LIVE ACTION · ${liveItems.length}</span><h3>真人剧集</h3></div><span class="library-type">真人</span></div><div class="show-grid">${liveItems.map((item) => renderShowCard(item, serverId)).join("")}</div></section>` : "";
-  content.innerHTML = `<div class="quarter-layout"><aside class="quarter-directory">${Object.keys(visibleGroups).map((label) => `<a href="#quarter-${encodeURIComponent(label)}">${escapeHtml(label)} <span>${visibleGroups[label].length}</span></a>`).join("")}</aside><div class="quarter-groups">${liveMarkup}${Object.entries(visibleGroups).map(([label, items]) => `<section id="quarter-${encodeURIComponent(label)}" class="panel quarter-group"><div class="library-heading"><div><span class="eyebrow">ANIMATION QUARTER · ${items.length}</span><h3>${escapeHtml(label)}</h3></div><span class="library-type">季度</span></div><div class="show-grid">${items.map((item) => renderShowCard(item, serverId, item.season)).join("")}</div></section>`).join("")}</div></div>`;
+  content.innerHTML = `<div class="quarter-layout"><aside class="quarter-directory"><div class="quarter-directory-title">季度目录</div>${directoryMarkup}</aside><div class="quarter-groups">${liveMarkup}${Object.entries(visibleGroups).map(([label, items]) => `<section id="quarter-${encodeURIComponent(label)}" class="panel quarter-group"><div class="library-heading"><div><span class="eyebrow">ANIMATION QUARTER · ${items.length}</span><h3>${escapeHtml(label)}</h3></div><span class="library-type">季度</span></div><div class="show-grid">${items.map((item) => renderShowCard(item, serverId, item.season)).join("")}</div></section>`).join("")}</div></div>`;
   content.querySelectorAll(".media-recheck").forEach((button) => button.addEventListener("click", handleMediaRecheck));
   content.querySelectorAll(".media-detail-link").forEach((button) => button.addEventListener("click", () => openMediaDetail(button.dataset.ratingKey, button.dataset.libraryId, button.dataset.mediaType)));
   bindMediaKindToggles();
