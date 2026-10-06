@@ -619,13 +619,7 @@ $("#media-library-refresh")?.addEventListener("click", async () => {
   const serverId = $("#media-library-server")?.value;
   const libraryId = state.mediaLibrarySelectedId;
   if (!serverId || !libraryId) return;
-  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `媒体服务器同步任务已创建：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
-});
-$("#media-library-tmdb-refresh")?.addEventListener("click", async () => {
-  const serverId = $("#media-library-server")?.value;
-  const libraryId = state.mediaLibrarySelectedId;
-  if (!serverId || !libraryId) return;
-  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/tmdb-refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `TMDB 同步任务已创建：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
+  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `已开始同步媒体库、更新 TMDB 数据并检查缺失剧集：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
 });
 $("#media-library-server")?.addEventListener("change", () => { state.mediaLibrarySelectedId = null; state.mediaLibraryPage = 1; loadMediaLibrary(); });
 $("#media-library-picker")?.addEventListener("change", () => selectMediaLibrary($("#media-library-picker").value, $("#media-library-server").value));

@@ -27,6 +27,7 @@ JOB_TYPES = {
     "media_sync",
     "media_library_refresh",
     "media_library_tmdb_refresh",
+    "media_library_full_refresh",
 }
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 

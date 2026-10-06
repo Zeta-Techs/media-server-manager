@@ -41,7 +41,7 @@ from .security import (
     verify_password,
 )
 from .services import TERMINAL_JOB_STATUSES, JobQueue
-from .catalog import _remove_expected_episode_placeholder, _upsert_media_library_item
+from .catalog import sync_media_library_full
 
 
 def _air_date(metadata: dict[str, Any]) -> str:
@@ -985,11 +985,11 @@ def create_app() -> Flask:
     @login_required
     def refresh_media_library(server_id: int, library_id: int):
         try:
-            job_id = manager.create_job("media_library_refresh", server_id, {"server_id": server_id, "library_id": library_id})
+            job_id = manager.create_job("media_library_full_refresh", server_id, {"server_id": server_id, "library_id": library_id})
             with connect() as db:
                 db.execute("UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?", (job_id, utcnow(), server_id, library_id))
                 db.commit()
-            return jsonify({"id": job_id})
+            return jsonify({"id": job_id, "workflow": "plex_then_tmdb"})
         except (TypeError, ValueError) as exc:
             return api_error(str(exc), "invalid_media_library_refresh", 400)
 
@@ -997,11 +997,13 @@ def create_app() -> Flask:
     @login_required
     def refresh_media_library_tmdb(server_id: int, library_id: int):
         try:
-            job_id = manager.create_job("media_library_tmdb_refresh", server_id, {"server_id": server_id, "library_id": library_id})
+            # Keep the legacy endpoint compatible with older clients while
+            # applying the same Plex-first, TMDB-second workflow.
+            job_id = manager.create_job("media_library_full_refresh", server_id, {"server_id": server_id, "library_id": library_id})
             with connect() as db:
                 db.execute("UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?", (job_id, utcnow(), server_id, library_id))
                 db.commit()
-            return jsonify({"id": job_id})
+            return jsonify({"id": job_id, "workflow": "plex_then_tmdb"})
         except (TypeError, ValueError) as exc:
             return api_error(str(exc), "invalid_media_library_tmdb_refresh", 400)
 
@@ -1022,21 +1024,10 @@ def create_app() -> Flask:
             metadata = plex.get_metadata(rating_key)
             if str(metadata.get("type") or "") != "show":
                 return api_error("只支持重新检查剧集", "invalid_media_recheck_type", 400)
+            sync_media_library_full(db_file=DB_FILE, server_id=server_id, library_id=library_id,
+                                    rating_keys={rating_key})
             with connect() as db:
-                _upsert_media_library_item(db, server_id, library_id, metadata, "show")
-                for season in plex.get_children(rating_key):
-                    season_index = season.get("index")
-                    if season_index is None:
-                        season_index = season.get("parentIndex")
-                    season_no = int(season_index or 0)
-                    _upsert_media_library_item(db, server_id, library_id, season, "season", rating_key, season_no, None)
-                for episode in plex.list_show_episodes(rating_key):
-                    season_no = int(episode.get("parentIndex") or 0)
-                    episode_no = int(episode.get("index") or 0)
-                    _upsert_media_library_item(db, server_id, library_id, episode, "episode", rating_key, season_no, episode_no)
-                    _remove_expected_episode_placeholder(db, server_id, library_id, rating_key, season_no, episode_no)
                 library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
-                db.commit()
                 return jsonify(_cached_show_payload(db, server_id, library_id, db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, rating_key)).fetchone(), library))
         except Exception as exc:
             return api_error(str(exc), "media_recheck_failed", 400)

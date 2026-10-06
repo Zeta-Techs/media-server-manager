@@ -11,7 +11,7 @@ import requests
 
 from clp.core import PlexServer, TaskCancelled, extract_external_ids
 
-from .db import connect, get_setting, server_config_from_row, utcnow
+from .db import connect, decode_payload, get_setting, server_config_from_row, utcnow
 from .tmdb import TMDBClient
 
 
@@ -182,13 +182,31 @@ def _plex_date(metadata: dict[str, Any]) -> str:
 
 
 def _plex_genres(metadata: dict[str, Any]) -> str:
-    return ", ".join(str(item.get("tag")) for item in (metadata.get("Genre") or []) if item.get("tag"))
+    values = []
+    for field in ("Genre", "Label"):
+        for item in metadata.get(field) or []:
+            value = str(item.get("tag") or "").strip()
+            if value and value not in values:
+                values.append(value)
+    return ", ".join(values)
 
 
 def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadata: dict[str, Any],
                                plex_type: str | None = None, parent_rating_key: str = "",
                                season_number: int | None = None, episode_number: int | None = None) -> None:
+    rating_key = str(metadata.get("ratingKey") or "")
+    previous = db.execute(
+        "SELECT genre, release_date, raw_json FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?",
+        (server_id, library_id, rating_key),
+    ).fetchone()
+    previous_raw = decode_payload(previous["raw_json"] if previous else "{}")
+    raw_payload = {**previous_raw, **metadata}
     ids = extract_external_ids(metadata)
+    raw_payload["external_ids"] = {
+        **(previous_raw.get("external_ids") or {}),
+        **(metadata.get("external_ids") or {}),
+        **ids,
+    }
     raw_type = str(metadata.get("type") or plex_type or "")
     if raw_type == "season":
         raw_type = "season"
@@ -201,6 +219,11 @@ def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadat
     else:
         raw_type = plex_type or raw_type
     duration = int(metadata.get("duration") or 0) if str(metadata.get("duration") or "0").isdigit() else 0
+    # Genres/labels in the media-library view are authoritative Plex metadata.
+    # Do not carry forward old TMDB genres: a Plex refresh must also clean up
+    # values written by older versions of the synchronizer.
+    genre = _plex_genres(metadata)
+    release_date = _plex_date(metadata) or (str(previous["release_date"] or "") if previous else "")
     db.execute("""
         INSERT INTO media_library_items
           (server_id, library_id, rating_key, plex_type, parent_rating_key, season_number, episode_number,
@@ -215,14 +238,14 @@ def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadat
           audience_rating=excluded.audience_rating, duration=excluded.duration,
           content_rating=excluded.content_rating, genre=excluded.genre, thumb=excluded.thumb,
           art=excluded.art, raw_json=excluded.raw_json, scanned_at=excluded.scanned_at
-    """, (server_id, library_id, str(metadata.get("ratingKey") or ""), raw_type, parent_rating_key,
+    """, (server_id, library_id, rating_key, raw_type, parent_rating_key,
           season_number if season_number is not None else metadata.get("parentIndex"),
           episode_number if episode_number is not None else metadata.get("index"),
           str(metadata.get("title") or ""), str(metadata.get("originalTitle") or ""), metadata.get("year"),
-          metadata.get("addedAt"), _plex_date(metadata), metadata.get("rating"), metadata.get("audienceRating"),
-          duration, str(metadata.get("contentRating") or ""), _plex_genres(metadata),
+          metadata.get("addedAt"), release_date, metadata.get("rating"), metadata.get("audienceRating"),
+          duration, str(metadata.get("contentRating") or ""), genre,
           str(metadata.get("thumb") or metadata.get("parentThumb") or ""), str(metadata.get("art") or ""),
-          json.dumps({**metadata, "external_ids": ids}, ensure_ascii=False), utcnow()))
+          json.dumps(raw_payload, ensure_ascii=False), utcnow()))
 
 
 def _remove_expected_episode_placeholder(db: Any, server_id: int, library_id: int,
@@ -245,7 +268,8 @@ def _library_is_animation(title: str, plex_type: int) -> bool:
     return any(keyword in lowered for keyword in ("anime", "动画", "番"))
 
 
-def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=None, cancelled=None) -> int:
+def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=None, cancelled=None,
+                       rating_keys: set[str] | None = None) -> int:
     with connect(db_file) as db:
         server = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
     if server is None:
@@ -267,6 +291,8 @@ def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=
     items = plex.list_library_collections(library_id) if plex_type == 3 else plex.list_library_items(library_id, plex_type)
     count = 0
     seen_keys: set[str] = set()
+    if rating_keys:
+        items = [item for item in items if str(item.get("ratingKey") or "") in rating_keys]
     for item in items:
         if cancelled and cancelled():
             raise TaskCancelled("任务已取消")
@@ -274,6 +300,11 @@ def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=
             item_type = str(item.get("type") or ("collection" if plex_type == 3 else "show" if plex_type == 2 else "movie"))
             if item.get("ratingKey"):
                 seen_keys.add(str(item["ratingKey"]))
+            if item_type == "show":
+                try:
+                    item = plex.get_metadata(str(item.get("ratingKey") or ""))
+                except Exception:
+                    pass
             _upsert_media_library_item(db, server_id, library_id, item, item_type)
             if item_type == "show":
                 show_key = str(item.get("ratingKey") or "")
@@ -296,24 +327,43 @@ def sync_media_library(db_file: Path, server_id: int, library_id: int, progress=
             db.commit()
         count += 1
         if progress:
-            progress({"processed_delta": 1, "total": len(items), "library": title})
+            progress({"processed_delta": 1, "total": len(items), "stage": "plex_media_library", "library": title})
     with connect(db_file) as db:
         existing = [str(row["rating_key"]) for row in db.execute("SELECT rating_key FROM media_library_items WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchall()]
-        stale = [key for key in existing if key not in seen_keys and not key.startswith("tmdb:")]
-        if stale:
-            db.executemany("DELETE FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", [(server_id, library_id, key) for key in stale])
+        # Keep TMDB season and episode placeholders; the Plex pass only owns
+        # rows returned by Plex and must not erase the comparison baseline.
+        if not rating_keys:
+            stale = [key for key in existing if key not in seen_keys and not key.startswith("tmdb")]
+            if stale:
+                db.executemany("DELETE FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", [(server_id, library_id, key) for key in stale])
         db.execute("UPDATE media_libraries SET plex_synced_at = ?, sync_status = 'idle', updated_at = ? WHERE server_id = ? AND library_id = ?",
                    (utcnow(), utcnow(), server_id, library_id))
         db.commit()
     return count
 
 
-def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, progress=None, cancelled=None) -> int:
+def sync_media_library_full(db_file: Path, server_id: int, library_id: int, progress=None, cancelled=None,
+                            rating_keys: set[str] | None = None) -> dict[str, int]:
+    """Refresh Plex metadata, then TMDB metadata, preserving both sources."""
+    plex_count = sync_media_library(db_file, server_id, library_id, progress=progress, cancelled=cancelled, rating_keys=rating_keys)
+    sync_media_library_tmdb(db_file, server_id, library_id, progress=progress, cancelled=cancelled, rating_keys=rating_keys)
+    return {"plex": plex_count}
+
+
+def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, progress=None, cancelled=None,
+                            rating_keys: set[str] | None = None, logger=None) -> int:
     token = get_setting("tmdb_api_key", db_file)
     if not token:
         raise ValueError("请先保存 TMDB API Key")
     with connect(db_file) as db:
-        rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type IN ('show','movie') ORDER BY id", (server_id, library_id)).fetchall()
+        if rating_keys:
+            placeholders = ",".join("?" for _ in rating_keys)
+            rows = db.execute(
+                f"SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type IN ('show','movie') AND rating_key IN ({placeholders}) ORDER BY id",
+                (server_id, library_id, *sorted(rating_keys)),
+            ).fetchall()
+        else:
+            rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type IN ('show','movie') ORDER BY id", (server_id, library_id)).fetchall()
     tmdb = TMDBClient(token)
     processed = 0
     for row in rows:
@@ -333,18 +383,38 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
             except Exception:
                 tmdb_id = None
         if tmdb_id:
+            details = None
             try:
                 details = tmdb.details("tv" if row["plex_type"] == "show" else "movie", int(tmdb_id))
+            except Exception as exc:
+                cached_details = payload.get("tmdb")
+                if isinstance(cached_details, dict) and cached_details:
+                    details = cached_details
+                if logger:
+                    logger(f"TMDB 详情获取失败：{row['title']}（{tmdb_id}）：{exc}")
+            if details:
+              try:
                 with connect(db_file) as db:
+                    tmdb_release = str(details.get("first_air_date") or details.get("release_date") or "")
+                    # TMDB enriches raw data and dates only.  The genre column
+                    # remains the Plex Genre/Label projection above.
                     db.execute("UPDATE media_library_items SET raw_json = ?, release_date = COALESCE(NULLIF(?, ''), release_date), scanned_at = ? WHERE server_id = ? AND library_id = ? AND rating_key = ?",
-                               (json.dumps({**payload, "tmdb": details}, ensure_ascii=False), str(details.get("first_air_date") or details.get("release_date") or ""), utcnow(), server_id, library_id, row["rating_key"]))
+                               (json.dumps({**payload, "tmdb": details}, ensure_ascii=False), tmdb_release, utcnow(), server_id, library_id, row["rating_key"]))
                     if row["plex_type"] == "show":
                         for season_info in details.get("seasons") or []:
                             season_number = int(season_info.get("season_number") or 0)
                             try:
                                 season_details = tmdb.season_details(int(tmdb_id), season_number)
-                            except Exception:
-                                continue
+                            except Exception as exc:
+                                season_details = None
+                                cached_season = db.execute("SELECT raw_json FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' AND season_number = ? ORDER BY id LIMIT 1", (server_id, library_id, row["rating_key"], season_number)).fetchone()
+                                if cached_season:
+                                    cached = decode_payload(cached_season["raw_json"])
+                                    season_details = cached.get("tmdb") if isinstance(cached.get("tmdb"), dict) else None
+                                if logger:
+                                    logger(f"TMDB 季详情获取失败：{row['title']} S{season_number:02d}（{tmdb_id}）：{exc}")
+                                if not season_details:
+                                    continue
                             season_key = f"tmdb-season:{tmdb_id}:{season_number}"
                             season_present = db.execute("SELECT 1 FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' AND season_number = ? LIMIT 1", (server_id, library_id, row["rating_key"], season_number)).fetchone()
                             if not season_present:
@@ -352,7 +422,12 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
                                 db.execute("INSERT OR IGNORE INTO media_library_items (server_id, library_id, rating_key, plex_type, parent_rating_key, season_number, title, release_date, raw_json, scanned_at) VALUES (?, ?, ?, 'season', ?, ?, ?, ?, ?, ?)", (server_id, library_id, season_key, row["rating_key"], season_number, str(season_details.get("name") or f"第 {season_number} 季"), first_air, json.dumps({"tmdb": season_details, "expected": True}, ensure_ascii=False), utcnow()))
                             for expected in season_details.get("episodes") or []:
                                 episode_number = int(expected.get("episode_number") or 0)
-                                present = db.execute("SELECT 1 FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? AND episode_number = ? LIMIT 1", (server_id, library_id, row["rating_key"], season_number, episode_number)).fetchone()
+                                # A TMDB expected row is the comparison
+                                # baseline, not proof that Plex has the
+                                # episode.  Exclude placeholders here or a
+                                # repeated recheck will delete every missing
+                                # episode and the next recheck will recreate it.
+                                present = db.execute("SELECT 1 FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? AND episode_number = ? AND rating_key NOT LIKE 'tmdb:%' LIMIT 1", (server_id, library_id, row["rating_key"], season_number, episode_number)).fetchone()
                                 if present:
                                     db.execute("DELETE FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, f"tmdb:{tmdb_id}:{season_number}:{episode_number}"))
                                     continue
@@ -368,8 +443,9 @@ def sync_media_library_tmdb(db_file: Path, server_id: int, library_id: int, prog
                                       str(expected.get("air_date") or "")[:10], int(expected.get("runtime") or 0),
                                       json.dumps({"tmdb": expected, "expected": True}, ensure_ascii=False), utcnow()))
                     db.commit()
-            except Exception:
-                pass
+              except Exception as exc:
+                if logger:
+                    logger(f"TMDB 缺集写入失败：{row['title']}（{tmdb_id}）：{exc}")
         processed += 1
         if progress:
             progress({"processed_delta": 1, "total": len(rows), "stage": "tmdb_media_library"})

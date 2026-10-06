@@ -143,12 +143,33 @@ class TaskManager:
                         db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
                         db.commit()
                     raise
+            elif job_type == "media_library_full_refresh":
+                library_id = int(payload["library_id"])
+                try:
+                    server_id = int(payload["server_id"])
+                    progress = lambda p: self._progress(job_id, p)
+                    cancelled = lambda: self._cancel_requested(job_id)
+                    # The Plex and TMDB passes are separate progress stages.
+                    # Reset the counters before TMDB so the UI never displays
+                    # a sum of two different stage totals.
+                    sync_media_library(self.db_file, server_id, library_id,
+                                       progress=progress, cancelled=cancelled)
+                    self._reset_progress(job_id, "tmdb_media_library")
+                    sync_media_library_tmdb(self.db_file, server_id, library_id,
+                                            progress=progress, cancelled=cancelled,
+                                            logger=lambda message: self._log(job_id, message))
+                except Exception as exc:
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.commit()
+                    raise
             elif job_type == "media_library_tmdb_refresh":
                 library_id = int(payload["library_id"])
                 try:
                     sync_media_library_tmdb(self.db_file, int(payload["server_id"]), library_id,
                                             progress=lambda p: self._progress(job_id, p),
-                                            cancelled=lambda: self._cancel_requested(job_id))
+                                            cancelled=lambda: self._cancel_requested(job_id),
+                                            logger=lambda message: self._log(job_id, message))
                 except Exception as exc:
                     with connect(self.db_file) as db:
                         db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
@@ -213,6 +234,14 @@ class TaskManager:
                 should_flush = True
         if should_flush:
             self._flush_progress(job_id)
+
+    def _reset_progress(self, job_id: int, stage: str, total: int = 0) -> None:
+        """Start a new progress stage with independent counters."""
+        self._flush_progress(job_id, force_publish=False)
+        with connect(self.db_file) as db:
+            db.execute("UPDATE jobs SET processed = 0, total = ?, stage = ? WHERE id = ?", (int(total), stage, job_id))
+            db.commit()
+        self._publish_job(job_id)
 
     def _flush_progress(self, job_id: int, force_publish: bool = True) -> None:
         with self.progress_lock:
