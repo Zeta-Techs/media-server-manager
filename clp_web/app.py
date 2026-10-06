@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from flask import Blueprint, Flask, Response, jsonify, redirect, render_template, request, session, url_for
 from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
-from clp.core import PlexServer, join_skip_libraries
+from clp.core import PlexServer, extract_external_ids, join_skip_libraries
 
 from .db import (
     DB_FILE,
@@ -41,6 +41,214 @@ from .security import (
     verify_password,
 )
 from .services import TERMINAL_JOB_STATUSES, JobQueue
+from .catalog import _upsert_media_library_item
+
+
+def _air_date(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("originallyAvailableAt") or metadata.get("originally_available_at") or "")[:10]
+
+
+def _season_bucket(date_value: str) -> str:
+    if not date_value or len(date_value) < 7:
+        return "未定档"
+    try:
+        year, month = int(date_value[:4]), int(date_value[5:7])
+    except (TypeError, ValueError):
+        return "未定档"
+    quarter = ((month - 1) // 3) + 1
+    label = {1: "1月番", 2: "4月番", 3: "7月番", 4: "10月番"}[quarter]
+    return f"{year} Q{quarter} / {label}"
+
+
+def _media_image_path(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("thumb") or metadata.get("parentThumb") or "")
+
+
+def _media_fields(metadata: dict[str, Any]) -> dict[str, Any]:
+    try:
+        duration = int(metadata.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    return {
+        "rating_key": str(metadata.get("ratingKey") or ""),
+        "title": str(metadata.get("title") or ""),
+        "original_title": str(metadata.get("originalTitle") or ""),
+        "year": metadata.get("year"),
+        "added_at": metadata.get("addedAt"),
+        "release_date": _air_date(metadata),
+        "rating": metadata.get("rating"),
+        "audience_rating": metadata.get("audienceRating"),
+        "duration": duration,
+        "content_rating": str(metadata.get("contentRating") or ""),
+        "genre": ", ".join(str(g.get("tag")) for g in (metadata.get("Genre") or []) if g.get("tag")),
+        "summary": str(metadata.get("summary") or ""),
+        "thumb": _media_image_path(metadata),
+        "art": str(metadata.get("art") or ""),
+        "type": str(metadata.get("type") or ""),
+        "external_ids": extract_external_ids(metadata),
+    }
+
+
+def _episode_payload(episode: dict[str, Any]) -> dict[str, Any]:
+    try:
+        season = int(episode.get("parentIndex") or 0)
+    except (TypeError, ValueError):
+        season = 0
+    try:
+        number = int(episode.get("index") or 0)
+    except (TypeError, ValueError):
+        number = 0
+    try:
+        duration = int(episode.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration = 0
+    return {
+        "rating_key": str(episode.get("ratingKey") or ""),
+        "season": season,
+        "episode": number,
+        "title": str(episode.get("title") or ""),
+        "air_date": _air_date(episode),
+        "duration": duration,
+        "thumb": _media_image_path(episode),
+    }
+
+
+def _show_payload(plex: PlexServer, show: dict[str, Any], library_id: int) -> dict[str, Any]:
+    show_key = str(show.get("ratingKey") or "")
+    seasons = []
+    episodes_by_season: dict[int, list[dict[str, Any]]] = {}
+    try:
+        for episode in plex.list_show_episodes(show_key):
+            payload = _episode_payload(episode)
+            episodes_by_season.setdefault(payload["season"], []).append(payload)
+    except Exception:
+        episodes_by_season = {}
+    try:
+        season_rows = plex.get_children(show_key)
+    except Exception:
+        season_rows = []
+    def season_number_for(row: dict[str, Any]) -> int:
+        try:
+            return int(row.get("index") or row.get("parentIndex") or 0)
+        except (TypeError, ValueError):
+            return 0
+    known_seasons = {season_number_for(row) for row in season_rows}
+    for season_number in sorted(set(known_seasons) | set(episodes_by_season)):
+        season = next((row for row in season_rows if season_number_for(row) == season_number), {})
+        episodes = sorted(episodes_by_season.get(season_number, []), key=lambda item: item["episode"])
+        dates = [item["air_date"] for item in episodes if item["air_date"]]
+        release_date = min(dates) if dates else _air_date(season)
+        seasons.append({
+            "season": season_number,
+            "title": str(season.get("title") or f"第 {season_number} 季"),
+            "release_date": release_date,
+            "bucket": "特别篇" if season_number == 0 else _season_bucket(release_date),
+            "episodes": episodes,
+        })
+    seasons.sort(key=lambda item: item["season"])
+    return {
+        **_media_fields(show),
+        "library_id": int(library_id),
+        "show_kind": "动画" if any(any(marker in str(item.get("tag") or "").lower() for marker in ("动画", "animation", "anime")) for item in (show.get("Genre") or [])) else "真人",
+        "seasons": seasons,
+        "season_count": len(seasons),
+        "episode_count": sum(len(season["episodes"]) for season in seasons),
+    }
+
+
+def _show_summary_payload(show: dict[str, Any], library_id: int) -> dict[str, Any]:
+    """Return the inexpensive part of a show card before its episodes load."""
+    return {
+        **_media_fields(show),
+        "library_id": int(library_id),
+        "show_kind": "动画" if any(any(marker in str(item.get("tag") or "").lower() for marker in ("动画", "animation", "anime")) for item in (show.get("Genre") or [])) else "真人",
+        "seasons": [],
+        "season_count": int(show.get("childCount") or 0),
+        "episode_count": int(show.get("leafCount") or 0),
+    }
+
+
+def _sort_value(item: dict[str, Any], field: str) -> Any:
+    aliases = {
+        "name": "title", "original_title": "original_title", "year": "year", "added_at": "added_at",
+        "release_date": "release_date", "rating": "rating", "audience_rating": "audience_rating",
+        "duration": "duration", "season_count": "season_count", "episode_count": "episode_count",
+        "content_rating": "content_rating", "genre": "genre",
+    }
+    value = item.get(aliases.get(field, "title"))
+    if value in (None, ""):
+        return (1, "")
+    if field in {"year", "added_at", "rating", "audience_rating", "duration", "season_count", "episode_count"}:
+        try:
+            return (0, float(value))
+        except (TypeError, ValueError):
+            return (1, 0)
+    return (0, str(value).casefold())
+
+
+def _sort_items(items: list[dict[str, Any]], field: str, direction: str) -> list[dict[str, Any]]:
+    reverse = direction == "desc"
+    return sorted(items, key=lambda item: (_sort_value(item, field), str(item.get("rating_key") or "")), reverse=reverse)
+
+
+def _library_name_is_animation(title: str, plex_type: int) -> bool:
+    return int(plex_type) == 2 and any(keyword in str(title or "").casefold() for keyword in ("anime", "动画", "番"))
+
+
+def _library_is_animation(mode: str, title: str, plex_type: int) -> bool:
+    if int(plex_type) != 2:
+        return False
+    if mode == "animation":
+        return True
+    if mode == "normal":
+        return False
+    return _library_name_is_animation(title, plex_type)
+
+
+def _quarter_entries(show: dict[str, Any], library_id: int, plex: PlexServer) -> list[dict[str, Any]]:
+    full = _show_payload(plex, show, library_id)
+    entries = []
+    for season in full["seasons"]:
+        dates = [episode["air_date"] for episode in season["episodes"] if episode.get("air_date")]
+        first_date = min(dates) if dates else season.get("release_date") or ""
+        entries.append({
+            **_show_summary_payload(show, library_id),
+            "season": season["season"],
+            "bucket": season["bucket"],
+            "release_date": season.get("release_date") or "",
+            "first_episode_date": first_date,
+            "episode_count": len(season["episodes"]),
+            "is_special": season["season"] == 0,
+            "is_undated": not bool(first_date),
+        })
+    return entries
+
+
+def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any, library: Any) -> dict[str, Any]:
+    show = dict(show_row)
+    seasons = []
+    season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' ORDER BY season_number", (server_id, library_id, show["rating_key"])).fetchall()
+    for season_row in season_rows:
+        season = dict(season_row)
+        episodes = []
+        episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? ORDER BY episode_number", (server_id, library_id, show["rating_key"], season["season_number"])).fetchall()
+        for episode_row in episode_rows:
+            episode = dict(episode_row)
+            expected = decode_payload(episode.get("raw_json")).get("expected") is True or str(episode.get("rating_key") or "").startswith("tmdb:")
+            episodes.append({"rating_key": episode["rating_key"], "season": int(episode["season_number"] or 0), "episode": int(episode["episode_number"] or 0),
+                             "title": episode["title"], "air_date": episode["release_date"], "duration": episode["duration"] or 0,
+                             "thumb": episode["thumb"], "added_at": episode["added_at"], "expected": expected, "missing": expected})
+        dates = [item["air_date"] for item in episodes if item.get("air_date")]
+        release_date = min(dates) if dates else season["release_date"] or ""
+        seasons.append({"season": int(season["season_number"] or 0), "title": season["title"] or f"第 {season['season_number']} 季",
+                        "release_date": release_date, "bucket": "特别篇" if int(season["season_number"] or 0) == 0 else _season_bucket(release_date),
+                        "episodes": episodes})
+    raw = decode_payload(show.get("raw_json"))
+    item = {key: show.get(key) for key in ("rating_key", "title", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "content_rating", "genre", "thumb", "art")}
+    item.update({"library_id": library_id, "type": "show", "summary": raw.get("summary") or "", "external_ids": raw.get("external_ids") or extract_external_ids(raw),
+                 "show_kind": "动画" if _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人", "seasons": seasons,
+                 "season_count": len(seasons), "episode_count": sum(len(item["episodes"]) for item in seasons)})
+    return item
 
 
 def create_app() -> Flask:
@@ -160,6 +368,10 @@ def create_app() -> Flask:
 
     @auth_bp.route("/")
     def index():
+        return render_template("index.html", initialized=has_user())
+
+    @auth_bp.route("/media-library/detail")
+    def media_library_detail_page():
         return render_template("index.html", initialized=has_user())
 
     @auth_bp.post("/api/setup")
@@ -602,10 +814,34 @@ def create_app() -> Flask:
             if server is None:
                 return api_error("服务器不存在", "server_not_found", 404)
             plex = PlexServer(server_config_from_row(server), tags=load_tags(), auto_login=True)
-            libraries = [{"key": item[0], "type": item[1], "title": item[2]} for item in plex.list_library()]
+            upstream = [{"key": item[0], "type": item[1], "title": item[2]} for item in plex.list_library()]
+            with connect() as db:
+                now = utcnow()
+                for item in upstream:
+                    db.execute("INSERT OR IGNORE INTO media_libraries (server_id, library_id, title, plex_type, auto_animation, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (server_id, int(item["key"]), item["title"], int(item["type"]), 1 if _library_name_is_animation(item["title"], item["type"]) else 0, now))
+                db.commit()
+                settings = {int(row["library_id"]): dict(row) for row in db.execute("SELECT * FROM media_libraries WHERE server_id = ?", (server_id,)).fetchall()}
+            libraries = [{**item, "animation_mode": settings.get(int(item["key"]), {}).get("animation_mode", "auto"),
+                          "auto_animation": bool(settings.get(int(item["key"]), {}).get("auto_animation", _library_name_is_animation(item["title"], item["type"]))),
+                          "is_animation": _library_is_animation(settings.get(int(item["key"]), {}).get("animation_mode", "auto"), item["title"], item["type"])} for item in upstream]
             return jsonify(libraries)
         except Exception as exc:
             return api_error(str(exc), "plex_library_failed", 400)
+
+    @servers_bp.put("/api/servers/<int:server_id>/libraries/<int:library_id>/settings")
+    @login_required
+    def update_library_settings(server_id: int, library_id: int):
+        data = request.get_json(force=True) or {}
+        mode = str(data.get("animation_mode") or "auto")
+        if mode not in {"auto", "animation", "normal"}:
+            return api_error("动画媒体库模式无效", "invalid_animation_mode", 400)
+        with connect() as db:
+            library = db.execute("SELECT title, plex_type FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            if library is None:
+                return api_error("媒体库尚未同步，请先从媒体服务器重新拉取", "library_cache_missing", 404)
+            db.execute("UPDATE media_libraries SET animation_mode = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (mode, utcnow(), server_id, library_id))
+            db.commit()
+        return jsonify({"ok": True, "animation_mode": mode, "is_animation": _library_is_animation(mode, library["title"], library["plex_type"])})
 
     @servers_bp.get("/api/servers/<int:server_id>/media-image")
     @login_required
@@ -634,6 +870,187 @@ def create_app() -> Flask:
             return api_error(str(exc), "invalid_media_path", 400)
         except Exception as exc:
             return api_error(str(exc), "media_image_failed", 502)
+
+    @servers_bp.get("/api/servers/<int:server_id>/media-library")
+    @login_required
+    def media_library(server_id: int):
+        with connect() as db:
+            server = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+            if server is None:
+                return api_error("服务器不存在或已停用", "server_not_found", 404)
+            libraries = db.execute("""SELECT media_libraries.*, jobs.status AS job_status, jobs.stage AS job_stage,
+                                      jobs.current_library AS job_current_library, jobs.processed AS job_processed,
+                                      jobs.total AS job_total, jobs.error AS job_error
+                               FROM media_libraries LEFT JOIN jobs ON jobs.id = media_libraries.sync_job_id
+                               WHERE media_libraries.server_id = ? ORDER BY media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
+        if not libraries:
+            try:
+                with connect() as db:
+                    server_row = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+                plex = PlexServer(server_config_from_row(server_row), tags=load_tags(), auto_login=True)
+                now = utcnow()
+                with connect() as db:
+                    for key, plex_type, title in plex.list_library():
+                        db.execute("INSERT OR IGNORE INTO media_libraries (server_id, library_id, title, plex_type, auto_animation, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (server_id, int(key), str(title), int(plex_type), 1 if _library_name_is_animation(title, plex_type) else 0, now))
+                    db.commit()
+                    libraries = db.execute("""SELECT media_libraries.*, jobs.status AS job_status, jobs.stage AS job_stage,
+                                              jobs.current_library AS job_current_library, jobs.processed AS job_processed,
+                                              jobs.total AS job_total, jobs.error AS job_error
+                                       FROM media_libraries LEFT JOIN jobs ON jobs.id = media_libraries.sync_job_id
+                                       WHERE media_libraries.server_id = ? ORDER BY media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
+            except Exception as exc:
+                return api_error(str(exc), "media_library_bootstrap_failed", 400)
+        with connect() as db:
+            output = []
+            for library in libraries:
+                count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library["library_id"])).fetchone()["count"]
+                output.append({"id": int(library["library_id"]), "title": library["title"], "plex_type": int(library["plex_type"]),
+                               "kind": "movie" if int(library["plex_type"]) == 1 else "show" if int(library["plex_type"]) == 2 else "collection",
+                               "items": [], "item_count": int(count), "animation_mode": library["animation_mode"],
+                               "auto_animation": bool(library["auto_animation"]), "is_animation": _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]),
+                               "plex_synced_at": library["plex_synced_at"], "tmdb_synced_at": library["tmdb_synced_at"],
+                               "sync_status": library["job_status"] or library["sync_status"], "sync_job_id": library["sync_job_id"],
+                               "sync_error": library["job_error"] or library["sync_error"], "sync_stage": library["job_stage"] or "",
+                               "sync_current_library": library["job_current_library"] or "", "sync_processed": int(library["job_processed"] or 0),
+                               "sync_total": int(library["job_total"] or 0)})
+        return jsonify({"server_id": server_id, "libraries": output, "generated_at": utcnow()})
+
+    @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/items")
+    @login_required
+    def media_library_items(server_id: int, library_id: int):
+        with connect() as db:
+            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            if library is None:
+                return api_error("媒体库缓存不存在，请先同步", "library_cache_missing", 404)
+            rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection') ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
+            items = []
+            for row in rows:
+                item = dict(row)
+                raw = decode_payload(item.pop("raw_json", "{}"))
+                item["external_ids"] = raw.get("external_ids") or extract_external_ids(raw)
+                item["library_id"] = library_id
+                item["show_kind"] = "动画" if library["plex_type"] == 2 and _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人"
+                item["season_count"] = db.execute("SELECT COUNT(DISTINCT season_number) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season'", (server_id, library_id, row["rating_key"])).fetchone()["count"]
+                item["episode_count"] = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode'", (server_id, library_id, row["rating_key"])).fetchone()["count"]
+                items.append(item)
+        return jsonify({"server_id": server_id, "library_id": library_id, "items": items})
+
+    @servers_bp.post("/api/servers/<int:server_id>/media-library/<int:library_id>/refresh")
+    @login_required
+    def refresh_media_library(server_id: int, library_id: int):
+        try:
+            job_id = manager.create_job("media_library_refresh", server_id, {"server_id": server_id, "library_id": library_id})
+            with connect() as db:
+                db.execute("UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?", (job_id, utcnow(), server_id, library_id))
+                db.commit()
+            return jsonify({"id": job_id})
+        except (TypeError, ValueError) as exc:
+            return api_error(str(exc), "invalid_media_library_refresh", 400)
+
+    @servers_bp.post("/api/servers/<int:server_id>/media-library/<int:library_id>/tmdb-refresh")
+    @login_required
+    def refresh_media_library_tmdb(server_id: int, library_id: int):
+        try:
+            job_id = manager.create_job("media_library_tmdb_refresh", server_id, {"server_id": server_id, "library_id": library_id})
+            with connect() as db:
+                db.execute("UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?", (job_id, utcnow(), server_id, library_id))
+                db.commit()
+            return jsonify({"id": job_id})
+        except (TypeError, ValueError) as exc:
+            return api_error(str(exc), "invalid_media_library_tmdb_refresh", 400)
+
+    @servers_bp.post("/api/servers/<int:server_id>/media-library/recheck")
+    @login_required
+    def media_library_recheck(server_id: int):
+        data = request.get_json(force=True) or {}
+        library_id = int(data.get("library_id") or 0)
+        rating_key = str(data.get("rating_key") or "").strip()
+        if not library_id or not rating_key:
+            return api_error("缺少媒体库或剧集标识", "invalid_media_recheck", 400)
+        try:
+            with connect() as db:
+                server = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+            if server is None:
+                return api_error("服务器不存在或已停用", "server_not_found", 404)
+            plex = PlexServer(server_config_from_row(server), tags=load_tags(), auto_login=True)
+            metadata = plex.get_metadata(rating_key)
+            if str(metadata.get("type") or "") != "show":
+                return api_error("只支持重新检查剧集", "invalid_media_recheck_type", 400)
+            with connect() as db:
+                _upsert_media_library_item(db, server_id, library_id, metadata, "show")
+                for season in plex.get_children(rating_key):
+                    season_no = int(season.get("index") or season.get("parentIndex") or 0)
+                    _upsert_media_library_item(db, server_id, library_id, season, "season", rating_key, season_no, None)
+                for episode in plex.list_show_episodes(rating_key):
+                    _upsert_media_library_item(db, server_id, library_id, episode, "episode", rating_key, int(episode.get("parentIndex") or 0), int(episode.get("index") or 0))
+                library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+                db.commit()
+                return jsonify(_cached_show_payload(db, server_id, library_id, db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, rating_key)).fetchone(), library))
+        except Exception as exc:
+            return api_error(str(exc), "media_recheck_failed", 400)
+
+    @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/quarter-index")
+    @login_required
+    def media_library_quarter_index(server_id: int, library_id: int):
+        with connect() as db:
+            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            if library is None or int(library["plex_type"]) != 2:
+                return api_error("电视剧库缓存不存在", "library_not_found", 404)
+            shows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'show' ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
+            entries, live_items = [], []
+            is_animation_library = _library_is_animation(library["animation_mode"], library["title"], library["plex_type"])
+            for show in shows:
+                full = _cached_show_payload(db, server_id, library_id, show, library)
+                if is_animation_library:
+                    for season in full["seasons"]:
+                        dates = [episode["air_date"] for episode in season["episodes"] if episode.get("air_date")]
+                        first_date = min(dates) if dates else season.get("release_date") or ""
+                        added = [episode["added_at"] for episode in season["episodes"] if episode.get("added_at")]
+                        entries.append({**full, "season": season["season"], "bucket": season["bucket"], "release_date": season.get("release_date") or "",
+                                        "first_episode_date": first_date, "latest_added_at": max(added) if added else "",
+                                        "episode_count": len(season["episodes"]), "missing_count": sum(1 for episode in season["episodes"] if episode.get("missing")),
+                                        "is_special": season["season"] == 0, "is_undated": not bool(first_date)})
+                else:
+                    live_items.append(full)
+            groups = {}
+            for entry in entries:
+                groups.setdefault(entry["bucket"], []).append(entry)
+            def group_key(label: str):
+                # Normal quarters are always newest-first.  Special episodes
+                # and undated seasons are kept as explicit trailing groups.
+                if label == "特别篇": return (1, 0, 0)
+                if label == "未定档": return (2, 0, 0)
+                try:
+                    return (0, -int(label[:4]), -int(label.split("Q", 1)[1].split()[0]))
+                except (TypeError, ValueError, IndexError):
+                    return (2, 0, 0)
+            for group in groups.values():
+                group.sort(key=lambda item: (item.get("first_episode_date") or "9999-99-99", str(item.get("title") or "").casefold()))
+            result = [{"label": label, "items": groups[label]} for label in sorted(groups, key=group_key)]
+        return jsonify({"server_id": server_id, "library_id": library_id, "groups": result, "live_items": live_items})
+
+    @servers_bp.get("/api/servers/<int:server_id>/media-library/item")
+    @login_required
+    def media_library_item(server_id: int):
+        try:
+            library_id = int(request.args.get("library_id") or 0)
+            rating_key = str(request.args.get("rating_key") or "").strip()
+        except (TypeError, ValueError):
+            return api_error("媒体参数无效", "invalid_media_item", 400)
+        if not library_id or not rating_key:
+            return api_error("缺少媒体库或条目标识", "invalid_media_item", 400)
+        with connect() as db:
+            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            row = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, rating_key)).fetchone()
+            if library is None or row is None:
+                return api_error("媒体条目缓存不存在，请先同步媒体库", "media_item_not_found", 404)
+            if row["plex_type"] == "show":
+                return jsonify(_cached_show_payload(db, server_id, library_id, row, library))
+            raw = decode_payload(row["raw_json"])
+            item = dict(row)
+            item.pop("raw_json", None)
+            item.update({"library_id": library_id, "summary": raw.get("summary") or "", "external_ids": raw.get("external_ids") or extract_external_ids(raw), "collections": []})
+        return jsonify(item)
 
     @jobs_bp.post("/api/jobs")
     @login_required

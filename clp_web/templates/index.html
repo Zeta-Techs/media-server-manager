@@ -33,6 +33,7 @@
         <nav aria-label="主导航">
           <button class="nav active" data-view="overview"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#layout-dashboard"></use></svg>概览</button>
           <button class="nav" data-view="servers"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#server"></use></svg>服务器</button>
+          <button class="nav" data-view="media-library"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#library"></use></svg>媒体库</button>
           <button class="nav" data-view="localization"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#languages"></use></svg>本地化</button>
           <button class="nav" data-view="jobs"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#list-checks"></use></svg>任务中心</button>
           <button class="nav" data-view="automation"><svg class="icon" aria-hidden="true"><use href="{{ url_for('static', filename='icons.svg') }}#workflow"></use></svg>自动化</button>
@@ -130,6 +131,40 @@
               <div id="server-message" class="message"></div>
             </form>
           </div>
+        </section>
+
+        <section id="view-media-library" class="view">
+          <div class="toolbar">
+            <div>
+              <span class="eyebrow">PLEX INVENTORY</span>
+              <h2>媒体库</h2>
+              <p>按 Plex 媒体库查看全量电影、剧集和合集，集中管理媒体信息。</p>
+            </div>
+            <div class="button-row">
+              <label class="compact-field">服务器<select id="media-library-server"></select></label>
+              <label class="compact-field">媒体库<select id="media-library-picker"></select></label>
+              <label class="compact-field">动画模式<select id="media-library-animation-mode"><option value="auto">自动</option><option value="animation">动画</option><option value="normal">普通</option></select></label>
+              <label class="compact-field">排序<select id="media-library-sort"><option value="name">名称</option><option value="original_title">原名</option><option value="year">年份</option><option value="added_at">添加时间</option><option value="release_date">首播日期</option><option value="first_episode_date">季度首播日期</option><option value="latest_added_at">最新一集收录时间</option><option value="rating">Plex 评分</option><option value="audience_rating">观众评分</option><option value="duration">片长</option><option value="season_count">季数</option><option value="episode_count">集数</option><option value="content_rating">分级</option><option value="genre">类型</option></select></label>
+              <button id="media-library-sort-direction" type="button" class="small" aria-label="切换排序方向">升序</button>
+              <button id="media-library-refresh" class="primary" type="button">从媒体服务器重新拉取</button>
+              <button id="media-library-tmdb-refresh" type="button">从 TMDB 重新拉取</button>
+            </div>
+          </div>
+          <div id="media-library-summary" class="metric-grid media-library-summary"></div>
+          <div id="media-library-tabs" class="media-library-tabs" role="tablist"></div>
+          <div id="media-library-message" class="message"></div>
+          <div id="media-library-sync-status" class="notice"></div>
+          <div id="media-library-sync-progress" class="sync-progress" hidden>
+            <div class="sync-progress-head"><strong id="media-library-sync-progress-title">正在拉取</strong><span id="media-library-sync-progress-text">0 / 0</span></div>
+            <div class="sync-progress-track"><div id="media-library-sync-progress-bar"></div></div>
+            <div id="media-library-sync-progress-detail" class="meta"></div>
+          </div>
+          <div id="media-library-content" class="media-library-content"></div>
+        </section>
+
+        <section id="view-media-library-detail" class="view">
+          <div class="toolbar"><button id="media-detail-back" type="button">返回媒体库</button></div>
+          <div id="media-detail-content" class="media-detail-content"></div>
         </section>
 
         <section id="view-localization" class="view">
@@ -261,7 +296,9 @@
                 <div><span>变更</span><strong id="job-changes">0</strong></div>
                 <div><span>错误</span><strong id="job-errors">0</strong></div>
               </div>
-              <pre id="job-logs" class="logs"></pre>
+              <div class="job-progress-bar"><div id="job-progress-bar-fill"></div></div>
+              <div id="job-progress-detail" class="meta"></div>
+              <details id="job-log-details" open><summary>实时日志</summary><pre id="job-logs" class="logs"></pre></details>
               <h3>变更记录</h3>
               <div class="button-row">
                 <button id="load-changes" type="button">查看变更</button>
@@ -598,6 +635,13 @@
             <button type="submit" class="primary">修改密码</button>
             <div id="password-message" class="message"></div>
           </form>
+          <form id="system-tmdb-form" class="panel">
+            <h3>TMDB API Key</h3>
+            <p>用于动画剧集季度资料和缺集检查。与媒体库工具共用同一配置。</p>
+            <div class="form-grid"><label>API Key<input id="system-tmdb-api-key" type="password" placeholder="粘贴 TMDB API Key"></label></div>
+            <div class="button-row"><button id="system-save-tmdb-key" class="primary" type="submit">保存 TMDB Key</button><span id="system-tmdb-key-status" class="meta"></span></div>
+            <div id="system-tmdb-message" class="message"></div>
+          </form>
           <div id="diagnostics-list" class="grid-list"></div>
         </section>
       </main>
@@ -606,6 +650,6 @@
     <script>
       window.CLP_INITIALIZED = {{ 'true' if initialized else 'false' }};
     </script>
-    <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v5') }}"></script>
   </body>
 </html>

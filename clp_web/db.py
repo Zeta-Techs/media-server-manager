@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from clp.core import CONFIG_DIR, TEMPLATE_TAGS_FILE, ServerConfig, split_skip_libraries
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_FILE = CONFIG_DIR / "clp.db"
 DEFAULT_USERNAME = "admin"
 
@@ -92,7 +92,7 @@ def _existing_schema_version(db_file: Path) -> int | None:
 def init_db(db_file: Path | None = None) -> None:
     db_file = Path(db_file or DB_FILE)
     version = _existing_schema_version(db_file)
-    if version not in (None, 2, SCHEMA_VERSION):
+    if version not in (None, 2, 3, SCHEMA_VERSION):
         raise IncompatibleSchemaError(
             f"数据库版本 {version} 与应用版本 {SCHEMA_VERSION} 不兼容。"
             "请运行 `python -m clp_admin reset-db --backup`。"
@@ -545,6 +545,53 @@ def init_db(db_file: Path | None = None) -> None:
                 FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_plex_inventory_ids ON plex_inventory_items(server_id, tmdb_id, plex_type);
+
+            CREATE TABLE IF NOT EXISTS media_libraries (
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                plex_type INTEGER NOT NULL DEFAULT 0,
+                animation_mode TEXT NOT NULL DEFAULT 'auto' CHECK (animation_mode IN ('auto','animation','normal')),
+                auto_animation INTEGER NOT NULL DEFAULT 0 CHECK (auto_animation IN (0,1)),
+                plex_synced_at TEXT,
+                tmdb_synced_at TEXT,
+                sync_job_id INTEGER,
+                sync_status TEXT NOT NULL DEFAULT 'idle',
+                sync_error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(server_id, library_id),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_libraries_server ON media_libraries(server_id, plex_type);
+
+            CREATE TABLE IF NOT EXISTS media_library_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                rating_key TEXT NOT NULL,
+                plex_type TEXT NOT NULL DEFAULT '',
+                parent_rating_key TEXT NOT NULL DEFAULT '',
+                season_number INTEGER,
+                episode_number INTEGER,
+                title TEXT NOT NULL DEFAULT '',
+                original_title TEXT NOT NULL DEFAULT '',
+                year INTEGER,
+                added_at TEXT,
+                release_date TEXT NOT NULL DEFAULT '',
+                rating REAL,
+                audience_rating REAL,
+                duration INTEGER,
+                content_rating TEXT NOT NULL DEFAULT '',
+                genre TEXT NOT NULL DEFAULT '',
+                thumb TEXT NOT NULL DEFAULT '',
+                art TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                scanned_at TEXT NOT NULL,
+                UNIQUE(server_id, library_id, rating_key),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_library_items_lookup
+                ON media_library_items(server_id, library_id, plex_type, parent_rating_key);
 
             CREATE TABLE IF NOT EXISTS media_match_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

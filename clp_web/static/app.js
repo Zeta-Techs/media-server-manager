@@ -30,6 +30,8 @@ async function bootstrap() {
   }
   showApp();
   await refreshInitial();
+  const savedView = window.location.pathname === "/media-library/detail" ? "media-library-detail" : (new URLSearchParams(window.location.search).get("view") || sessionStorage.getItem("clp-active-view") || "overview");
+  await switchView(savedView);
 }
 
 async function refreshInitial() {
@@ -74,6 +76,7 @@ $("#auth-form").addEventListener("submit", async (event) => {
 
 $("#logout").addEventListener("click", async () => {
   closeEventSource();
+  if (initialJob) updateJobProgress(initialJob);
   const result = await api("/api/auth/logout", { method: "POST", body: "{}" });
   setCsrfToken(result.csrf_token);
   state.authenticated = false;
@@ -94,7 +97,8 @@ $$(".tab").forEach((button) => {
 });
 
 async function switchView(view) {
-  $$(".nav").forEach((item) => item.classList.toggle("active", item.dataset.view === view));
+  if (view !== "media-library-detail") sessionStorage.setItem("clp-active-view", view);
+  $$(".nav").forEach((item) => item.classList.toggle("active", item.dataset.view === (view === "media-library-detail" ? "media-library" : view)));
   $$(".view").forEach((item) => item.classList.toggle("active", item.id === `view-${view}`));
   if (view !== "jobs") closeEventSource();
   await ensureViewData(view);
@@ -112,6 +116,11 @@ async function ensureViewData(view) {
   if (state.loadedViews.has(view)) return;
   if (view === "overview") await loadOverview();
   if (view === "servers") await loadServers();
+  if (view === "media-library") {
+    await loadServers();
+    await loadMediaLibrary();
+  }
+  if (view === "media-library-detail") await loadMediaDetailFromUrl();
   if (view === "localization") await Promise.all([loadServers(), loadTags()]);
   if (view === "jobs") await loadJobs();
   if (view === "automation") {
@@ -159,10 +168,440 @@ function fillServerSelects() {
   $("#collection-server").innerHTML = options;
   $("#continue-watching-server").innerHTML = options;
   $("#episode-audit-server").innerHTML = options;
+  $("#media-library-server").innerHTML = options;
   $("#webhook-rule-server").innerHTML = options;
   $("#tag-suggestion-server").innerHTML = options;
   $("#schedule-form").server_id.innerHTML = options;
 }
+
+function mediaImageUrl(serverId, path) {
+  return path ? `/api/servers/${encodeURIComponent(serverId)}/media-image?path=${encodeURIComponent(path)}` : "";
+}
+
+function formatMinutes(milliseconds) {
+  const minutes = Math.round(Number(milliseconds || 0) / 60000);
+  return minutes ? `${minutes} 分钟` : "-";
+}
+
+function renderMediaLibrarySummary(libraries) {
+  const totalMovies = libraries.filter((library) => library.kind === "movie").reduce((sum, library) => sum + Number(library.item_count || library.items?.length || 0), 0);
+  const totalShows = libraries.filter((library) => library.kind === "show").reduce((sum, library) => sum + Number(library.item_count || library.items?.length || 0), 0);
+  const totalCollections = libraries.reduce((sum, library) => sum + (library.collections || []).length, 0);
+  const totalEpisodes = libraries.filter((library) => library.kind === "show").reduce((sum, library) => sum + library.items.reduce((n, show) => n + (show.episode_count || (show.seasons || []).reduce((m, season) => m + (season.episodes || []).length, 0)), 0), 0);
+  $("#media-library-summary").innerHTML = [["媒体库", libraries.length], ["电影", totalMovies], ["剧集", totalShows], ["集数", totalEpisodes], ["合集", totalCollections]].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
+}
+
+function renderMediaLibrary(libraries, serverId) {
+  state.mediaLibraryData = libraries;
+  if (!state.mediaLibrarySelectedId || !libraries.some((library) => String(library.id) === String(state.mediaLibrarySelectedId))) {
+    state.mediaLibrarySelectedId = libraries[0]?.id || null;
+  }
+  renderMediaLibrarySummary(libraries);
+  const picker = $("#media-library-picker");
+  picker.innerHTML = libraries.map((library) => `<option value="${library.id}">${escapeHtml(library.title)} · ${library.kind === "movie" ? "电影" : library.kind === "show" ? "剧集" : "合集"} · ${library.item_count || library.items?.length || 0} 项</option>`).join("");
+  picker.value = String(state.mediaLibrarySelectedId || "");
+  const sort = $("#media-library-sort");
+  if (sort) sort.value = state.mediaLibrarySort;
+  const sortDirection = $("#media-library-sort-direction");
+  if (sortDirection) sortDirection.textContent = state.mediaLibraryDirection === "asc" ? "升序" : "降序";
+  const animationMode = $("#media-library-animation-mode");
+  if (animationMode) animationMode.value = libraries.find((library) => String(library.id) === String(state.mediaLibrarySelectedId))?.animation_mode || "auto";
+  const syncLibrary = libraries.find((library) => String(library.id) === String(state.mediaLibrarySelectedId));
+  if (syncLibrary) {
+    const syncStatus = $("#media-library-sync-status");
+    if (syncStatus) syncStatus.textContent = `${syncLibrary.plex_synced_at ? `Plex：${syncLibrary.plex_synced_at}` : "尚未从 Plex 同步"}${syncLibrary.tmdb_synced_at ? ` · TMDB：${syncLibrary.tmdb_synced_at}` : ""}${syncLibrary.sync_status && syncLibrary.sync_status !== "idle" ? ` · 状态：${syncLibrary.sync_status}` : ""}${syncLibrary.sync_error ? ` · ${syncLibrary.sync_error}` : ""}`;
+    renderMediaLibrarySyncProgress(syncLibrary);
+  }
+  $("#media-library-tabs").innerHTML = libraries.map((library) => `<button type="button" class="media-library-tab ${String(library.id) === String(state.mediaLibrarySelectedId) ? "active" : ""}" data-library-tab="${library.id}">${escapeHtml(library.title)}<span>${library.item_count || library.items?.length || 0}</span></button>`).join("");
+  $("#media-library-tabs").querySelectorAll("[data-library-tab]").forEach((button) => button.addEventListener("click", () => {
+    state.mediaLibrarySelectedId = button.dataset.libraryTab;
+    state.mediaLibraryPage = 1;
+    picker.value = state.mediaLibrarySelectedId;
+    $("#media-library-tabs").querySelectorAll(".media-library-tab").forEach((item) => item.classList.toggle("active", item === button));
+    selectMediaLibrary(state.mediaLibrarySelectedId, serverId);
+  }));
+  renderMediaLibraryPage(serverId);
+}
+
+function renderMediaLibrarySyncProgress(library) {
+  const box = $("#media-library-sync-progress");
+  if (!box) return;
+  const active = ["queued", "running"].includes(library?.sync_status);
+  box.hidden = !active;
+  if (!active) return;
+  const processed = Number(library.sync_processed || 0);
+  const total = Number(library.sync_total || 0);
+  const percent = total ? Math.min(100, Math.round(processed * 100 / total)) : 0;
+  $("#media-library-sync-progress-title").textContent = library.sync_status === "queued" ? "等待 Worker 拉取" : `正在拉取 · ${library.sync_stage || "处理中"}`;
+  $("#media-library-sync-progress-text").textContent = total ? `${processed} / ${total}（${percent}%）` : "准备中…";
+  $("#media-library-sync-progress-bar").style.width = `${percent}%`;
+  $("#media-library-sync-progress-detail").textContent = library.sync_current_library ? `当前阶段：${library.sync_current_library}` : "任务已加入后台队列，页面可继续使用。";
+}
+
+async function selectMediaLibrary(libraryId, serverId) {
+  state.mediaLibrarySelectedId = libraryId;
+  state.mediaLibraryPage = 1;
+  const library = state.mediaLibraryData.find((item) => String(item.id) === String(libraryId));
+  if (library?.is_animation) {
+    state.mediaLibrarySort = "first_episode_date";
+    state.mediaLibraryDirection = "desc";
+    const sort = $("#media-library-sort");
+    if (sort) sort.value = state.mediaLibrarySort;
+    const direction = $("#media-library-sort-direction");
+    if (direction) direction.textContent = "降序";
+  }
+  if (library && !library.items?.length) {
+    try {
+      const cached = await api(`/api/servers/${serverId}/media-library/${library.id}/items`);
+      library.items = cached.items || [];
+      renderMediaLibraryPage(serverId);
+    } catch (error) {
+      setMessage("#media-library-message", error.message, true);
+    }
+  }
+  renderMediaLibraryPage(serverId);
+  if (library?.kind === "show" && library.is_animation) {
+    const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
+    state.mediaLibraryQuarterGroups = quarter.groups || [];
+    state.mediaLibraryLiveItems = quarter.live_items || [];
+    renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
+  } else {
+    await loadVisibleShowDetails(serverId);
+  }
+}
+
+function renderMediaLibraryPage(serverId) {
+  const libraries = state.mediaLibraryData || [];
+  const library = libraries.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
+  const content = $("#media-library-content");
+  if (!library) {
+    content.innerHTML = '<div class="panel media-empty">没有读取到媒体库内容。请检查服务器连接和权限。</div>';
+    return;
+  }
+  const orderedItems = sortMediaItems(library.items);
+  const pageItems = orderedItems;
+  const collectionMarkup = (library.collections || []).length ? `<div class="library-collections"><div class="section-label">合集 · ${library.collections.length}</div><div class="collection-strip">${library.collections.map((item) => `<div class="collection-chip"><strong>${escapeHtml(item.title)}</strong><span>${item.child_count || 0} 项</span></div>`).join("")}</div></div>` : "";
+  const panel = (() => {
+    const collectionMarkup = (library.collections || []).length ? `<div class="library-collections"><div class="section-label">合集 · ${library.collections.length}</div><div class="collection-strip">${library.collections.map((item) => `<div class="collection-chip"><strong>${escapeHtml(item.title)}</strong><span>${item.child_count || 0} 项</span></div>`).join("")}</div></div>` : "";
+    if (library.kind === "movie") {
+      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">MOVIES · ${library.items.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载全部 ${library.items.length} 项</span></div><span class="library-type">电影</span></div>${collectionMarkup}<div class="movie-table-wrap"><table class="movie-table"><thead><tr><th>海报</th><th>标题</th><th>年份</th><th>类型</th><th>分级</th><th>片长</th><th>条目键</th><th>操作</th></tr></thead><tbody>${pageItems.map((item) => `<tr><td>${item.thumb ? `<img class="table-poster" src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.genre || "-")}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><code>${escapeHtml(item.rating_key)}</code></td><td><button class="small media-detail-link" type="button" data-library-id="${library.id}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`).join("")}</tbody></table></div></section>`;
+    }
+    if (library.kind === "show") {
+      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">SERIES · ${library.items.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载全部 ${library.items.length} 项</span></div><span class="library-type">剧集</span></div>${collectionMarkup}<div class="show-grid">${pageItems.map((show) => renderShowCard(show, serverId)).join("")}</div></section>`;
+    }
+    return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">COLLECTIONS · ${library.items.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载全部 ${library.items.length} 项</span></div><span class="library-type">合集</span></div><div class="collection-grid">${pageItems.map((item) => `<article class="collection-card">${item.thumb ? `<img src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<div class="collection-fallback">集</div>'}<div><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.summary || "暂无简介")}</span></div></article>`).join("")}</div></section>`;
+  })();
+  content.innerHTML = panel;
+  content.querySelectorAll(".media-recheck").forEach((button) => button.addEventListener("click", handleMediaRecheck));
+  content.querySelectorAll(".media-detail-link").forEach((button) => button.addEventListener("click", () => openMediaDetail(button.dataset.ratingKey, button.dataset.libraryId, button.dataset.mediaType)));
+  bindMediaKindToggles();
+  bindSeasonToggles();
+}
+
+function renderAnimationQuarterPage(groups, serverId, liveItems = []) {
+  const content = $("#media-library-content");
+  const animationField = state.mediaLibrarySort === "name" || state.mediaLibrarySort === "year" ? "first_episode_date" : state.mediaLibrarySort;
+  const animationDirection = state.mediaLibrarySort === "name" || state.mediaLibrarySort === "year" ? state.mediaLibraryAnimationDirection : state.mediaLibraryDirection;
+  const sortQuarterItems = (items) => [...items].sort((a, b) => {
+    const av = a[animationField] ?? "";
+    const bv = b[animationField] ?? "";
+    const emptyA = av === "" || av == null;
+    const emptyB = bv === "" || bv == null;
+    if (emptyA !== emptyB) return emptyA ? 1 : -1;
+    const cmp = String(av).localeCompare(String(bv), undefined, { numeric: true }) || String(a.title || "").localeCompare(String(b.title || ""));
+    return animationDirection === "desc" ? -cmp : cmp;
+  });
+  // Keep the server's quarter ordering (latest normal quarter first, then
+  // 特别篇 and 未定档) while sorting cards only inside each quarter.
+  const visibleGroups = groups.reduce((map, group) => {
+    map[group.label] = sortQuarterItems(group.items || []);
+    return map;
+  }, {});
+  const liveMarkup = liveItems.length ? `<section class="panel quarter-group"><div class="library-heading"><div><span class="eyebrow">LIVE ACTION · ${liveItems.length}</span><h3>真人剧集</h3></div><span class="library-type">真人</span></div><div class="show-grid">${liveItems.map((item) => renderShowCard(item, serverId)).join("")}</div></section>` : "";
+  content.innerHTML = `<div class="quarter-layout"><aside class="quarter-directory">${Object.keys(visibleGroups).map((label) => `<a href="#quarter-${encodeURIComponent(label)}">${escapeHtml(label)} <span>${visibleGroups[label].length}</span></a>`).join("")}</aside><div class="quarter-groups">${liveMarkup}${Object.entries(visibleGroups).map(([label, items]) => `<section id="quarter-${encodeURIComponent(label)}" class="panel quarter-group"><div class="library-heading"><div><span class="eyebrow">ANIMATION QUARTER · ${items.length}</span><h3>${escapeHtml(label)}</h3></div><span class="library-type">季度</span></div><div class="show-grid">${items.map((item) => renderShowCard(item, serverId, item.season)).join("")}</div></section>`).join("")}</div></div>`;
+  content.querySelectorAll(".media-recheck").forEach((button) => button.addEventListener("click", handleMediaRecheck));
+  content.querySelectorAll(".media-detail-link").forEach((button) => button.addEventListener("click", () => openMediaDetail(button.dataset.ratingKey, button.dataset.libraryId, button.dataset.mediaType)));
+  bindMediaKindToggles();
+  bindSeasonToggles();
+  loadVisibleQuarterDetails(serverId, groups);
+}
+
+function saveMediaListState() {
+  sessionStorage.setItem("clp-media-library-state", JSON.stringify({
+    serverId: $("#media-library-server")?.value || "",
+    libraryId: state.mediaLibrarySelectedId,
+    pageSize: state.mediaLibraryPageSize,
+    page: state.mediaLibraryPage,
+    sort: state.mediaLibrarySort,
+    direction: state.mediaLibraryDirection,
+  }));
+}
+
+function openMediaDetail(ratingKey, libraryId, mediaType) {
+  saveMediaListState();
+  const url = `/media-library/detail?server_id=${encodeURIComponent($("#media-library-server").value)}&library_id=${encodeURIComponent(libraryId)}&rating_key=${encodeURIComponent(ratingKey)}&media_type=${encodeURIComponent(mediaType)}`;
+  window.location.href = url;
+}
+
+async function loadMediaDetailFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const serverId = params.get("server_id") || "";
+  const libraryId = params.get("library_id") || "";
+  const ratingKey = params.get("rating_key") || "";
+  if (!serverId || !libraryId || !ratingKey) {
+    $("#media-detail-content").innerHTML = '<div class="panel media-empty">缺少媒体详情参数。</div>';
+    return;
+  }
+  try {
+    const item = await api(`/api/servers/${encodeURIComponent(serverId)}/media-library/item?library_id=${encodeURIComponent(libraryId)}&rating_key=${encodeURIComponent(ratingKey)}&media_type=${encodeURIComponent(params.get("media_type") || "")}`);
+    const isShow = item.type === "show" || Array.isArray(item.seasons);
+    $("#media-detail-content").innerHTML = renderMediaDetail(item, serverId, libraryId, isShow);
+    $("#media-detail-back").onclick = () => {
+      const saved = JSON.parse(sessionStorage.getItem("clp-media-library-state") || "{}");
+      window.location.href = `/?view=media-library&server_id=${encodeURIComponent(saved.serverId || serverId)}`;
+    };
+  } catch (error) {
+    $("#media-detail-content").innerHTML = `<div class="panel error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderMediaDetail(item, serverId, libraryId, isShow) {
+  const hero = `<div class="media-detail-hero">${item.thumb ? `<img src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<div class="show-fallback">媒</div>'}<div><span class="eyebrow">MEDIA DETAIL</span><h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.original_title || "")}</p><div class="meta">${escapeHtml(item.year || "未知年份")} · ${escapeHtml(item.genre || "未分类")} · ${escapeHtml(item.content_rating || "未分级")}</div></div></div>`;
+  const facts = ["rating", "audience_rating", "duration", "added_at", "release_date", "rating_key"].map((key) => `<div class="detail-fact"><span>${escapeHtml(key)}</span><strong>${escapeHtml(item[key] ?? "-")}</strong></div>`).join("");
+  const seasons = isShow ? (item.seasons || []).map((season) => `<div class="season-block"><div class="season-heading"><strong>${season.season === 0 ? "S00 · 特别篇" : `S${String(season.season).padStart(2, "0")}`}</strong><span>${escapeHtml(season.bucket)} · ${escapeHtml(season.release_date || "日期未知")}</span></div><div class="episode-grid">${season.episodes.map((episode) => `<div class="episode-box"><strong>E${String(episode.episode).padStart(2, "0")}</strong><span>${escapeHtml(episode.title)}</span><small>${escapeHtml(episode.air_date || "待定")}</small></div>`).join("")}</div></div>`).join("") : "";
+  return `<article class="panel media-detail-panel">${hero}<div class="detail-facts">${facts}</div><div class="detail-summary">${escapeHtml(item.summary || "暂无简介")}</div>${seasons ? `<div class="season-list">${seasons}</div>` : ""}</article>`;
+}
+
+async function loadVisibleQuarterDetails(serverId, groups) {
+  const cards = Array.from(document.querySelectorAll("[data-show-card]"));
+  for (const card of cards) {
+    const group = groups.find((item) => item.items.some((entry) => String(entry.rating_key) === String(card.dataset.ratingKey)));
+    const entry = group?.items.find((item) => String(item.rating_key) === String(card.dataset.ratingKey));
+    if (!entry) continue;
+    const cardKey = card.dataset.showCard;
+    try {
+      const fresh = await api(`/api/servers/${serverId}/media-library/item?library_id=${encodeURIComponent(entry.library_id)}&rating_key=${encodeURIComponent(entry.rating_key)}&media_type=show`);
+      card.outerHTML = renderShowCard(fresh, serverId, entry.season);
+      const replacement = document.querySelector(`[data-show-card="${CSS.escape(cardKey)}"]`);
+      replacement?.querySelector(".media-recheck")?.addEventListener("click", handleMediaRecheck);
+      replacement?.querySelector(".media-detail-link")?.addEventListener("click", () => openMediaDetail(fresh.rating_key, entry.library_id, "show"));
+      bindMediaKindToggles();
+      bindSeasonToggles();
+    } catch (_) {
+      card.querySelector(".show-details-loading")?.replaceWith(Object.assign(document.createElement("div"), { className: "show-details-loading error", textContent: "剧集详情读取失败，可点击“重新检查”重试。" }));
+    }
+  }
+}
+
+function sortMediaItems(items) {
+  const direction = state.mediaLibraryDirection === "desc" ? -1 : 1;
+  const field = state.mediaLibrarySort || "name";
+  const value = (item) => {
+    const raw = item[field] ?? item.title ?? "";
+    if (["year", "added_at", "rating", "audience_rating", "duration", "season_count", "episode_count"].includes(field)) return Number(raw) || 0;
+    return String(raw).toLocaleLowerCase();
+  };
+  return [...items].sort((a, b) => {
+    const av = value(a), bv = value(b);
+    if (av < bv) return -1 * direction;
+    if (av > bv) return 1 * direction;
+    return String(a.rating_key || "").localeCompare(String(b.rating_key || ""));
+  });
+}
+
+function rerenderSelectedMediaLibrary(serverId) {
+  const library = state.mediaLibraryData.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
+  if (library?.kind === "show" && state.mediaLibraryQuarterGroups) {
+    renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems || []);
+  } else {
+    renderMediaLibraryPage(serverId);
+  }
+}
+
+async function handleMediaRecheck(event) {
+  const button = event.currentTarget;
+  const serverId = $("#media-library-server").value;
+  button.disabled = true;
+  button.textContent = "检查中…";
+  try {
+    const fresh = await api(`/api/servers/${serverId}/media-library/recheck`, { method: "POST", body: JSON.stringify({ library_id: Number(button.dataset.libraryId), rating_key: button.dataset.ratingKey }) });
+    const card = button.closest(".show-card");
+    if (card) {
+      card.outerHTML = renderShowCard(fresh, serverId);
+      const replacement = document.querySelector(`.media-recheck[data-rating-key="${CSS.escape(fresh.rating_key)}"]`);
+      replacement?.addEventListener("click", handleMediaRecheck);
+      bindMediaKindToggles();
+      bindSeasonToggles();
+    }
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = "重新检查";
+    setMessage("#media-library-message", error.message, true);
+  }
+}
+
+function renderShowCard(show, serverId, focusSeason = null) {
+  const seasons = show.seasons || [];
+  const episodeCount = seasons.reduce((sum, season) => sum + season.episodes.length, 0);
+  const marks = JSON.parse(localStorage.getItem("clp-show-kinds") || "{}");
+  const showKind = marks[show.rating_key] || show.show_kind || "真人";
+  const seasonMarkup = seasons.length ? seasons.map((season) => {
+    const currentSeason = focusSeason !== null && Number(focusSeason) === Number(season.season);
+    const missingEpisodes = season.episodes.filter((episode) => episode.missing && episodeAvailability(episode) === "媒体文件缺失");
+    const pendingEpisodes = season.episodes.filter((episode) => episode.missing && episodeAvailability(episode) === "待发布");
+    const missingSeason = missingEpisodes.length > 0;
+    const seasonStatus = [missingSeason ? `缺失 ${missingEpisodes.length} 集` : "", pendingEpisodes.length ? `待发布 ${pendingEpisodes.length} 集` : ""].filter(Boolean).join(" · ");
+    return `<details class="season-block ${currentSeason ? "current-season" : "other-season"} ${missingSeason ? "has-missing" : ""}" data-season-block="${season.season}" open><summary class="season-heading"><strong>${season.season === 0 ? "S00 · 特别篇" : `S${String(season.season).padStart(2, "0")}`}</strong><span>${escapeHtml(season.bucket)} · ${escapeHtml(season.release_date || "日期未知")}${seasonStatus ? ` · ${seasonStatus}` : ""}</span></summary><div class="episode-grid">${season.episodes.map((episode) => {
+      const availability = episodeAvailability(episode);
+      const episodeClass = [availability === "媒体文件缺失" ? "episode-missing" : "", availability === "待发布" ? "episode-pending" : "", !currentSeason ? "other-episode" : ""].filter(Boolean).join(" ");
+      return `<div class="episode-box ${episodeClass}"><strong>E${String(episode.episode).padStart(2, "0")}</strong><span>${escapeHtml(episode.title || "未命名")}</span><small>${escapeHtml(episode.air_date || "待定")}${availability ? ` · ${availability}` : ""}</small></div>`;
+    }).join("")}</div></details>`;
+  }).join("") : '<div class="show-details-loading">正在读取季和集的详细信息…</div>';
+  const cardKey = `${show.rating_key}${focusSeason === null ? "" : `-${focusSeason}`}`;
+  return `<article class="show-card" data-show-card="${escapeHtml(cardKey)}" data-rating-key="${escapeHtml(show.rating_key)}"><div class="show-card-head">${show.thumb ? `<img src="${mediaImageUrl(serverId, show.thumb)}" alt="">` : '<div class="show-fallback">剧</div>'}<div class="show-card-title"><div class="show-title-line"><h4>${escapeHtml(show.title)}</h4><button class="show-kind ${showKind === "动画" ? "anime" : "live"} kind-toggle" type="button" data-rating-key="${escapeHtml(show.rating_key)}">${escapeHtml(showKind)}</button></div><p>${escapeHtml(show.original_title || "")}</p><span class="meta">${escapeHtml(show.year || "未知年份")} · ${seasons.length ? `${seasons.length} 季 · ${episodeCount} 集` : "详情读取中"}${show.genre ? ` · ${escapeHtml(show.genre)}` : ""}</span></div><div class="media-card-actions"><button class="small media-recheck" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}">重新检查</button><button class="small media-detail-link" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}" data-media-type="show">查看详情</button></div></div><div class="season-list">${seasonMarkup}</div></article>`;
+}
+
+function episodeAvailability(episode) {
+  if (!episode?.missing) return "";
+  const airDate = String(episode.air_date || "").slice(0, 10);
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  return airDate && airDate > today ? "待发布" : "媒体文件缺失";
+}
+
+function bindSeasonToggles() {
+  document.querySelectorAll("[data-season-block]").forEach((season) => season.addEventListener("toggle", () => {
+    const card = season.closest(".show-card");
+    if (card) card.dataset.expandedSeason = season.open ? season.dataset.seasonBlock : "";
+  }));
+}
+
+function bindMediaKindToggles() {
+  document.querySelectorAll(".kind-toggle").forEach((button) => button.addEventListener("click", () => {
+    const marks = JSON.parse(localStorage.getItem("clp-show-kinds") || "{}");
+    marks[button.dataset.ratingKey] = button.textContent.trim() === "动画" ? "真人" : "动画";
+    localStorage.setItem("clp-show-kinds", JSON.stringify(marks));
+    const label = marks[button.dataset.ratingKey];
+    button.textContent = label;
+    button.classList.toggle("anime", label === "动画");
+    button.classList.toggle("live", label !== "动画");
+  }));
+}
+
+async function loadVisibleShowDetails(serverId) {
+  const library = state.mediaLibraryData.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
+  if (!library || library.kind !== "show") return;
+  const cards = Array.from(document.querySelectorAll("[data-show-card]"));
+  for (let index = 0; index < cards.length; index += 1) {
+    const card = cards[index];
+    const show = library.items.find((item) => String(item.rating_key) === String(card.dataset.showCard));
+    if (!show || show.seasons?.length) continue;
+    setMessage("#media-library-message", `正在读取剧集详情 ${index + 1}/${cards.length}…`);
+    try {
+      const fresh = await api(`/api/servers/${serverId}/media-library/item?library_id=${encodeURIComponent(library.id)}&rating_key=${encodeURIComponent(show.rating_key)}&media_type=show`);
+      Object.assign(show, fresh);
+      card.outerHTML = renderShowCard(fresh, serverId);
+      document.querySelector(`[data-show-card="${CSS.escape(fresh.rating_key)}"] .media-recheck`)?.addEventListener("click", handleMediaRecheck);
+      bindMediaKindToggles();
+    } catch (_) {
+      card.querySelector(".show-details-loading")?.replaceWith(Object.assign(document.createElement("div"), { className: "show-details-loading error", textContent: "剧集详情读取失败，可点击“重新检查”重试。" }));
+    }
+  }
+  setMessage("#media-library-message", "当前媒体库页面已更新");
+}
+
+async function loadMediaLibrary() {
+  const saved = JSON.parse(sessionStorage.getItem("clp-media-library-state") || "{}");
+  if (saved.serverId && $("#media-library-server")?.querySelector(`option[value="${CSS.escape(String(saved.serverId))}"]`)) {
+    $("#media-library-server").value = String(saved.serverId);
+  }
+  const serverId = $("#media-library-server").value;
+  if (!serverId) {
+    $("#media-library-content").innerHTML = '<div class="panel media-empty">请先配置并选择 Plex 服务器。</div>';
+    return;
+  }
+  setMessage("#media-library-message", "正在读取媒体库缓存…");
+  try {
+    if (saved.serverId && String(saved.serverId) === String(serverId)) {
+      state.mediaLibrarySelectedId = saved.libraryId || state.mediaLibrarySelectedId;
+      state.mediaLibraryPageSize = saved.pageSize || state.mediaLibraryPageSize;
+      state.mediaLibraryPage = Number(saved.page || state.mediaLibraryPage);
+      state.mediaLibrarySort = saved.sort || state.mediaLibrarySort;
+      state.mediaLibraryDirection = saved.direction || state.mediaLibraryDirection;
+    }
+    const result = await api(`/api/servers/${serverId}/media-library`);
+    renderMediaLibrary(result.libraries || [], serverId);
+    const library = state.mediaLibraryData.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
+    if (library?.is_animation && !saved.sort) {
+      state.mediaLibrarySort = "first_episode_date";
+      state.mediaLibraryDirection = "desc";
+    }
+    if (library) {
+      const cached = await api(`/api/servers/${serverId}/media-library/${library.id}/items`);
+      library.items = cached.items || [];
+      renderMediaLibraryPage(serverId);
+    }
+    if (library?.kind === "show" && library.is_animation) {
+      const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
+      state.mediaLibraryQuarterGroups = quarter.groups || [];
+    renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, quarter.live_items || []);
+    } else {
+      await loadVisibleShowDetails(serverId);
+    }
+    setMessage("#media-library-message", `已加载数据库缓存 · ${result.generated_at || ""}`);
+    startMediaLibrarySyncPolling(serverId);
+  } catch (error) {
+    setMessage("#media-library-message", error.message, true);
+  }
+}
+
+function startMediaLibrarySyncPolling(serverId) {
+  if (state.mediaLibrarySyncTimer) window.clearInterval(state.mediaLibrarySyncTimer);
+  const hasActive = () => (state.mediaLibraryData || []).some((library) => ["queued", "running"].includes(library.sync_status));
+  if (!hasActive()) return;
+  state.mediaLibrarySyncTimer = window.setInterval(async () => {
+    try {
+      const result = await api(`/api/servers/${serverId}/media-library`);
+      const previousId = state.mediaLibrarySelectedId;
+      state.mediaLibraryData = result.libraries || [];
+      const selected = state.mediaLibraryData.find((library) => String(library.id) === String(previousId));
+      if (selected) {
+        const status = $("#media-library-sync-status");
+        if (status) status.textContent = `${selected.plex_synced_at ? `Plex：${selected.plex_synced_at}` : "尚未从 Plex 同步"}${selected.tmdb_synced_at ? ` · TMDB：${selected.tmdb_synced_at}` : ""}${selected.sync_status && selected.sync_status !== "idle" ? ` · 状态：${selected.sync_status}` : ""}${selected.sync_error ? ` · ${selected.sync_error}` : ""}`;
+        renderMediaLibrarySyncProgress(selected);
+      }
+      if (!hasActive()) {
+        window.clearInterval(state.mediaLibrarySyncTimer);
+        state.mediaLibrarySyncTimer = null;
+        await loadMediaLibrary();
+      }
+    } catch (_) {}
+  }, 5000);
+}
+
+$("#media-library-refresh")?.addEventListener("click", async () => {
+  const serverId = $("#media-library-server")?.value;
+  const libraryId = state.mediaLibrarySelectedId;
+  if (!serverId || !libraryId) return;
+  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `媒体服务器同步任务已创建：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
+});
+$("#media-library-tmdb-refresh")?.addEventListener("click", async () => {
+  const serverId = $("#media-library-server")?.value;
+  const libraryId = state.mediaLibrarySelectedId;
+  if (!serverId || !libraryId) return;
+  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/tmdb-refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `TMDB 同步任务已创建：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
+});
+$("#media-library-server")?.addEventListener("change", () => { state.mediaLibrarySelectedId = null; state.mediaLibraryPage = 1; loadMediaLibrary(); });
+$("#media-library-picker")?.addEventListener("change", () => selectMediaLibrary($("#media-library-picker").value, $("#media-library-server").value));
+$("#media-library-animation-mode")?.addEventListener("change", async () => {
+  const serverId = $("#media-library-server")?.value;
+  const libraryId = state.mediaLibrarySelectedId;
+  if (!serverId || !libraryId) return;
+  try { await api(`/api/servers/${serverId}/libraries/${libraryId}/settings`, { method: "PUT", body: JSON.stringify({ animation_mode: $("#media-library-animation-mode").value }) }); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
+});
+$("#media-library-page-size")?.addEventListener("change", () => { state.mediaLibraryPageSize = $("#media-library-page-size").value; state.mediaLibraryPage = 1; rerenderSelectedMediaLibrary($("#media-library-server").value); });
+$("#media-library-sort")?.addEventListener("change", () => { state.mediaLibrarySort = $("#media-library-sort").value; state.mediaLibraryPage = 1; rerenderSelectedMediaLibrary($("#media-library-server").value); });
+$("#media-library-sort-direction")?.addEventListener("click", () => { state.mediaLibraryDirection = state.mediaLibraryDirection === "asc" ? "desc" : "asc"; $("#media-library-sort-direction").textContent = state.mediaLibraryDirection === "asc" ? "升序" : "降序"; state.mediaLibraryPage = 1; rerenderSelectedMediaLibrary($("#media-library-server").value); });
 
 function fillServerForm(server) {
   const form = $("#server-form");
@@ -314,7 +753,7 @@ $("#load-server-libraries").addEventListener("click", async () => {
     const libraries = await api(`/api/servers/${id}/libraries`);
     const skipped = new Set(String($("#server-form").skip_libraries.value || "").split("；").map((item) => item.trim()).filter(Boolean));
     $("#server-library-list").innerHTML = libraries
-      .map((library) => `<label class="check"><input type="checkbox" value="${escapeHtml(library.title)}" ${skipped.has(library.title) ? "checked" : ""}> 跳过 ${escapeHtml(library.title)}</label>`)
+      .map((library) => `<div class="server-library-setting"><label class="check"><input type="checkbox" value="${escapeHtml(library.title)}" ${skipped.has(library.title) ? "checked" : ""}> 跳过 ${escapeHtml(library.title)}</label>${Number(library.type) === 2 ? `<label class="compact-field">动画模式<select data-library-animation="${library.key}"><option value="auto" ${library.animation_mode === "auto" ? "selected" : ""}>自动</option><option value="animation" ${library.animation_mode === "animation" ? "selected" : ""}>动画</option><option value="normal" ${library.animation_mode === "normal" ? "selected" : ""}>普通</option></select></label>` : ""}</div>`)
       .join("");
     $("#server-library-list").querySelectorAll("input").forEach((input) => {
       input.addEventListener("change", () => {
@@ -322,6 +761,9 @@ $("#load-server-libraries").addEventListener("click", async () => {
         $("#server-form").skip_libraries.value = values.join("；");
       });
     });
+    $("#server-library-list").querySelectorAll("[data-library-animation]").forEach((select) => select.addEventListener("change", async () => {
+      try { await api(`/api/servers/${id}/libraries/${select.dataset.libraryAnimation}/settings`, { method: "PUT", body: JSON.stringify({ animation_mode: select.value }) }); setMessage("#server-message", "媒体库动画模式已保存。"); } catch (error) { setMessage("#server-message", error.message, true); }
+    }));
   } catch (error) {
     setMessage("#server-message", error.message, true);
   }
@@ -430,6 +872,8 @@ async function selectJob(jobId, initialJob = null) {
   state.selectedJobData = initialJob;
   state.logLines = [];
   renderLogs();
+  const logDetails = $("#job-log-details");
+  if (logDetails) logDetails.open = true;
   closeEventSource();
   $("#apply-preview-job").disabled = !isRunnablePreview(initialJob);
   const logs = await api(`/api/jobs/${jobId}/logs?limit=300`);
@@ -450,6 +894,11 @@ function updateJobProgress(job) {
   $("#job-status").textContent = job.status;
   $("#job-library").textContent = job.current_library || job.stage || "-";
   $("#job-progress").textContent = `${job.processed}/${job.total || "-"}`;
+  const progressBar = $("#job-progress-bar-fill");
+  const progressDetail = $("#job-progress-detail");
+  const percent = Number(job.total) > 0 ? Math.min(100, Math.round(Number(job.processed || 0) * 100 / Number(job.total))) : 0;
+  if (progressBar) progressBar.style.width = `${percent}%`;
+  if (progressDetail) progressDetail.textContent = `${job.stage || ""}${job.current_library ? ` · ${job.current_library}` : ""}${job.total ? ` · ${percent}%` : ""}`;
   $("#job-changes").textContent = job.changes;
   $("#job-errors").textContent = job.errors;
   $("#cancel-job").disabled = !["queued", "running"].includes(job.status);
@@ -458,6 +907,10 @@ function updateJobProgress(job) {
   $("#rollback-job").disabled = !["succeeded", "failed"].includes(job.status);
   $("#apply-preview-job").disabled = !isRunnablePreview(job);
   scheduleJobListRefresh(["succeeded", "failed", "interrupted", "cancelled"].includes(job.status));
+  if (["succeeded", "failed", "interrupted", "cancelled"].includes(job.status)) {
+    const logDetails = $("#job-log-details");
+    if (logDetails) logDetails.open = false;
+  }
 }
 
 function isRunnablePreview(job) {
@@ -998,8 +1451,19 @@ async function loadEpisodeAuditSettings() {
   try {
     const settings = await api("/api/settings/tmdb");
     $("#tmdb-key-status").textContent = settings.configured ? "已保存" : "未配置";
+    if ($("#system-tmdb-key-status")) $("#system-tmdb-key-status").textContent = settings.configured ? "已保存" : "未配置";
   } catch (_) {}
 }
+
+$("#system-tmdb-form")?.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/settings/tmdb", { method: "POST", body: JSON.stringify({ api_key: $("#system-tmdb-api-key").value }) });
+    $("#system-tmdb-api-key").value = "";
+    $("#system-tmdb-key-status").textContent = "已保存";
+    setMessage("#system-tmdb-message", "TMDB API Key 已保存。");
+  } catch (error) { setMessage("#system-tmdb-message", error.message, true); }
+});
 
 $("#save-tmdb-key").addEventListener("click", async () => {
   try {
@@ -1713,3 +2177,4 @@ bindOverview();
 bootstrap();
 updateScheduleMode();
 updateLocalizeAddedFilter();
+

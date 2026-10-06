@@ -13,7 +13,7 @@ from .db import DB_FILE, connect, get_setting, load_tags, server_config_from_row
 from .scheduling import validate_schedule
 from .services import JobQueue
 from .tmdb import TMDBClient
-from .catalog import sync_catalog, scan_plex_inventory, reconcile
+from .catalog import sync_catalog, scan_plex_inventory, reconcile, sync_media_library, sync_media_library_tmdb
 
 
 class TaskManager:
@@ -132,6 +132,28 @@ class TaskManager:
                 for server_id in payload.get("server_ids") or []:
                     scan_plex_inventory(self.db_file, int(server_id))
                     reconcile(self.db_file, int(server_id))
+            elif job_type == "media_library_refresh":
+                library_id = int(payload["library_id"])
+                try:
+                    sync_media_library(self.db_file, int(payload["server_id"]), library_id,
+                                       progress=lambda p: self._progress(job_id, p),
+                                       cancelled=lambda: self._cancel_requested(job_id))
+                except Exception as exc:
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.commit()
+                    raise
+            elif job_type == "media_library_tmdb_refresh":
+                library_id = int(payload["library_id"])
+                try:
+                    sync_media_library_tmdb(self.db_file, int(payload["server_id"]), library_id,
+                                            progress=lambda p: self._progress(job_id, p),
+                                            cancelled=lambda: self._cancel_requested(job_id))
+                except Exception as exc:
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.commit()
+                    raise
             else:
                 raise ValueError(f"未知任务类型：{job_type}")
             if self._cancel_requested(job_id):

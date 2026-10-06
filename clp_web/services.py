@@ -25,6 +25,8 @@ JOB_TYPES = {
     "plex_inventory_sync",
     "media_reconcile",
     "media_sync",
+    "media_library_refresh",
+    "media_library_tmdb_refresh",
 }
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 
