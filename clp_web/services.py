@@ -29,6 +29,9 @@ JOB_TYPES = {
     "media_library_tmdb_refresh",
     "media_library_full_refresh",
     "media_library_show_recheck",
+    "media_library_bulk_resolve",
+    "media_library_bulk_confirm",
+    "media_library_search_add",
 }
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 

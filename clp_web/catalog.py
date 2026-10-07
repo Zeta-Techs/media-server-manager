@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -15,8 +16,65 @@ from .db import connect, decode_payload, get_setting, server_config_from_row, ut
 from .tmdb import TMDBClient
 
 
+def _match_title_key(value: Any) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", str(value or "").casefold())
+
+
+def resolve_plex_rating_key(db_file: Path, server_id: int, library_id: int, rating_key: str) -> str:
+    """Resolve a synthetic TMDB show key to the real Plex rating key.
+
+    System-maintained shows use ``tmdb:tv:<id>`` until Plex receives the real
+    media.  A manual recheck must discover the Plex item before asking Plex
+    for metadata; otherwise the synthetic key is sent to Plex and every
+    episode remains marked missing.
+    """
+    key = str(rating_key or "").strip()
+    if not key.startswith("tmdb:"):
+        return key
+    with connect(db_file) as db:
+        row = db.execute(
+            "SELECT * FROM media_library_items WHERE server_id=? AND library_id=? AND rating_key=?",
+            (server_id, library_id, key),
+        ).fetchone()
+        server = db.execute("SELECT * FROM servers WHERE id=? AND enabled=1", (server_id,)).fetchone()
+    if row is None or server is None:
+        raise ValueError("系统维护剧集缓存不存在，请先刷新媒体库")
+    raw = decode_payload(row["raw_json"])
+    external_ids = raw.get("external_ids") or extract_external_ids(raw)
+    tmdb_id = int(row["tmdb_id"] or external_ids.get("tmdb") or 0)
+    if not tmdb_id:
+        synthetic = re.search(r"tmdb:tv:(\d+)$", key)
+        tmdb_id = int(synthetic.group(1)) if synthetic else 0
+    title_key = _match_title_key(row["title"])
+    original_key = _match_title_key(row["original_title"])
+    year = int(row["year"] or 0)
+    plex = PlexServer(server_config_from_row(server, db_file), auto_login=False)
+    library = next((entry for entry in plex.list_library() if int(entry[0]) == int(library_id)), None)
+    if library is None or int(library[1]) != 2:
+        raise ValueError("目标媒体库不是电视剧库")
+    candidates = plex.list_library_items(library_id, 2)
+    fallback = None
+    for item in candidates:
+        candidate_key = str(item.get("ratingKey") or "")
+        if not candidate_key:
+            continue
+        ids = extract_external_ids(item)
+        if tmdb_id and str(ids.get("tmdb") or "") == str(tmdb_id):
+            return candidate_key
+        candidate_year = int(item.get("year") or 0)
+        candidate_title = _match_title_key(item.get("title"))
+        candidate_original = _match_title_key(item.get("originalTitle") or item.get("original_title"))
+        if year and candidate_year and candidate_year != year:
+            continue
+        if (title_key and candidate_title == title_key) or (original_key and candidate_original == original_key):
+            fallback = candidate_key
+    if fallback:
+        return fallback
+    raise ValueError("Plex 媒体库中尚未找到对应的真实剧集，请确认媒体已完成入库并刷新 Plex 元数据")
+
+
 def _cache_root() -> Path:
-    root = Path(os.environ.get("MSM_CONFIG_DIR", os.environ.get("CLP_CONFIG_DIR", "config"))) / "media_cache" / "tmdb"
+    root = Path(os.environ.get("CLP_CONFIG_DIR", os.environ.get("MSM_CONFIG_DIR", "config"))) / "media_cache" / "tmdb"
     root.mkdir(parents=True, exist_ok=True)
     return root
 
@@ -30,17 +88,18 @@ def _upsert_item(db: Any, media_type: str, tmdb_id: int, payload: dict[str, Any]
     checksum = hashlib.sha256(raw.encode()).hexdigest()
     now = utcnow()
     db.execute("""
-        INSERT INTO tmdb_items (tmdb_id, media_type, parent_tmdb_id, season_number, episode_number, title,
+        INSERT INTO tmdb_items (tmdb_id, media_type, imdb_id, tvdb_id, parent_tmdb_id, season_number, episode_number, title,
           original_title, release_date, status, overview, poster_path, backdrop_path, still_path, genres,
           raw_json, fetched_at, updated_at, expires_at, checksum)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(media_type, tmdb_id, season_number, episode_number) DO UPDATE SET
+          imdb_id=excluded.imdb_id, tvdb_id=excluded.tvdb_id,
           parent_tmdb_id=excluded.parent_tmdb_id, title=excluded.title, original_title=excluded.original_title,
           release_date=excluded.release_date, status=excluded.status, overview=excluded.overview,
           poster_path=excluded.poster_path, backdrop_path=excluded.backdrop_path, still_path=excluded.still_path,
           genres=excluded.genres, raw_json=excluded.raw_json, fetched_at=excluded.fetched_at,
           updated_at=excluded.updated_at, expires_at=excluded.expires_at, checksum=excluded.checksum
-    """, (tmdb_id, media_type, parent_id, season_number, episode_number, title, original, release,
+    """, (tmdb_id, media_type, str((payload.get("external_ids") or {}).get("imdb_id") or payload.get("imdb_id") or ""), str((payload.get("external_ids") or {}).get("tvdb_id") or payload.get("tvdb_id") or ""), parent_id, season_number, episode_number, title, original, release,
           payload.get("status") or "", payload.get("overview") or "", payload.get("poster_path") or "",
           payload.get("backdrop_path") or "", payload.get("still_path") or "", json.dumps(payload.get("genres") or payload.get("genre_ids") or [], ensure_ascii=False),
           raw, now, now, "", checksum))
@@ -191,6 +250,31 @@ def _plex_genres(metadata: dict[str, Any]) -> str:
     return ", ".join(values)
 
 
+def _plex_resolution(metadata: dict[str, Any]) -> str:
+    heights: list[int] = []
+    for media in metadata.get("Media") or []:
+        try:
+            heights.append(int(media.get("height") or 0))
+        except (TypeError, ValueError):
+            pass
+        for part in media.get("Part") or []:
+            for stream in part.get("Stream") or []:
+                if str(stream.get("streamType") or "") != "1":
+                    continue
+                try:
+                    heights.append(int(stream.get("height") or 0))
+                except (TypeError, ValueError):
+                    pass
+    height = max(heights or [0])
+    if height >= 1800:
+        return "4K"
+    if height >= 1000:
+        return "1080P"
+    if height >= 650:
+        return "720P"
+    return f"{height}P" if height else ""
+
+
 def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadata: dict[str, Any],
                                plex_type: str | None = None, parent_rating_key: str = "",
                                season_number: int | None = None, episode_number: int | None = None) -> None:
@@ -224,12 +308,14 @@ def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadat
     # values written by older versions of the synchronizer.
     genre = _plex_genres(metadata)
     release_date = _plex_date(metadata) or (str(previous["release_date"] or "") if previous else "")
+    resolution = _plex_resolution(metadata)
     db.execute("""
         INSERT INTO media_library_items
           (server_id, library_id, rating_key, plex_type, parent_rating_key, season_number, episode_number,
            title, original_title, year, added_at, release_date, rating, audience_rating, duration,
-           content_rating, genre, thumb, art, raw_json, scanned_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           content_rating, genre, thumb, art, raw_json, scanned_at,
+           tmdb_media_type, tmdb_id, imdb_id, tvdb_id, source, system_managed, resolution, animation_kind, system_genres)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(server_id, library_id, rating_key) DO UPDATE SET
           plex_type=excluded.plex_type, parent_rating_key=excluded.parent_rating_key,
           season_number=excluded.season_number, episode_number=excluded.episode_number,
@@ -237,7 +323,12 @@ def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadat
           added_at=excluded.added_at, release_date=excluded.release_date, rating=excluded.rating,
           audience_rating=excluded.audience_rating, duration=excluded.duration,
           content_rating=excluded.content_rating, genre=excluded.genre, thumb=excluded.thumb,
-          art=excluded.art, raw_json=excluded.raw_json, scanned_at=excluded.scanned_at
+          art=excluded.art, raw_json=excluded.raw_json, scanned_at=excluded.scanned_at,
+          tmdb_media_type=COALESCE(NULLIF(excluded.tmdb_media_type, ''), media_library_items.tmdb_media_type),
+          tmdb_id=COALESCE(excluded.tmdb_id, media_library_items.tmdb_id), source='plex', system_managed=0,
+          imdb_id=COALESCE(NULLIF(excluded.imdb_id, ''), media_library_items.imdb_id),
+          tvdb_id=COALESCE(NULLIF(excluded.tvdb_id, ''), media_library_items.tvdb_id),
+          resolution=COALESCE(NULLIF(excluded.resolution, ''), media_library_items.resolution)
     """, (server_id, library_id, rating_key, raw_type, parent_rating_key,
           season_number if season_number is not None else metadata.get("parentIndex"),
           episode_number if episode_number is not None else metadata.get("index"),
@@ -245,7 +336,13 @@ def _upsert_media_library_item(db: Any, server_id: int, library_id: int, metadat
           metadata.get("addedAt"), release_date, metadata.get("rating"), metadata.get("audienceRating"),
           duration, str(metadata.get("contentRating") or ""), genre,
           str(metadata.get("thumb") or metadata.get("parentThumb") or ""), str(metadata.get("art") or ""),
-          json.dumps(raw_payload, ensure_ascii=False), utcnow()))
+          json.dumps(raw_payload, ensure_ascii=False), utcnow(),
+          ("movie" if raw_type == "movie" else "tv" if raw_type == "show" else ""), ids.get("tmdb"), ids.get("imdb") or "", ids.get("tvdb") or "", "plex", 0, resolution, "", "[]"))
+    if ids.get("tmdb") and raw_type in {"movie", "show"} and rating_key and not rating_key.startswith("tmdb:"):
+        managed = db.execute("SELECT rating_key FROM media_library_items WHERE server_id=? AND library_id=? AND tmdb_id=? AND tmdb_media_type=? AND system_managed=1 AND rating_key<>?", (server_id, library_id, int(ids["tmdb"]), "movie" if raw_type == "movie" else "tv", rating_key)).fetchall()
+        for managed_row in managed:
+            db.execute("DELETE FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key=?", (server_id, library_id, managed_row["rating_key"]))
+            db.execute("DELETE FROM media_library_items WHERE server_id=? AND library_id=? AND rating_key=?", (server_id, library_id, managed_row["rating_key"]))
 
 
 def _remove_expected_episode_placeholder(db: Any, server_id: int, library_id: int,

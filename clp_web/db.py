@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from clp.core import CONFIG_DIR, TEMPLATE_TAGS_FILE, ServerConfig, split_skip_libraries
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DB_FILE = CONFIG_DIR / "clp.db"
 DEFAULT_USERNAME = "admin"
 
@@ -92,7 +92,7 @@ def _existing_schema_version(db_file: Path) -> int | None:
 def init_db(db_file: Path | None = None) -> None:
     db_file = Path(db_file or DB_FILE)
     version = _existing_schema_version(db_file)
-    if version not in (None, 2, 3, SCHEMA_VERSION):
+    if version not in (None, 2, 3, 4, SCHEMA_VERSION):
         raise IncompatibleSchemaError(
             f"数据库版本 {version} 与应用版本 {SCHEMA_VERSION} 不兼容。"
             "请运行 `python -m clp_admin reset-db --backup`。"
@@ -350,6 +350,8 @@ def init_db(db_file: Path | None = None) -> None:
                 library_id INTEGER NOT NULL,
                 plex_rating_key TEXT NOT NULL,
                 tmdb_id INTEGER NOT NULL,
+                imdb_id TEXT NOT NULL DEFAULT '',
+                tvdb_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(server_id, library_id, plex_rating_key),
@@ -449,6 +451,8 @@ def init_db(db_file: Path | None = None) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tmdb_id INTEGER NOT NULL,
                 media_type TEXT NOT NULL CHECK (media_type IN ('movie','tv','season','episode')),
+                imdb_id TEXT NOT NULL DEFAULT '',
+                tvdb_id TEXT NOT NULL DEFAULT '',
                 parent_tmdb_id INTEGER,
                 season_number INTEGER,
                 episode_number INTEGER,
@@ -617,6 +621,48 @@ def init_db(db_file: Path | None = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_media_library_items_lookup
                 ON media_library_items(server_id, library_id, plex_type, parent_rating_key);
 
+            CREATE TABLE IF NOT EXISTS media_library_bulk_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                resolve_job_id INTEGER,
+                confirm_job_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY(resolve_job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY(confirm_job_id) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_library_bulk_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                line_number INTEGER NOT NULL,
+                input_text TEXT NOT NULL,
+                input_kind TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                media_type TEXT NOT NULL DEFAULT '',
+                tmdb_id INTEGER,
+                title TEXT NOT NULL DEFAULT '',
+                original_title TEXT NOT NULL DEFAULT '',
+                year INTEGER,
+                poster_path TEXT NOT NULL DEFAULT '',
+                genres TEXT NOT NULL DEFAULT '[]',
+                animation_kind TEXT NOT NULL DEFAULT '真人',
+                candidates TEXT NOT NULL DEFAULT '[]',
+                selected INTEGER NOT NULL DEFAULT 0,
+                custom_genres TEXT NOT NULL DEFAULT '[]',
+                custom_animation_kind TEXT NOT NULL DEFAULT '',
+                target_library_id INTEGER,
+                message TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(batch_id, line_number),
+                FOREIGN KEY(batch_id) REFERENCES media_library_bulk_batches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_library_bulk_rows_batch ON media_library_bulk_rows(batch_id, line_number);
+
             CREATE TABLE IF NOT EXISTS media_match_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 media_type TEXT NOT NULL,
@@ -661,6 +707,31 @@ def init_db(db_file: Path | None = None) -> None:
             db.execute("ALTER TABLE media_libraries ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''")
         if "sort_direction" not in media_library_columns:
             db.execute("ALTER TABLE media_libraries ADD COLUMN sort_direction TEXT NOT NULL DEFAULT 'asc'")
+        item_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_library_items)").fetchall()}
+        for name, definition in {
+            "tmdb_media_type": "TEXT NOT NULL DEFAULT ''",
+            "tmdb_id": "INTEGER",
+            "imdb_id": "TEXT NOT NULL DEFAULT ''",
+            "tvdb_id": "TEXT NOT NULL DEFAULT ''",
+            "source": "TEXT NOT NULL DEFAULT 'plex'",
+            "system_managed": "INTEGER NOT NULL DEFAULT 0",
+            "resolution": "TEXT NOT NULL DEFAULT ''",
+            "animation_kind": "TEXT NOT NULL DEFAULT ''",
+            "system_genres": "TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if name not in item_columns:
+                db.execute(f"ALTER TABLE media_library_items ADD COLUMN {name} {definition}")
+        tmdb_item_columns = {row["name"] for row in db.execute("PRAGMA table_info(tmdb_items)").fetchall()}
+        for name, definition in {"imdb_id": "TEXT NOT NULL DEFAULT ''", "tvdb_id": "TEXT NOT NULL DEFAULT ''"}.items():
+            if name not in tmdb_item_columns:
+                db.execute(f"ALTER TABLE tmdb_items ADD COLUMN {name} {definition}")
+        # Backfill external ids already present in cached Plex payloads.
+        for row in db.execute("SELECT server_id, library_id, rating_key, raw_json, imdb_id, tvdb_id FROM media_library_items WHERE imdb_id='' OR tvdb_id='' OR tmdb_id IS NULL").fetchall():
+            payload = decode_payload(row["raw_json"])
+            ids = payload.get("external_ids") or {}
+            if not ids:
+                continue
+            db.execute("UPDATE media_library_items SET tmdb_id=COALESCE(tmdb_id, ?), tmdb_media_type=CASE WHEN COALESCE(tmdb_media_type,'')='' AND ? IS NOT NULL THEN CASE WHEN plex_type='movie' THEN 'movie' WHEN plex_type='show' THEN 'tv' ELSE '' END ELSE tmdb_media_type END, imdb_id=CASE WHEN imdb_id='' THEN ? ELSE imdb_id END, tvdb_id=CASE WHEN tvdb_id='' THEN ? ELSE tvdb_id END WHERE server_id=? AND library_id=? AND rating_key=?", (int(ids["tmdb"]) if ids.get("tmdb") else None, int(ids["tmdb"]) if ids.get("tmdb") else None, str(ids.get("imdb") or ""), str(ids.get("tvdb") or ""), row["server_id"], row["library_id"], row["rating_key"]))
         db.execute(
             "INSERT INTO schema_meta (id, version, created_at) VALUES (1, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET version = excluded.version",

@@ -13,7 +13,8 @@ from .db import DB_FILE, connect, get_setting, load_tags, server_config_from_row
 from .scheduling import validate_schedule
 from .services import JobQueue
 from .tmdb import TMDBClient
-from .catalog import sync_catalog, scan_plex_inventory, reconcile, sync_media_library, sync_media_library_tmdb
+from .catalog import resolve_plex_rating_key, sync_catalog, scan_plex_inventory, reconcile, sync_media_library, sync_media_library_tmdb
+from .bulk_media import resolve_batch, confirm_batch, add_system_media_item
 
 
 class TaskManager:
@@ -166,7 +167,7 @@ class TaskManager:
             elif job_type == "media_library_show_recheck":
                 library_id = int(payload["library_id"])
                 server_id = int(payload["server_id"])
-                rating_key = str(payload["rating_key"])
+                rating_key = resolve_plex_rating_key(self.db_file, server_id, library_id, str(payload["rating_key"]))
                 progress = lambda p: self._progress(job_id, p)
                 cancelled = lambda: self._cancel_requested(job_id)
                 sync_media_library(self.db_file, server_id, library_id, progress=progress,
@@ -193,6 +194,24 @@ class TaskManager:
                         db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
                         db.commit()
                     raise
+            elif job_type == "media_library_bulk_resolve":
+                try:
+                    result = resolve_batch(self.db_file, int(payload["batch_id"]), progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
+                except Exception as exc:
+                    # Keep the batch auditable and terminal even when a worker-level
+                    # failure occurs outside the per-row TMDB error handling.
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_library_bulk_batches SET status='failed', error=?, updated_at=? WHERE id=?", (str(exc), utcnow(), int(payload["batch_id"])))
+                        db.commit()
+                    raise
+                self._log(job_id, f"批量媒体解析完成：{result['processed']} 行，错误 {result['errors']} 行。")
+            elif job_type == "media_library_bulk_confirm":
+                result = confirm_batch(self.db_file, int(payload["batch_id"]), payload, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
+                self._log(job_id, f"批量媒体确认完成：新增 {result['added']}，跳过 {result['skipped']}，错误 {result['errors']}。")
+            elif job_type == "media_library_search_add":
+                result = add_system_media_item(self.db_file, int(payload["server_id"]), int(payload["library_id"]), str(payload["media_type"]), int(payload["tmdb_id"]))
+                self._progress(job_id, {"total": 1, "processed_delta": 1, "stage": "media_library_search_add"}, force=True)
+                self._log(job_id, ("媒体已存在于系统媒体库。" if result.get("status") == "exists" else f"已添加系统媒体条目：{result.get('title') or payload['tmdb_id']}"))
             else:
                 raise ValueError(f"未知任务类型：{job_type}")
             if self._cancel_requested(job_id):

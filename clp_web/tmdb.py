@@ -55,6 +55,11 @@ class TMDBClient:
     def movie_details(self, tmdb_id: int) -> Dict[str, Any]:
         return self.details("movie", tmdb_id)
 
+    def search_movie(self, title: str, year: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        data = self._get("/search/movie", query=title, year=year)
+        results = data.get("results") or []
+        return results[:limit] if limit else results
+
     def episode_details(self, series_id: int, season_number: int, episode_number: int, language: str = "zh-CN") -> Dict[str, Any]:
         return self._get(f"/tv/{series_id}/season/{season_number}/episode/{episode_number}", language=language, append_to_response="images,external_ids")
 
@@ -73,9 +78,27 @@ class TMDBClient:
         results = data.get("tv_results") or []
         return results[0] if results else None
 
-    def search_tv(self, title: str, year: Optional[int] = None) -> List[Dict[str, Any]]:
+    def find_by_external_id(self, external_id: str) -> Dict[str, Any]:
+        value = str(external_id or "").strip()
+        if value.lower().startswith("tt"):
+            source = "imdb_id"
+        elif value.isdigit():
+            source = "tvdb_id"
+        else:
+            return {}
+        return self._get(f"/find/{value}", external_source=source)
+
+    def search_tv(self, title: str, year: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         data = self._get("/search/tv", query=title, first_air_date_year=year)
-        return data.get("results") or []
+        results = data.get("results") or []
+        return results[:limit] if limit else results
+
+    def search(self, media_type: str, query: str, year: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        if media_type == "movie":
+            return self.search_movie(query, year, limit)
+        if media_type == "tv":
+            return self.search_tv(query, year, limit)
+        raise ValueError("仅支持 movie 或 tv")
 
     def tv_details(self, series_id: int) -> Dict[str, Any]:
         return self._get(f"/tv/{series_id}")

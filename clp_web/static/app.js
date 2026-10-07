@@ -7,6 +7,15 @@ const JOB_LIST_REFRESH_INTERVAL = 2000;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
+const mediaSearchState = { results: [], signature: "", version: 0 };
+
+function mediaSearchSignature() {
+  return [
+    $("#media-library-search-query")?.value.trim() || "",
+    $("#media-library-search-type")?.value || "all",
+    $("#media-library-search-year")?.value.trim() || "",
+  ].join("\u001f");
+}
 
 function showAuth() {
   $("#auth-screen").hidden = false;
@@ -52,6 +61,7 @@ async function refreshAll() {
 
 function setMessage(selector, message, isError = false) {
   const el = $(selector);
+  if (!el) return;
   el.textContent = message || "";
   el.className = isError ? "error" : "message";
 }
@@ -324,8 +334,15 @@ function renderMediaLibrarySyncProgress(library) {
 }
 
 async function selectMediaLibrary(libraryId, serverId) {
+  const previousLibraryId = state.mediaLibrarySelectedId;
+  if (String(previousLibraryId) !== String(libraryId)) state.mediaLibraryQuarterSignature = "";
   state.mediaLibrarySelectedId = libraryId;
   state.mediaLibraryPage = 1;
+  const picker = $("#media-library-picker");
+  if (picker) picker.value = String(libraryId);
+  $("#media-library-tabs")?.querySelectorAll("[data-library-tab]").forEach((button) => {
+    button.classList.toggle("active", String(button.dataset.libraryTab) === String(libraryId));
+  });
   const library = state.mediaLibraryData.find((item) => String(item.id) === String(libraryId));
   renderMediaLibraryAutoRecheck(library, serverId);
   if (library?.is_animation) {
@@ -340,18 +357,23 @@ async function selectMediaLibrary(libraryId, serverId) {
     try {
       const cached = await api(`/api/servers/${serverId}/media-library/${library.id}/items`);
       library.items = cached.items || [];
-      renderMediaLibraryPage(serverId);
+      library._itemsLoaded = true;
+      if (!(library.kind === "show" && library.is_animation)) renderMediaLibraryPage(serverId);
     } catch (error) {
       setMessage("#media-library-message", error.message, true);
     }
   }
-  renderMediaLibraryPage(serverId);
   if (library?.kind === "show" && library.is_animation) {
+    // Selecting the already-visible animation library is common when using
+    // search jump links. Keep the existing quarter DOM in place so the page
+    // does not flash or reflow back to the top.
+    if (String(previousLibraryId) === String(library.id) && document.querySelector("#media-library-content .quarter-layout")) return;
     const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
     state.mediaLibraryQuarterGroups = quarter.groups || [];
     state.mediaLibraryLiveItems = quarter.live_items || [];
     renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
   } else {
+    renderMediaLibraryPage(serverId);
     await loadVisibleShowDetails(serverId);
   }
 }
@@ -370,7 +392,7 @@ function renderMediaLibraryPage(serverId) {
   const panel = (() => {
     const collectionMarkup = (library.collections || []).length ? `<div class="library-collections"><div class="section-label">合集 · ${library.collections.length}</div><div class="collection-strip">${library.collections.map((item) => `<div class="collection-chip"><strong>${escapeHtml(item.title)}</strong><span>${item.child_count || 0} 项</span></div>`).join("")}</div></div>` : "";
     if (library.kind === "movie") {
-      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">MOVIES · ${library.items.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载全部 ${library.items.length} 项</span></div><span class="library-type">电影</span></div>${collectionMarkup}<div class="movie-table-wrap"><table class="movie-table"><thead><tr><th>海报</th><th>标题</th><th>年份</th><th>类型</th><th>分级</th><th>片长</th><th>条目键</th><th>操作</th></tr></thead><tbody>${pageItems.map((item) => `<tr><td>${item.thumb ? `<img class="table-poster" src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.genre || "-")}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><code>${escapeHtml(item.rating_key)}</code></td><td><button class="small media-detail-link" type="button" data-library-id="${library.id}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`).join("")}</tbody></table></div></section>`;
+      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">MOVIES · ${library.items.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载全部 ${library.items.length} 项</span></div><span class="library-type">电影</span></div>${collectionMarkup}<div class="movie-table-wrap"><table class="movie-table"><thead><tr><th>海报</th><th>标题</th><th>年份</th><th>类型</th><th>标签</th><th>分辨率</th><th>分级</th><th>片长</th><th>操作</th></tr></thead><tbody>${pageItems.map((item) => { const resolution = item.resolution || "×"; const poster = item.thumb ? mediaImageUrl(serverId, item.thumb) : (item.poster_url || ""); return `<tr class="${resolution === "×" ? "resolution-missing" : ""}" data-rating-key="${escapeHtml(item.rating_key)}" data-library-id="${library.id}"><td>${poster ? `<img class="table-poster" src="${poster}" alt="">` : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.plex_type || "电影")}</td><td>${escapeHtml(item.genre || (item.system_genres || []).join(", ") || "-")}</td><td class="resolution-cell">${escapeHtml(resolution)}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><button class="small media-detail-link" type="button" data-library-id="${library.id}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`; }).join("")}</tbody></table></div></section>`;
     }
     if (library.kind === "show") {
       return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">SERIES · ${library.items.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载全部 ${library.items.length} 项</span></div><span class="library-type">剧集</span></div>${collectionMarkup}<div class="show-grid">${pageItems.map((show) => renderShowCard(show, serverId)).join("")}</div></section>`;
@@ -403,6 +425,19 @@ function renderAnimationQuarterPage(groups, serverId, liveItems = []) {
     map[group.label] = sortQuarterItems(group.items || []);
     return map;
   }, {});
+  const layoutSignature = JSON.stringify({
+    live: liveItems.map((item) => String(item.rating_key || "")),
+    groups: Object.entries(visibleGroups).map(([label, items]) => [label, items.map((item) => `${item.rating_key || ""}:${item.season ?? ""}`)]),
+  });
+  // Keep the existing quarter structure when only metadata/details were
+  // refreshed. This is what prevents ordinary searches and sync polling from
+  // rebuilding thousands of cards and moving the user's scroll position.
+  if (state.mediaLibraryQuarterSignature === layoutSignature && content.querySelector(".quarter-layout")) {
+    state.mediaLibraryQuarterGroups = groups;
+    state.mediaLibraryLiveItems = liveItems;
+    return;
+  }
+  state.mediaLibraryQuarterSignature = layoutSignature;
   const directoryGroups = groups.reduce((map, group) => {
     const label = String(group.label || "");
     const yearMatch = label.match(/^(\d{4})\s+/);
@@ -458,6 +493,25 @@ function openMediaDetail(ratingKey, libraryId, mediaType) {
   window.location.href = url;
 }
 
+function renderExternalIdBadges(item, mediaType = "", extraClass = "") {
+  const ids = item?.external_ids || {};
+  const tmdbId = item?.tmdb_id || ids.tmdb || ids.tmdb_id || "";
+  const imdbId = item?.imdb_id || ids.imdb || ids.imdb_id || "";
+  const tvdbId = item?.tvdb_id || ids.tvdb || ids.tvdb_id || "";
+  const kind = mediaType === "movie" || item?.media_type === "movie" || item?.type === "movie" ? "movie" : "tv";
+  const badges = [];
+  if (tmdbId) {
+    badges.push(`<span class="external-id-badge tmdb" title="在 TMDB 打开"><span class="external-id-logo" aria-hidden="true">TMDB</span><a href="https://www.themoviedb.org/${kind}/${encodeURIComponent(tmdbId)}" target="_blank" rel="noopener" aria-label="在 TMDB 打开 ${escapeHtml(tmdbId)}">${escapeHtml(tmdbId)}</a></span>`);
+  }
+  if (imdbId) {
+    badges.push(`<span class="external-id-badge imdb" title="在 IMDb 打开"><span class="external-id-logo" aria-hidden="true">IMDb</span><a href="https://www.imdb.com/title/${encodeURIComponent(imdbId)}/" target="_blank" rel="noopener" aria-label="在 IMDb 打开 ${escapeHtml(imdbId)}">${escapeHtml(imdbId)}</a></span>`);
+  }
+  if (tvdbId) {
+    badges.push(`<span class="external-id-badge tvdb" title="在 TVDB 打开"><span class="external-id-logo" aria-hidden="true">TVDB</span><a href="https://thetvdb.com/dereferrer/series/${encodeURIComponent(tvdbId)}" target="_blank" rel="noopener" aria-label="在 TVDB 打开 ${escapeHtml(tvdbId)}">${escapeHtml(tvdbId)}</a></span>`);
+  }
+  return badges.length ? `<span class="external-id-badges${extraClass ? ` ${extraClass}` : ""}">${badges.join("")}</span>` : "";
+}
+
 async function loadMediaDetailFromUrl() {
   const params = new URLSearchParams(window.location.search);
   const serverId = params.get("server_id") || "";
@@ -481,8 +535,8 @@ async function loadMediaDetailFromUrl() {
 }
 
 function renderMediaDetail(item, serverId, libraryId, isShow) {
-  const hero = `<div class="media-detail-hero">${item.thumb ? `<img src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<div class="show-fallback">媒</div>'}<div><span class="eyebrow">MEDIA DETAIL</span><h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.original_title || "")}</p><div class="meta">${escapeHtml(item.year || "未知年份")} · ${escapeHtml(item.genre || "未分类")} · ${escapeHtml(item.content_rating || "未分级")}</div></div></div>`;
-  const facts = ["rating", "audience_rating", "duration", "added_at", "release_date", "rating_key"].map((key) => `<div class="detail-fact"><span>${escapeHtml(key)}</span><strong>${escapeHtml(item[key] ?? "-")}</strong></div>`).join("");
+  const hero = `<div class="media-detail-hero">${item.thumb ? `<img src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<div class="show-fallback">媒</div>'}<div><span class="eyebrow">MEDIA DETAIL</span><h2>${escapeHtml(item.title)}</h2><p>${escapeHtml(item.original_title || "")}</p><div class="meta">${escapeHtml(item.year || "未知年份")} · ${escapeHtml(item.genre || "未分类")} · ${escapeHtml(item.content_rating || "未分级")}</div><div class="meta media-detail-ids">${renderExternalIdBadges(item, isShow ? "tv" : "movie") || '<span class="meta">暂无外部 ID</span>'}</div></div></div>`;
+  const facts = ["rating", "audience_rating", "duration", "added_at", "release_date", "rating_key", "source", "system_managed"].map((key) => `<div class="detail-fact"><span>${escapeHtml(key)}</span><strong>${escapeHtml(item[key] ?? "-")}</strong></div>`).join("");
   const seasons = isShow ? (item.seasons || []).map((season) => `<div class="season-block"><div class="season-heading"><strong>${season.season === 0 ? "S00 · 特别篇" : `S${String(season.season).padStart(2, "0")}`}</strong><span>${escapeHtml(season.bucket)} · ${escapeHtml(season.release_date || "日期未知")} · 已收录 ${season.episodes.filter((episode) => !episode.missing).length} / ${season.episodes.length}</span></div><div class="episode-grid">${season.episodes.map((episode) => `<div class="episode-box"><strong>E${String(episode.episode).padStart(2, "0")}</strong><span title="${escapeHtml(episode.title || "未命名")}">${escapeHtml(episode.title || "未命名")}</span><small>${escapeHtml(episode.air_date || "待定")}</small></div>`).join("")}</div></div>`).join("") : "";
   return `<article class="panel media-detail-panel">${hero}<div class="detail-facts">${facts}</div><div class="detail-summary">${escapeHtml(item.summary || "暂无简介")}</div>${seasons ? `<div class="season-list">${seasons}</div>` : ""}</article>`;
 }
@@ -522,6 +576,175 @@ function sortMediaItems(items) {
     if (av > bv) return 1 * direction;
     return String(a.rating_key || "").localeCompare(String(b.rating_key || ""));
   });
+}
+
+function renderMovieTableRow(item, serverId, libraryId) {
+  const resolution = item.resolution || "×";
+  const poster = item.thumb ? mediaImageUrl(serverId, item.thumb) : (item.poster_url || "");
+  return `<tr class="${resolution === "×" ? "resolution-missing" : ""}" data-rating-key="${escapeHtml(item.rating_key)}" data-library-id="${libraryId}"><td>${poster ? `<img class="table-poster" src="${escapeHtml(poster)}" alt="">` : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title || "")}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.plex_type || "电影")}</td><td>${escapeHtml(item.genre || (item.system_genres || []).join(", ") || "-")}</td><td class="resolution-cell">${escapeHtml(resolution)}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><button class="small media-detail-link" type="button" data-library-id="${libraryId}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`;
+}
+
+function refreshMediaLibraryCounts() {
+  const libraries = state.mediaLibraryData || [];
+  renderMediaLibrarySummary(libraries);
+  const picker = $("#media-library-picker");
+  if (picker) {
+    const selected = picker.value;
+    picker.innerHTML = libraries.map((library) => `<option value="${library.id}">${escapeHtml(library.title)} · ${library.kind === "movie" ? "电影" : library.kind === "show" ? "剧集" : "合集"} · ${library.item_count || library.items?.length || 0} 项</option>`).join("");
+    picker.value = selected;
+  }
+  $("#media-library-tabs")?.querySelectorAll("[data-library-tab]").forEach((button) => {
+    const library = libraries.find((item) => String(item.id) === String(button.dataset.libraryTab));
+    const count = button.querySelector("span");
+    if (library && count) count.textContent = library.item_count || library.items?.length || 0;
+  });
+}
+
+function patchAnimationQuarterDirectory(groups) {
+  const directory = $("#media-library-content .quarter-directory");
+  if (!directory) return;
+  const directoryGroups = groups.reduce((map, group) => {
+    const label = String(group.label || "");
+    const yearMatch = label.match(/^(\d{4})\s+/);
+    const key = yearMatch ? `year-${yearMatch[1]}` : `special-${label}`;
+    if (!map[key]) map[key] = { year: yearMatch ? yearMatch[1] : label, total: 0, quarters: [] };
+    map[key].total += (group.items || []).length;
+    map[key].quarters.push({ label, count: (group.items || []).length });
+    return map;
+  }, {});
+  const groupKey = (label) => {
+    if (label === "特别篇") return [1, 0, 0];
+    if (label === "未定档") return [2, 0, 0];
+    try { return [0, -Number(label.slice(0, 4)), -Number(label.split("Q", 1)[1].split(" ")[0])]; } catch (_) { return [2, 0, 0]; }
+  };
+  const markup = Object.values(directoryGroups).sort((a, b) => {
+    const an = /^\d{4}$/.test(String(a.year)) ? Number(a.year) : -1;
+    const bn = /^\d{4}$/.test(String(b.year)) ? Number(b.year) : -1;
+    if (an !== bn) return bn - an;
+    return String(a.year).localeCompare(String(b.year));
+  }).map((yearGroup) => {
+    const isYear = /^\d{4}$/.test(yearGroup.year);
+    const quarters = [...yearGroup.quarters].sort((a, b) => {
+      const ak = groupKey(a.label), bk = groupKey(b.label);
+      return ak[0] - bk[0] || ak[1] - bk[1] || ak[2] - bk[2];
+    });
+    const quarterBySlot = quarters.reduce((slots, quarter) => { const match = quarter.label.match(/\bQ([1-4])\b/); if (match) slots[match[1]] = quarter; return slots; }, {});
+    const slots = isYear ? ["4", "3", "2", "1"].map((slot) => {
+      const quarter = quarterBySlot[slot];
+      if (!quarter) return '<span class="quarter-slot empty" aria-hidden="true">&nbsp;</span>';
+      const shortLabel = (quarter.label.includes("/") ? quarter.label.split("/").pop().trim() : quarter.label).replace(/番$/, "");
+      return `<a href="#quarter-${encodeURIComponent(quarter.label)}" title="${escapeHtml(quarter.label)}"><span>${escapeHtml(shortLabel)}</span><b>${quarter.count}</b></a>`;
+    }).join("") : quarters.map(({ label, count }) => `<a href="#quarter-${encodeURIComponent(label)}" title="${escapeHtml(label)}"><span>${escapeHtml((label.includes("/") ? label.split("/").pop().trim() : label).replace(/番$/, ""))}</span><b>${count}</b></a>`).join("");
+    return `<section class="quarter-year-card${isYear ? "" : " special"}"><div class="quarter-year-heading"><strong>${escapeHtml(yearGroup.year)}</strong><span>${yearGroup.total}</span></div><div class="quarter-year-items">${slots}</div></section>`;
+  }).join("");
+  directory.innerHTML = `<div class="quarter-directory-title">季度目录</div>${markup}`;
+}
+
+function bindPatchedMediaItem(item) {
+  const root = $("#media-library-content");
+  root?.querySelectorAll(`[data-rating-key="${CSS.escape(String(item.rating_key))}"] .media-detail-link`).forEach((button) => button.addEventListener("click", () => openMediaDetail(button.dataset.ratingKey, button.dataset.libraryId, button.dataset.mediaType)));
+  root?.querySelectorAll(`[data-rating-key="${CSS.escape(String(item.rating_key))}"] .media-recheck`).forEach((button) => button.addEventListener("click", handleMediaRecheck));
+  bindSeasonToggles();
+}
+
+function patchVisibleMediaItem(item, serverId) {
+  const library = state.mediaLibraryData.find((entry) => String(entry.id) === String(item.library_id));
+  if (!library || String(state.mediaLibrarySelectedId) !== String(item.library_id)) return;
+  if (library.kind === "movie") {
+    const tbody = $("#media-library-content .movie-table tbody");
+    if (!tbody) return;
+    const old = tbody.querySelector(`[data-rating-key="${CSS.escape(String(item.rating_key))}"]`);
+    const wrapper = document.createElement("tbody");
+    wrapper.innerHTML = renderMovieTableRow(item, serverId, library.id);
+    const replacement = wrapper.firstElementChild;
+    if (!replacement) return;
+    if (old) old.replaceWith(replacement);
+    else {
+      const ordered = sortMediaItems(library.items || []);
+      const position = ordered.findIndex((entry) => String(entry.rating_key) === String(item.rating_key));
+      const next = position >= 0 ? tbody.querySelector(`[data-rating-key="${CSS.escape(String(ordered[position + 1]?.rating_key || ""))}"]`) : null;
+      if (next) tbody.insertBefore(replacement, next); else tbody.appendChild(replacement);
+    }
+    bindPatchedMediaItem(item);
+    return;
+  }
+  if (library.kind === "show" && !library.is_animation) {
+    const grid = $("#media-library-content .library-panel .show-grid");
+    if (!grid) return;
+    const existing = grid.querySelector(`[data-rating-key="${CSS.escape(String(item.rating_key))}"]`);
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = renderShowCard(item, serverId);
+    const card = wrapper.firstElementChild;
+    if (existing) existing.replaceWith(card);
+    else {
+      const ordered = sortMediaItems(library.items || []);
+      const position = ordered.findIndex((entry) => String(entry.rating_key) === String(item.rating_key));
+      const next = position >= 0 ? grid.querySelector(`[data-rating-key="${CSS.escape(String(ordered[position + 1]?.rating_key || ""))}"]`) : null;
+      if (next) grid.insertBefore(card, next); else grid.appendChild(card);
+    }
+    bindPatchedMediaItem(item);
+    return;
+  }
+  if (library.kind !== "show" || !$("#media-library-content .quarter-layout")) return;
+  const groups = state.mediaLibraryQuarterGroups || [];
+  for (const entry of item.quarter_entries || []) {
+    let group = groups.find((candidate) => String(candidate.label) === String(entry.label));
+    if (!group) { group = { label: entry.label || "未定档", items: [] }; groups.push(group); }
+    const quarterItem = { ...item, ...entry, library_id: item.library_id };
+    const key = `${item.rating_key}-${entry.season}`;
+    const index = group.items.findIndex((candidate) => `${candidate.rating_key}-${candidate.season}` === key);
+    if (index >= 0) group.items[index] = quarterItem; else group.items.push(quarterItem);
+    const sectionId = `quarter-${encodeURIComponent(String(group.label))}`;
+    let section = document.getElementById(sectionId);
+    if (!section) {
+      section = document.createElement("section");
+      section.id = sectionId;
+      section.className = "panel quarter-group";
+      section.innerHTML = `<div class="library-heading"><div><span class="eyebrow">ANIMATION QUARTER · 0</span><h3>${escapeHtml(group.label)}</h3></div><span class="library-type">季度</span></div><div class="show-grid"></div>`;
+      $("#media-library-content .quarter-groups")?.appendChild(section);
+    }
+    const grid = section.querySelector(".show-grid");
+    const old = grid?.querySelector(`[data-show-card="${CSS.escape(key)}"]`);
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = renderShowCard(quarterItem, serverId, entry.season);
+    if (old) old.replaceWith(wrapper.firstElementChild); else grid?.appendChild(wrapper.firstElementChild);
+    const eyebrow = section.querySelector(".eyebrow");
+    if (eyebrow) eyebrow.textContent = `ANIMATION QUARTER · ${group.items.length}`;
+  }
+  state.mediaLibraryQuarterGroups = groups;
+  state.mediaLibraryQuarterSignature = "";
+  patchAnimationQuarterDirectory(groups);
+  bindPatchedMediaItem(item);
+}
+
+async function updateMediaLibraryAfterAdd(serverId, mediaType, tmdbId, libraryId, results, resultVersion) {
+  const payload = await api(`/api/servers/${encodeURIComponent(serverId)}/media-library/item-by-tmdb?library_id=${encodeURIComponent(libraryId)}&media_type=${encodeURIComponent(mediaType)}&tmdb_id=${encodeURIComponent(tmdbId)}`);
+  const library = state.mediaLibraryData.find((entry) => String(entry.id) === String(libraryId));
+  if (library) {
+    library.item_count = payload.library_item_count;
+    if (library._itemsLoaded || String(state.mediaLibrarySelectedId) === String(libraryId)) {
+      library.items = library.items || [];
+      const index = library.items.findIndex((entry) => String(entry.rating_key) === String(payload.rating_key) || (Number(entry.tmdb_id) === Number(payload.tmdb_id) && String(entry.tmdb_media_type || entry.media_type) === String(mediaType)));
+      if (index >= 0) library.items[index] = payload; else library.items.push(payload);
+    }
+  }
+  refreshMediaLibraryCounts();
+  patchVisibleMediaItem(payload, serverId);
+  const current = (results || []).find((entry) => String(entry.media_type) === String(mediaType) && Number(entry.tmdb_id) === Number(tmdbId));
+  if (current) {
+    current.source = "merged";
+    current.can_add = false;
+    current.duplicate_reason = "已存在于媒体库";
+    current.library_ids = [...new Set([...(current.library_ids || []), Number(libraryId)])];
+    current.library_titles = [...new Set([...(current.library_titles || []), payload.library_title || String(libraryId)])];
+    current.source_labels = [...new Set([...(current.source_labels || []), "本系统"])]
+    current.locations = [...(current.locations || []).filter((location) => !(Number(location.library_id) === Number(libraryId) && String(location.rating_key) === String(payload.rating_key))), { library_id: Number(libraryId), rating_key: payload.rating_key, media_type: mediaType }];
+    if (mediaSearchState.version === resultVersion && mediaSearchState.signature === mediaSearchSignature()) {
+      mediaSearchState.results = results;
+      renderMediaSearchResults(results);
+    }
+  }
+  return payload;
 }
 
 function rerenderSelectedMediaLibrary(serverId) {
@@ -566,8 +789,6 @@ async function handleMediaRecheck(event) {
 function renderShowCard(show, serverId, focusSeason = null) {
   const seasons = show.seasons || [];
   const episodeCount = seasons.reduce((sum, season) => sum + season.episodes.length, 0);
-  const marks = JSON.parse(localStorage.getItem("clp-show-kinds") || "{}");
-  const showKind = marks[show.rating_key] || show.show_kind || "真人";
   const seasonMarkup = seasons.length ? seasons.map((season) => {
     const currentSeason = focusSeason !== null && Number(focusSeason) === Number(season.season);
     const missingEpisodes = season.episodes.filter((episode) => episode.missing && episodeAvailability(episode) === "媒体文件缺失");
@@ -588,7 +809,9 @@ function renderShowCard(show, serverId, focusSeason = null) {
     }).join("")}</div></details>`;
   }).join("") : '<div class="show-details-loading">正在读取季和集的详细信息…</div>';
   const cardKey = `${show.rating_key}${focusSeason === null ? "" : `-${focusSeason}`}`;
-  return `<article class="show-card" data-show-card="${escapeHtml(cardKey)}" data-rating-key="${escapeHtml(show.rating_key)}"><div class="show-card-head">${show.thumb ? `<img src="${mediaImageUrl(serverId, show.thumb)}" alt="">` : '<div class="show-fallback">剧</div>'}<div class="show-card-title"><div class="show-title-line"><h4>${escapeHtml(show.title)}</h4><button class="show-kind ${showKind === "动画" ? "anime" : "live"} kind-toggle" type="button" data-rating-key="${escapeHtml(show.rating_key)}">${escapeHtml(showKind)}</button></div><p>${escapeHtml(show.original_title || "")}</p><span class="meta">${escapeHtml(show.year || "未知年份")} · ${seasons.length ? `${seasons.length} 季 · ${episodeCount} 集` : "详情读取中"}${show.genre ? ` · ${escapeHtml(show.genre)}` : ""}</span></div><div class="media-card-actions"><button class="small media-recheck" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}">重新检查</button><button class="small media-detail-link" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}" data-media-type="show">查看详情</button></div></div><div class="season-list">${seasonMarkup}</div></article>`;
+  const poster = show.thumb ? mediaImageUrl(serverId, show.thumb) : (show.poster_url || "");
+  const idMarkup = renderExternalIdBadges(show, "tv", "media-show-ids");
+  return `<article class="show-card" data-show-card="${escapeHtml(cardKey)}" data-rating-key="${escapeHtml(show.rating_key)}"><div class="show-card-head">${poster ? `<img src="${poster}" alt="">` : '<div class="show-fallback">剧</div>'}<div class="show-card-title"><div class="show-title-line"><h4>${escapeHtml(show.title)}</h4></div><p>${escapeHtml(show.original_title || "")}</p><span class="meta">${escapeHtml(show.year || "未知年份")} · ${seasons.length ? `${seasons.length} 季 · ${episodeCount} 集` : "详情读取中"}${show.genre ? ` · ${escapeHtml(show.genre)}` : ""}</span>${idMarkup}</div><div class="media-card-actions"><button class="small media-recheck" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}">重新检查</button><button class="small media-detail-link" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}" data-media-type="show">查看详情</button></div></div><div class="season-list">${seasonMarkup}</div></article>`;
 }
 
 function episodeAvailability(episode) {
@@ -637,7 +860,6 @@ async function loadVisibleShowDetails(serverId) {
       card.querySelector(".show-details-loading")?.replaceWith(Object.assign(document.createElement("div"), { className: "show-details-loading error", textContent: "剧集详情读取失败，可点击“重新检查”重试。" }));
     }
   }
-  setMessage("#media-library-message", "当前媒体库页面已更新");
 }
 
 async function loadMediaLibrary() {
@@ -666,19 +888,21 @@ async function loadMediaLibrary() {
       state.mediaLibrarySort = "first_episode_date";
       state.mediaLibraryDirection = "desc";
     }
-    if (library) {
+    if (library && !(library.kind === "show" && library.is_animation)) {
       const cached = await api(`/api/servers/${serverId}/media-library/${library.id}/items`);
       library.items = cached.items || [];
+      library._itemsLoaded = true;
       renderMediaLibraryPage(serverId);
     }
     if (library?.kind === "show" && library.is_animation) {
       const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
       state.mediaLibraryQuarterGroups = quarter.groups || [];
-    renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, quarter.live_items || []);
+      state.mediaLibraryLiveItems = quarter.live_items || [];
+      renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
     } else {
       await loadVisibleShowDetails(serverId);
     }
-    setMessage("#media-library-message", "当前媒体库页面已更新");
+    setMessage("#media-library-message", "");
     startMediaLibrarySyncPolling(serverId);
   } catch (error) {
     setMessage("#media-library-message", error.message, true);
@@ -715,6 +939,229 @@ $("#media-library-refresh")?.addEventListener("click", async () => {
   if (!serverId || !libraryId) return;
   try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `已开始同步媒体库、更新 TMDB 数据并检查缺失剧集：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
 });
+
+function searchLibraryOptions(kind) {
+  return (state.mediaLibraryData || []).filter((item) => item.kind === kind).map((item) => `<option value="${item.id}">${escapeHtml(item.title)}</option>`).join("");
+}
+async function jumpToMediaSearchLocation(item) {
+  const location = (item.locations || [])[0] || (item.library_id && item.rating_key ? { library_id: item.library_id, rating_key: item.rating_key, media_type: item.media_type } : null);
+  if (!location) return;
+  const serverId = $("#media-library-server")?.value;
+  if (!serverId) return;
+  const ratingKey = String(location.rating_key || "");
+  // Always go through the normal library selection flow. Animation libraries
+  // use the quarter layout, so rendering the generic library page directly
+  // leaves the UI on an incomplete page and the target card cannot be found.
+  await selectMediaLibrary(location.library_id, serverId);
+  const quarterGroups = state.mediaLibraryQuarterGroups || [];
+  const targetQuarter = quarterGroups.find((group) => (group.items || []).some((entry) => String(entry.rating_key) === ratingKey));
+  const selector = location.media_type === "movie"
+    ? `tr[data-rating-key="${CSS.escape(ratingKey)}"]`
+    : `[data-rating-key="${CSS.escape(ratingKey)}"]`;
+  let element = document.querySelector(selector);
+  // Quarter groups use content-visibility:auto for performance. A card can
+  // exist in the DOM while its group still has only an intrinsic placeholder
+  // height. Force the target group to participate in layout before reading
+  // any card coordinates; otherwise the first click lands at a stale offset
+  // and a second click appears to "fix" it.
+  const targetSection = targetQuarter
+    ? document.getElementById(`quarter-${encodeURIComponent(String(targetQuarter.label || ""))}`)
+    : null;
+  if (targetSection) {
+    targetSection.style.contentVisibility = "visible";
+    targetSection.style.containIntrinsicSize = "auto";
+    targetSection.scrollIntoView({ behavior: "auto", block: "start" });
+    await new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)));
+  }
+  // Hydrate the requested card first. The background loop replaces loading
+  // cards one by one; waiting for this card here prevents its later height
+  // change from moving the first-click destination.
+  if (element?.querySelector(".show-details-loading") && location.media_type !== "movie") {
+    try {
+      const entry = targetQuarter?.items?.find((item) => String(item.rating_key) === ratingKey);
+      const fresh = await api(`/api/servers/${serverId}/media-library/item?library_id=${encodeURIComponent(location.library_id)}&rating_key=${encodeURIComponent(ratingKey)}&media_type=show`);
+      const focusSeason = entry && entry.season !== undefined && entry.season !== null ? Number(entry.season) : null;
+      const cardKey = element.dataset.showCard || `${ratingKey}${focusSeason === null ? "" : `-${focusSeason}`}`;
+      element.outerHTML = renderShowCard(fresh, serverId, Number.isFinite(focusSeason) ? focusSeason : null);
+      element = document.querySelector(`[data-show-card="${CSS.escape(cardKey)}"]`) || document.querySelector(selector);
+      element?.querySelector(".media-recheck")?.addEventListener("click", handleMediaRecheck);
+      element?.querySelector(".media-detail-link")?.addEventListener("click", () => openMediaDetail(fresh.rating_key, location.library_id, "show"));
+      bindMediaKindToggles();
+      bindSeasonToggles();
+    } catch (_) {
+      // The normal hydration loop can still replace the card if this request
+      // fails, so navigation continues with the current DOM node.
+    }
+  }
+  // Quarter details are hydrated asynchronously after the quarter layout is
+  // painted. Wait briefly for the card rather than stopping on the loading
+  // state or scrolling to the top of the page.
+  const deadline = Date.now() + 6000;
+  while (!element && Date.now() < deadline) {
+    await new Promise((resolve) => window.setTimeout(resolve, 100));
+    element = document.querySelector(selector);
+  }
+  if (element) {
+    // The first layout pass may still be settling after content-visibility is
+    // lifted. Wait for two stable animation frames and re-query the node in
+    // case asynchronous detail hydration replaced it.
+    await new Promise((resolve) => window.requestAnimationFrame(() => window.requestAnimationFrame(resolve)));
+    element = document.querySelector(selector) || element;
+    // Re-query after the layout pass because async detail hydration may have
+    // replaced the card node. Use an explicit document offset so this also
+    // works when content-visibility or nested layout containers are involved.
+    const scrollingElement = document.scrollingElement || document.documentElement;
+    const preferredTop = Math.max(96, Math.round(window.innerHeight * 0.18));
+    const resolveElement = () => document.querySelector(selector) || element;
+    const correctScroll = () => {
+      const current = resolveElement();
+      if (!current) return;
+      const rect = current.getBoundingClientRect();
+      const delta = rect.top - preferredTop;
+      if (Math.abs(delta) > 1) scrollingElement.scrollTo({ top: Math.max(0, scrollingElement.scrollTop + delta), behavior: "auto" });
+    };
+    // Do the first move synchronously. Smooth scrolling lets asynchronous
+    // card hydration move the destination underneath the animation, which is
+    // why the old implementation often required a second click.
+    correctScroll();
+    // Detail requests for cards above the target can still replace loading
+    // placeholders and change the document height. Re-anchor the target for a
+    // short settling window so the first click remains accurate.
+    let frames = 0;
+    const settle = () => {
+      correctScroll();
+      if (++frames < 90) window.requestAnimationFrame(settle);
+    };
+    window.requestAnimationFrame(settle);
+    const highlighted = resolveElement();
+    highlighted?.classList.add("media-search-highlight");
+    setTimeout(() => resolveElement()?.classList.remove("media-search-highlight"), 2200);
+    return;
+  }
+  throw new Error("没有找到对应的媒体库条目，请刷新媒体库后重试。");
+}
+function renderMediaSearchResults(results) {
+  const resultVersion = mediaSearchState.version;
+  const target = $("#media-library-search-results");
+  const serverId = $("#media-library-server")?.value || "";
+  target.innerHTML = (results || []).map((item, resultIndex) => {
+    const firstLocation = (item.locations || [])[0] || {};
+    const label = item.media_type === "movie" ? "电影" : "剧集";
+    const posterUrl = item.poster_url || (item.thumb && serverId ? mediaImageUrl(serverId, item.thumb) : "");
+    const poster = posterUrl ? `<img class="search-result-poster" src="${escapeHtml(posterUrl)}" alt="" loading="lazy">` : `<span class="search-result-poster fallback">影</span>`;
+    const action = item.can_add ? `<select class="search-target-library" data-kind="${item.media_type}">${searchLibraryOptions(item.media_type === "movie" ? "movie" : "show")}</select><button class="small primary media-search-add" data-type="${item.media_type}" data-tmdb-id="${item.tmdb_id}">添加到媒体库</button><span class="media-search-add-status meta" hidden></span>` : `<span class="meta">${escapeHtml(item.add_status || item.duplicate_reason || "已存在")}</span>`;
+    const jump = item.source !== "tmdb" && ((item.locations || []).length || item.rating_key) ? `<button class="small media-search-jump" type="button" data-result-index="${resultIndex}" title="跳转到媒体库条目">↗</button>` : "";
+    const sourceLabels = [...new Set(item.source_labels || (item.source === "merged" ? ["媒体库", "本系统", "TMDB"] : item.source === "tmdb" ? ["TMDB"] : item.source === "catalog" ? ["本系统"] : ["媒体库"]))];
+    const ids = renderExternalIdBadges(item, item.media_type);
+    return `<article class="media-search-result" data-location-library-id="${escapeHtml(firstLocation.library_id || item.library_id || "")}" data-location-rating-key="${escapeHtml(firstLocation.rating_key || item.rating_key || "")}"><div>${poster}</div><div class="search-result-main"><strong>${escapeHtml(item.title || "未命名")}</strong><span>${escapeHtml(item.original_title || "")} · ${escapeHtml(item.year || "未知年份")} · ${label}</span>${ids}<small>${escapeHtml((item.genres || []).join(", ") || "无标签")}</small><small class="media-source-badges">${sourceLabels.map((source) => `<span class="media-source-badge">${escapeHtml(source)}</span>`).join("")} ${escapeHtml((item.library_titles || []).join(", ") || "")}${item.media_type === "movie" && item.resolution ? ` · ${escapeHtml(item.resolution)}` : ""}</small></div><div class="media-card-actions">${jump}${action}</div></article>`;
+  }).join("") || '<div class="media-empty">没有找到匹配作品。</div>';
+  target.querySelectorAll(".media-search-jump").forEach((button) => button.addEventListener("click", async () => {
+    button.disabled = true;
+    try {
+      await jumpToMediaSearchLocation((results || [])[Number(button.dataset.resultIndex)]);
+    } catch (error) {
+      setMessage("#media-library-search-message", error.message || "跳转媒体库条目失败", true);
+    } finally {
+      button.disabled = false;
+    }
+  }));
+  target.querySelectorAll(".media-search-add").forEach((button) => button.addEventListener("click", async () => {
+    const serverId = $("#media-library-server").value;
+    const select = button.closest(".media-search-result").querySelector(".search-target-library");
+    const status = button.closest(".media-search-result").querySelector(".media-search-add-status");
+    button.disabled = true;
+    select.disabled = true;
+    button.textContent = "提交中…";
+    if (status) { status.hidden = false; status.textContent = "正在创建添加任务…"; status.className = "media-search-add-status meta"; }
+    try {
+      const result = await api(`/api/servers/${serverId}/media-library/search/add`, { method: "POST", body: JSON.stringify({ media_type: button.dataset.type, tmdb_id: Number(button.dataset.tmdbId), library_id: Number(select.value) }) });
+      const jobId = Number(result.job_id);
+      if (!jobId) throw new Error("添加任务未返回任务编号");
+      setMessage("#media-library-search-message", `添加任务 #${jobId} 已创建，正在写入本系统媒体库…`);
+      if (status) status.textContent = `任务 #${jobId}：排队中`;
+      const startedAt = Date.now();
+      const poll = async () => {
+        try {
+          const job = await api(`/api/jobs/${jobId}`);
+          if (["queued", "running"].includes(job.status)) {
+            const progress = job.total ? ` ${job.processed || 0}/${job.total}` : "";
+            if (status) status.textContent = `任务 #${jobId}：${job.status === "running" ? "处理中" : "排队中"}${progress}`;
+            if (Date.now() - startedAt < 180000) { window.setTimeout(poll, 700); return; }
+            if (status) status.textContent = `任务 #${jobId}：仍在处理中，可在任务中心查看`;
+            setMessage("#media-library-search-message", `添加任务 #${jobId} 仍在处理中，可在任务中心查看进度。`);
+            return;
+          }
+          if (job.status === "succeeded") {
+            if (status) { status.textContent = `任务 #${jobId}：添加成功`; status.className = "media-search-add-status success"; }
+            if (mediaSearchState.version === resultVersion && mediaSearchState.signature === mediaSearchSignature()) {
+              setMessage("#media-library-search-message", `任务 #${jobId} 已完成，作品已添加到本系统媒体库。`);
+            }
+            const resultIndex = (results || []).findIndex((entry) => String(entry.media_type) === String(button.dataset.type) && Number(entry.tmdb_id) === Number(button.dataset.tmdbId));
+            const resultItem = resultIndex >= 0 ? results[resultIndex] : null;
+            if (resultItem) resultItem.add_status = `任务 #${jobId}：添加成功`;
+            try {
+              await updateMediaLibraryAfterAdd(serverId, button.dataset.type, Number(button.dataset.tmdbId), Number(select.value), results, resultVersion);
+            } catch (refreshError) {
+              if (resultItem) {
+                resultItem.add_status = `任务 #${jobId}：添加成功（局部刷新失败）`;
+                resultItem.can_add = false;
+                resultItem.duplicate_reason = "已写入本系统，页面请手动刷新";
+                if (mediaSearchState.version === resultVersion && mediaSearchState.signature === mediaSearchSignature()) {
+                  mediaSearchState.results = results;
+                  renderMediaSearchResults(results);
+                }
+              }
+              if (mediaSearchState.version === resultVersion && mediaSearchState.signature === mediaSearchSignature()) {
+                setMessage("#media-library-search-message", `任务 #${jobId} 已完成，但局部刷新失败：${refreshError.message || "请手动刷新页面"}`, true);
+              }
+            }
+            return;
+          }
+          const errorText = job.error || `任务状态：${job.status}`;
+          if (status) { status.textContent = `任务 #${jobId}：失败`; status.className = "media-search-add-status error"; }
+          button.disabled = false;
+          select.disabled = false;
+          button.textContent = "重试添加";
+          setMessage("#media-library-search-message", `添加任务 #${jobId} 失败：${errorText}`, true);
+        } catch (error) {
+          if (Date.now() - startedAt < 180000) { window.setTimeout(poll, 1200); return; }
+          button.disabled = false;
+          select.disabled = false;
+          button.textContent = "重试添加";
+          if (status) status.textContent = `任务 #${jobId}：无法读取状态`;
+          setMessage("#media-library-search-message", `已创建任务 #${jobId}，但暂时无法读取任务状态，请到任务中心查看。`, true);
+        }
+      };
+      window.setTimeout(poll, 250);
+    } catch (error) {
+      button.disabled = false;
+      select.disabled = false;
+      button.textContent = "添加到媒体库";
+      if (status) { status.hidden = false; status.textContent = "创建任务失败"; status.className = "media-search-add-status error"; }
+      setMessage("#media-library-search-message", error.message, true);
+    }
+  }));
+}
+async function runMediaLibrarySearch() {
+  const serverId = $("#media-library-server")?.value;
+  if (!serverId) return;
+  const params = new URLSearchParams({ q: $("#media-library-search-query").value.trim(), media_type: $("#media-library-search-type").value, include_tmdb: "1" });
+  const year = $("#media-library-search-year").value.trim();
+  if (year) params.set("year", year);
+  const requestVersion = ++mediaSearchState.version;
+  setMessage("#media-library-search-message", "正在搜索…");
+  try {
+    const data = await api(`/api/servers/${serverId}/media-library/search?${params}`);
+    if (requestVersion !== mediaSearchState.version) return;
+    mediaSearchState.signature = mediaSearchSignature();
+    mediaSearchState.results = data.results || [];
+    renderMediaSearchResults(mediaSearchState.results);
+    setMessage("#media-library-search-message", data.warning || `找到 ${data.results.length} 项` , Boolean(data.warning));
+  } catch (error) { setMessage("#media-library-search-message", error.message, true); }
+}
+$("#media-library-search-submit")?.addEventListener("click", runMediaLibrarySearch);
+$("#media-library-search-query")?.addEventListener("keydown", (event) => { if (event.key === "Enter") runMediaLibrarySearch(); });
+$("#media-library-search-clear")?.addEventListener("click", () => { $("#media-library-search-query").value = ""; $("#media-library-search-year").value = ""; $("#media-library-search-type").value = "all"; mediaSearchState.version += 1; mediaSearchState.results = []; mediaSearchState.signature = mediaSearchSignature(); $("#media-library-search-results").innerHTML = ""; setMessage("#media-library-search-message", ""); });
 $("#media-library-server")?.addEventListener("change", () => { state.mediaLibrarySelectedId = null; state.mediaLibraryPage = 1; loadMediaLibrary(); });
 $("#media-library-picker")?.addEventListener("change", () => selectMediaLibrary($("#media-library-picker").value, $("#media-library-server").value));
 $("#media-library-animation-mode")?.addEventListener("change", async () => {

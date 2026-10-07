@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from clp_web.db import connect, init_db, new_secret, utcnow
+from clp_web.catalog import resolve_plex_rating_key
 from clp_web.rechecks import enqueue_due_rechecks, request_recheck
 
 
@@ -57,3 +58,29 @@ def test_missing_show_key_is_reported(tmp_path):
     path, server_id = _database(tmp_path)
     with connect(path) as db:
         assert request_recheck(db, server_id, "library.new", {"type": "episode", "librarySectionID": 2}) == "show_key_missing"
+
+
+def test_synthetic_tmdb_show_key_resolves_to_plex_item(tmp_path, monkeypatch):
+    path, server_id = _database(tmp_path)
+    now = utcnow()
+    with connect(path) as db:
+        db.execute(
+            """INSERT INTO media_library_items
+               (server_id,library_id,rating_key,plex_type,title,original_title,year,tmdb_media_type,tmdb_id,system_managed,source,scanned_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (server_id, 2, "tmdb:tv:326119", "show", "雷霆三人行", "サンダー３", 2026, "tv", 326119, 1, "system", now),
+        )
+        db.commit()
+
+    class FakePlex:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def list_library(self):
+            return [[2, 2, "电视剧"]]
+
+        def list_library_items(self, _library_id, _plex_type):
+            return [{"ratingKey": "real-1", "type": "show", "title": "雷霆三人行", "year": 2026, "Guid": [{"id": "tmdb://326119"}]}]
+
+    monkeypatch.setattr("clp_web.catalog.PlexServer", FakePlex)
+    assert resolve_plex_rating_key(path, server_id, 2, "tmdb:tv:326119") == "real-1"

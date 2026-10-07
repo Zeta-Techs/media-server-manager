@@ -18,4 +18,4 @@ RUN mkdir -p /app/config \
 USER msm
 
 ENTRYPOINT ["/app/start.sh"]
-CMD ["python", "-m", "media_server_manager_web"]
+CMD ["python", "-m", "clp_web"]

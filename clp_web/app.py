@@ -41,8 +41,10 @@ from .security import (
     verify_password,
 )
 from .services import TERMINAL_JOB_STATUSES, JobQueue
-from .catalog import sync_media_library_full
+from .catalog import resolve_plex_rating_key, sync_media_library_full
 from .rechecks import request_recheck
+from .bulk_media import MAX_BULK_ROWS, decode_json, row_dict, add_system_media_item, parse_line, _summary, dedupe_system_media_items, _title_key
+from .tmdb import TMDBClient, TMDBError
 
 
 def _air_date(metadata: dict[str, Any]) -> str:
@@ -217,6 +219,16 @@ def _library_is_animation(mode: str, title: str, plex_type: int) -> bool:
     return _library_name_is_animation(title, plex_type)
 
 
+def _cached_show_kind(row: Any, library: Any) -> str:
+    """Use TMDB classification for system rows and Plex labels for real rows."""
+    if row is not None and int(row["system_managed"] or 0) and row["animation_kind"]:
+        return str(row["animation_kind"])
+    genre = str(row["genre"] or "").casefold() if row is not None else ""
+    if genre:
+        return "动画" if any(marker in genre for marker in ("动画", "animation", "anime")) else "真人"
+    return "动画" if _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人"
+
+
 def _quarter_entries(show: dict[str, Any], library_id: int, plex: PlexServer) -> list[dict[str, Any]]:
     full = _show_payload(plex, show, library_id)
     entries = []
@@ -292,9 +304,12 @@ def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any
                         "episodes": episodes})
     raw = decode_payload(show.get("raw_json"))
     item = {key: show.get(key) for key in ("rating_key", "title", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "content_rating", "genre", "thumb", "art")}
-    item.update({"library_id": library_id, "type": "show", "summary": raw.get("summary") or "", "external_ids": raw.get("external_ids") or extract_external_ids(raw),
-                 "show_kind": "动画" if _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人", "seasons": seasons,
-                 "season_count": len(seasons), "episode_count": sum(len(item["episodes"]) for item in seasons)})
+    external_ids = raw.get("external_ids") or extract_external_ids(raw)
+    external_ids = {**external_ids, "tmdb": str(show.get("tmdb_id") or external_ids.get("tmdb") or ""), "imdb": str(show.get("imdb_id") or external_ids.get("imdb") or ""), "tvdb": str(show.get("tvdb_id") or external_ids.get("tvdb") or "")}
+    item.update({"library_id": library_id, "type": "show", "summary": raw.get("summary") or "", "external_ids": external_ids,
+                 "tmdb_id": int(show["tmdb_id"]) if show.get("tmdb_id") else None, "imdb_id": show.get("imdb_id") or external_ids.get("imdb") or "", "tvdb_id": show.get("tvdb_id") or external_ids.get("tvdb") or "",
+                 "show_kind": _cached_show_kind(show, library), "seasons": seasons,
+                 "season_count": len(seasons), "episode_count": sum(len(item["episodes"]) for item in seasons), "poster_url": raw.get("poster_url") or ""})
     return item
 
 
@@ -963,6 +978,10 @@ def create_app() -> Flask:
     @servers_bp.get("/api/servers/<int:server_id>/media-library")
     @login_required
     def media_library(server_id: int):
+        # Clean up legacy synthetic rows before returning library counts/items.
+        # This is idempotent and also repairs duplicates created by old batch
+        # imports after the corresponding Plex item has appeared.
+        dedupe_system_media_items(DB_FILE)
         with connect() as db:
             server = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
             if server is None:
@@ -1013,16 +1032,246 @@ def create_app() -> Flask:
                 return api_error("媒体库缓存不存在，请先同步", "library_cache_missing", 404)
             rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection') ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
             items = []
+            seen_tmdb: set[tuple[str, int]] = set()
+            real_signatures = {("movie" if row["plex_type"] == "movie" else "tv", int(row["year"] or 0), _title_key(row["title"])) for row in rows if not row["system_managed"] and row["plex_type"] in {"movie", "show"} and _title_key(row["title"])}
             for row in rows:
                 item = dict(row)
+                tmdb_key = (str(item.get("tmdb_media_type") or item.get("plex_type") or ""), int(item.get("tmdb_id") or 0))
+                if item.get("system_managed") and tmdb_key[1] and db.execute("SELECT 1 FROM media_library_items WHERE server_id=? AND library_id=? AND tmdb_media_type=? AND tmdb_id=? AND system_managed=0 LIMIT 1", (server_id, library_id, tmdb_key[0], tmdb_key[1])).fetchone():
+                    continue
+                signature = ("movie" if row["plex_type"] == "movie" else "tv", int(row["year"] or 0), _title_key(row["title"]))
+                if item.get("system_managed") and signature in real_signatures:
+                    continue
+                if tmdb_key[1] and tmdb_key in seen_tmdb:
+                    continue
+                if tmdb_key[1]:
+                    seen_tmdb.add(tmdb_key)
                 raw = decode_payload(item.pop("raw_json", "{}"))
                 item["external_ids"] = raw.get("external_ids") or extract_external_ids(raw)
+                item["poster_url"] = raw.get("poster_url") or ""
                 item["library_id"] = library_id
-                item["show_kind"] = "动画" if library["plex_type"] == 2 and _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人"
+                item["show_kind"] = item.get("animation_kind") or ("动画" if library["plex_type"] == 2 and _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人")
+                item["system_genres"] = decode_json(item.get("system_genres"), [])
                 item["season_count"] = db.execute("SELECT COUNT(DISTINCT season_number) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season'", (server_id, library_id, row["rating_key"])).fetchone()["count"]
                 item["episode_count"] = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode'", (server_id, library_id, row["rating_key"])).fetchone()["count"]
                 items.append(item)
         return jsonify({"server_id": server_id, "library_id": library_id, "items": items})
+
+    @servers_bp.get("/api/servers/<int:server_id>/media-library/search")
+    @login_required
+    def search_media_library(server_id: int):
+        dedupe_system_media_items(DB_FILE)
+        query = str(request.args.get("q") or "").strip()
+        media_type = str(request.args.get("media_type") or "all").strip().lower()
+        year_text = str(request.args.get("year") or "").strip()
+        include_tmdb = str(request.args.get("include_tmdb", "1")).lower() not in {"0", "false", "no"}
+        try:
+            year = int(year_text) if year_text else None
+            if year is not None and not 1800 <= year <= 2200:
+                raise ValueError
+        except ValueError:
+            return api_error("年份无效", "invalid_search_year", 400)
+        if media_type not in {"all", "movie", "tv"}:
+            return api_error("媒体类型无效", "invalid_search_media_type", 400)
+        if not query and year is None and media_type == "all":
+            return api_error("请输入关键词、类型或年份", "empty_media_search", 400)
+        try:
+            limit = min(max(int(request.args.get("limit") or 20), 1), 50)
+        except ValueError:
+            limit = 20
+        wanted_types = [media_type] if media_type in {"movie", "tv"} else ["movie", "tv"]
+        with connect() as db:
+            if db.execute("SELECT 1 FROM servers WHERE id=? AND enabled=1", (server_id,)).fetchone() is None:
+                return api_error("服务器不存在或已停用", "server_not_found", 404)
+            libraries = {int(row["library_id"]): row for row in db.execute("SELECT * FROM media_libraries WHERE server_id=?", (server_id,)).fetchall()}
+            rows = db.execute("SELECT * FROM media_library_items WHERE server_id=? AND parent_rating_key='' AND plex_type IN ('movie','show') ORDER BY title COLLATE NOCASE", (server_id,)).fetchall()
+        local = {}
+        # Keep an index of every local TMDB-backed item even when its cached
+        # title does not match the text query. System-maintained rows can have
+        # stale/garbled localized title columns; the stable TMDB identity must
+        # still allow them to merge with the TMDB search result.
+        local_tmdb_index = {}
+        needle = query.casefold()
+        for row in rows:
+            kind = str(row["tmdb_media_type"] or ("movie" if row["plex_type"] == "movie" else "tv"))
+            if kind not in wanted_types:
+                continue
+            if year is not None and int(row["year"] or 0) != year:
+                continue
+            raw = decode_payload(row["raw_json"])
+            tmdb_id = int(row["tmdb_id"] or (raw.get("external_ids") or {}).get("tmdb") or 0)
+            external_ids = raw.get("external_ids") or extract_external_ids(raw)
+            imdb_id = str(row["imdb_id"] or external_ids.get("imdb") or "")
+            tvdb_id = str(row["tvdb_id"] or external_ids.get("tvdb") or "")
+            # System-maintained rows are seeded from TMDB and may have a
+            # damaged/empty localized title in the legacy title columns.
+            # Prefer the cached TMDB payload for display and matching so the
+            # item remains searchable even when the remote TMDB request is
+            # unavailable or no longer returns the same search hit.
+            cached_tmdb = raw.get("tmdb") if isinstance(raw.get("tmdb"), dict) else raw
+            cached_title = str(cached_tmdb.get("title") or cached_tmdb.get("name") or "")
+            cached_original = str(cached_tmdb.get("original_title") or cached_tmdb.get("original_name") or "")
+            title = str(row["title"] or "")
+            original_title = str(row["original_title"] or "")
+            if cached_title and (not title or "\ufffd" in title):
+                title = cached_title
+            if cached_original and (not original_title or "\ufffd" in original_title):
+                original_title = cached_original
+            if tmdb_id and (year is None or int(row["year"] or 0) == year):
+                local_key = (kind, tmdb_id)
+                indexed = local_tmdb_index.get(local_key)
+                if indexed is None or (indexed.get("system_managed") and not int(row["system_managed"] or 0)):
+                    indexed = {"source": "local", "media_type": kind, "tmdb_id": tmdb_id or None, "imdb_id": imdb_id, "tvdb_id": tvdb_id, "title": title, "original_title": original_title, "year": row["year"], "thumb": row["thumb"] or "", "poster_url": raw.get("poster_url") or "", "genres": decode_json(row["system_genres"], []) or [x.strip() for x in str(row["genre"] or "").split(",") if x.strip()], "library_ids": [], "library_titles": [], "locations": [], "source_labels": [], "library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "system_managed": bool(row["system_managed"]), "plex_present": not bool(row["system_managed"]), "resolution": row["resolution"] or "", "can_add": False, "duplicate_reason": "已存在于媒体库", "_real": not bool(row["system_managed"])}
+                    local_tmdb_index[local_key] = indexed
+                indexed["library_ids"].append(int(row["library_id"]))
+                indexed["locations"].append({"library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "media_type": kind})
+                library_row = libraries.get(int(row["library_id"]))
+                indexed["library_titles"].append(str(library_row["title"] if library_row else row["library_id"]))
+                indexed["source_labels"].append("本系统" if bool(row["system_managed"]) else f"媒体服务器：{title}")
+            haystack = " ".join([title, original_title, cached_title, cached_original, str(tmdb_id), imdb_id, tvdb_id]) .casefold()
+            if needle and needle not in haystack:
+                continue
+            key = (kind, tmdb_id) if tmdb_id else (kind, f"local:{row['rating_key']}")
+            item = local.get(key)
+            if item is None or (item.get("system_managed") and not int(row["system_managed"] or 0)):
+                item = {"source": "local", "media_type": kind, "tmdb_id": tmdb_id or None, "imdb_id": imdb_id, "tvdb_id": tvdb_id, "title": title, "original_title": original_title, "year": row["year"], "thumb": row["thumb"] or "", "poster_url": raw.get("poster_url") or "", "genres": decode_json(row["system_genres"], []) or [x.strip() for x in str(row["genre"] or "").split(",") if x.strip()], "library_ids": [], "library_titles": [], "locations": [], "source_labels": [], "library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "system_managed": bool(row["system_managed"]), "plex_present": not bool(row["system_managed"]), "resolution": row["resolution"] or "", "can_add": False, "duplicate_reason": "已存在于媒体库", "_real": not bool(row["system_managed"])}
+                local[key] = item
+            item["library_ids"].append(int(row["library_id"]))
+            item["locations"].append({"library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "media_type": kind})
+            library_row = libraries.get(int(row["library_id"]))
+            item["library_titles"].append(str(library_row["title"] if library_row else row["library_id"]))
+            item["source_labels"].append("本系统" if bool(row["system_managed"]) else f"媒体服务器：{title}")
+        # Keep local TMDB-backed entries visible even when the remote search
+        # does not return them. This is essential for system-maintained items:
+        # adding them must be observable from the local database alone.
+        for key, indexed in local_tmdb_index.items():
+            haystack = " ".join([str(indexed.get("title") or ""), str(indexed.get("original_title") or ""), str(indexed.get("tmdb_id") or "")]).casefold()
+            if (not needle or needle in haystack) and key not in local:
+                local[key] = indexed
+        for item in local.values():
+            item["library_ids"] = list(dict.fromkeys(item.get("library_ids") or []))
+            item["library_titles"] = list(dict.fromkeys(item.get("library_titles") or []))
+            item["source_labels"] = list(dict.fromkeys(item.get("source_labels") or []))
+            seen_locations = set()
+            item["locations"] = [loc for loc in item.get("locations") or [] if not ((loc_key := (loc.get("library_id"), loc.get("rating_key"))) in seen_locations or seen_locations.add(loc_key))]
+        tmdb_items = {}
+        # The local TMDB catalog is a separate source from both Plex and live
+        # TMDB requests. Include it in the same identity merge.
+        with connect() as db:
+            catalog_rows = db.execute("SELECT * FROM tmdb_items WHERE media_type IN ('movie','tv') ORDER BY release_date DESC, id DESC").fetchall()
+        for row in catalog_rows:
+            release = str(row["release_date"] or "")
+            catalog_year = int(release[:4]) if release[:4].isdigit() else None
+            if media_type != "all" and row["media_type"] != media_type:
+                continue
+            if year is not None and catalog_year != year:
+                continue
+            catalog_raw = decode_payload(row["raw_json"])
+            catalog_ids = catalog_raw.get("external_ids") or {}
+            catalog_imdb = str(row["imdb_id"] or catalog_ids.get("imdb") or catalog_ids.get("imdb_id") or "")
+            catalog_tvdb = str(row["tvdb_id"] or catalog_ids.get("tvdb") or catalog_ids.get("tvdb_id") or "")
+            haystack = " ".join([str(row["title"] or ""), str(row["original_title"] or ""), str(row["tmdb_id"]), catalog_imdb, catalog_tvdb]).casefold()
+            if needle and needle not in haystack:
+                continue
+            key = (str(row["media_type"]), int(row["tmdb_id"]))
+            genres = decode_json(row["genres"], [])
+            if genres and isinstance(genres[0], dict):
+                genres = [str(g.get("name") or g.get("id") or "") for g in genres]
+            tmdb_items[key] = {"source": "catalog", "media_type": str(row["media_type"]), "tmdb_id": int(row["tmdb_id"]), "imdb_id": catalog_imdb, "tvdb_id": catalog_tvdb, "title": row["title"], "original_title": row["original_title"], "year": catalog_year, "poster_url": f"https://image.tmdb.org/t/p/w342{row['poster_path']}" if row["poster_path"] else "", "genres": genres, "library_ids": [], "library_titles": [], "source_labels": ["本系统"], "system_managed": False, "plex_present": False, "resolution": "", "can_add": False, "duplicate_reason": "本系统资料库"}
+        for key, item in list(tmdb_items.items()):
+            local_item = local.get(key) or local_tmdb_index.get(key)
+            if local_item is None:
+                local_item = next((candidate for candidate in local.values() if candidate.get("media_type") == item.get("media_type") and int(candidate.get("year") or 0) == int(item.get("year") or 0) and (_title_key(candidate.get("title")) == _title_key(item.get("title")) or _title_key(candidate.get("original_title")) == _title_key(item.get("original_title")))), None)
+            if local_item:
+                local[key] = local_item
+                if not local_item.get("_real"):
+                    local_item.update({field: item[field] for field in ("title", "original_title", "year", "poster_url", "genres", "imdb_id", "tvdb_id") if field in item and item[field]})
+                local_item["source_labels"] = list(dict.fromkeys((local_item.get("source_labels") or []) + ["本系统"]))
+                local_item["source"] = "merged"
+                local_item["can_add"] = False
+                tmdb_items.pop(key, None)
+        warning = ""
+        if include_tmdb:
+            try:
+                token = get_setting("tmdb_api_key")
+                if token:
+                    tmdb = TMDBClient(token)
+                    parsed = None
+                    if query:
+                        try: parsed = parse_line(query)
+                        except ValueError: parsed = None
+                    for kind in wanted_types:
+                        results = []
+                        if query.lower().startswith("tt") or query.lower().startswith("tvdb:"):
+                            try:
+                                external_value = query.split(":", 1)[1] if ":" in query else query
+                                external_data = tmdb.find_by_external_id(external_value)
+                                results = (external_data.get("movie_results") or []) if kind == "movie" else (external_data.get("tv_results") or [])
+                            except Exception:
+                                results = []
+                        elif parsed and parsed.get("kind") in {"id", "url"}:
+                            if parsed.get("media_type") in {"", kind}:
+                                try: results = [tmdb.details(kind, int(parsed["id"]))]
+                                except Exception: results = []
+                        elif query:
+                            results = tmdb.search_movie(query, year) if kind == "movie" else tmdb.search_tv(query, year)
+                        else:
+                            data = tmdb.discover(kind, year=year, sort_by="popularity.desc")
+                            results = data.get("results") or []
+                        for payload in results[:limit]:
+                            item = _summary(kind, payload)
+                            if not item.get("genres") and payload.get("id"):
+                                try:
+                                    item = _summary(kind, {**payload, **tmdb.details(kind, int(payload["id"]))})
+                                except Exception:
+                                    pass
+                            if year is not None and item.get("year") != year:
+                                continue
+                            key = (kind, int(item["tmdb_id"]))
+                            previous = tmdb_items.get(key)
+                            tmdb_items[key] = {"source": "tmdb", "media_type": kind, "tmdb_id": int(item["tmdb_id"]), "imdb_id": item.get("imdb_id") or "", "tvdb_id": item.get("tvdb_id") or "", "title": item["title"], "original_title": item["original_title"], "year": item["year"], "poster_url": f"https://image.tmdb.org/t/p/w342{item['poster_path']}" if item.get("poster_path") else "", "genres": item.get("genres") or [], "library_ids": [], "library_titles": [], "source_labels": list(dict.fromkeys((previous or {}).get("source_labels", []) + ["TMDB"])), "system_managed": False, "plex_present": False, "resolution": "", "can_add": True, "duplicate_reason": ""}
+                for key, item in tmdb_items.items():
+                    local_item = local.get(key) or local_tmdb_index.get(key)
+                    if local_item:
+                        local[key] = local_item
+                        # Real Plex metadata remains authoritative. For a
+                        # system-maintained row, keep the TMDB result's title,
+                        # year, poster and genres while attaching local
+                        # library/resource state.
+                        if not local_item.get("_real"):
+                            local_item.update({field: item[field] for field in ("title", "original_title", "year", "poster_url", "genres") if field in item})
+                        local_item["source_labels"] = list(dict.fromkeys((local_item.get("source_labels") or []) + ["TMDB" if item.get("source") == "tmdb" else "本系统"]))
+                        local_item["source"] = "merged"; local_item["can_add"] = False; local_item["duplicate_reason"] = "已存在于媒体库"
+                        local_item["source_labels"] = list(dict.fromkeys(local_item.get("source_labels") or []))
+                for key, item in tmdb_items.items():
+                    if key not in local:
+                        item["can_add"] = item.get("source") == "tmdb"
+            except Exception as exc:
+                warning = str(exc)
+        merged = list(local.values()) + [item for key, item in tmdb_items.items() if key not in local]
+        return jsonify({"query": {"q": query, "media_type": media_type, "year": year}, "local_count": len(local), "tmdb_count": len(tmdb_items), "results": merged[:limit * len(wanted_types)], "warning": warning})
+
+    @servers_bp.post("/api/servers/<int:server_id>/media-library/search/add")
+    @login_required
+    def add_media_search_result(server_id: int):
+        data = request.get_json(force=True) or {}
+        try:
+            media_type, tmdb_id, library_id = str(data.get("media_type") or ""), int(data.get("tmdb_id") or 0), int(data.get("library_id") or 0)
+        except (TypeError, ValueError):
+            return api_error("添加参数无效", "invalid_media_search_add", 400)
+        if media_type not in {"movie", "tv"} or tmdb_id <= 0 or library_id <= 0:
+            return api_error("添加参数无效", "invalid_media_search_add", 400)
+        with connect() as db:
+            if db.execute("SELECT 1 FROM servers WHERE id=? AND enabled=1", (server_id,)).fetchone() is None:
+                return api_error("服务器不存在或已停用", "server_not_found", 404)
+            lib = db.execute("SELECT plex_type FROM media_libraries WHERE server_id=? AND library_id=?", (server_id, library_id)).fetchone()
+            if lib is None or int(lib["plex_type"]) != (1 if media_type == "movie" else 2):
+                return api_error("目标媒体库类型不匹配", "invalid_target_library", 400)
+        # Keep the server id in the payload as well as on the job row. The
+        # worker uses the payload when it writes the system-maintained item;
+        # omitting it made every search-add task fail before doing any work.
+        job_id = manager.create_job("media_library_search_add", server_id, {"server_id": server_id, "media_type": media_type, "tmdb_id": tmdb_id, "library_id": library_id})
+        return jsonify({"job_id": job_id})
 
     @servers_bp.post("/api/servers/<int:server_id>/media-library/<int:library_id>/refresh")
     @login_required
@@ -1063,21 +1312,26 @@ def create_app() -> Flask:
                 server = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
             if server is None:
                 return api_error("服务器不存在或已停用", "server_not_found", 404)
+            resolved_rating_key = resolve_plex_rating_key(DB_FILE, server_id, library_id, rating_key)
             plex = PlexServer(server_config_from_row(server), tags=load_tags(), auto_login=True)
-            metadata = plex.get_metadata(rating_key)
+            metadata = plex.get_metadata(resolved_rating_key)
             if str(metadata.get("type") or "") != "show":
                 return api_error("只支持重新检查剧集", "invalid_media_recheck_type", 400)
             sync_media_library_full(db_file=DB_FILE, server_id=server_id, library_id=library_id,
-                                    rating_keys={rating_key})
+                                    rating_keys={resolved_rating_key})
             with connect() as db:
                 library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
-                return jsonify(_cached_show_payload(db, server_id, library_id, db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, rating_key)).fetchone(), library))
+                row = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, resolved_rating_key)).fetchone()
+                if row is None:
+                    return api_error("重新检查后未找到真实剧集缓存", "media_item_not_found", 404)
+                return jsonify(_cached_show_payload(db, server_id, library_id, row, library))
         except Exception as exc:
             return api_error(str(exc), "media_recheck_failed", 400)
 
     @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/quarter-index")
     @login_required
     def media_library_quarter_index(server_id: int, library_id: int):
+        dedupe_system_media_items(DB_FILE)
         with connect() as db:
             library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
             if library is None or int(library["plex_type"]) != 2:
@@ -1136,6 +1390,86 @@ def create_app() -> Flask:
             item = dict(row)
             item.pop("raw_json", None)
             item.update({"library_id": library_id, "summary": raw.get("summary") or "", "external_ids": raw.get("external_ids") or extract_external_ids(raw), "collections": []})
+            item["tmdb_id"] = int(row["tmdb_id"]) if row["tmdb_id"] else (int(item["external_ids"]["tmdb"]) if item["external_ids"].get("tmdb") else None)
+            item["imdb_id"] = row["imdb_id"] or item["external_ids"].get("imdb") or ""
+            item["tvdb_id"] = row["tvdb_id"] or item["external_ids"].get("tvdb") or ""
+            item["poster_url"] = raw.get("poster_url") or ""
+        return jsonify(item)
+
+    @servers_bp.get("/api/servers/<int:server_id>/media-library/item-by-tmdb")
+    @login_required
+    def media_library_item_by_tmdb(server_id: int):
+        """Return one cached media item without reloading the whole library.
+
+        Search-add jobs write only to the local cache.  The browser uses this
+        endpoint after the job succeeds to patch the current result and the
+        affected library in place.  Prefer a real Plex row when both a real
+        and a system-maintained row exist, matching the normal merge rules.
+        """
+        try:
+            library_id = int(request.args.get("library_id") or 0)
+            tmdb_id = int(request.args.get("tmdb_id") or 0)
+        except (TypeError, ValueError):
+            return api_error("媒体参数无效", "invalid_media_item_by_tmdb", 400)
+        media_type = str(request.args.get("media_type") or "").strip().lower()
+        if not library_id or not tmdb_id or media_type not in {"movie", "tv"}:
+            return api_error("缺少有效的媒体库、媒体类型或 TMDB ID", "invalid_media_item_by_tmdb", 400)
+        with connect() as db:
+            library = db.execute("SELECT * FROM media_libraries WHERE server_id=? AND library_id=?", (server_id, library_id)).fetchone()
+            if library is None:
+                return api_error("媒体库不存在", "library_not_found", 404)
+            expected_type = 1 if media_type == "movie" else 2
+            if int(library["plex_type"] or 0) != expected_type:
+                return api_error("媒体库类型与作品类型不匹配", "invalid_target_library", 400)
+            row = db.execute(
+                """SELECT * FROM media_library_items
+                   WHERE server_id=? AND library_id=? AND parent_rating_key=''
+                     AND tmdb_media_type=? AND tmdb_id=?
+                   ORDER BY system_managed ASC, id ASC LIMIT 1""",
+                (server_id, library_id, media_type, tmdb_id),
+            ).fetchone()
+            if row is None:
+                return api_error("媒体条目尚未写入缓存", "media_item_not_found", 404)
+            if media_type == "tv":
+                item = _cached_show_payload(db, server_id, library_id, row, library)
+                quarter_entries = []
+                for season in item.get("seasons") or []:
+                    dates = [episode.get("air_date") for episode in season.get("episodes") or [] if episode.get("air_date")]
+                    first_date = min(dates) if dates else season.get("release_date") or ""
+                    added = [episode.get("added_at") for episode in season.get("episodes") or [] if episode.get("added_at")]
+                    quarter_entries.append({
+                        "label": season.get("bucket") or "未定档",
+                        "season": int(season.get("season") or 0),
+                        "first_episode_date": first_date,
+                        "latest_added_at": max(added) if added else "",
+                        "episode_count": len(season.get("episodes") or []),
+                        "missing_count": sum(1 for episode in season.get("episodes") or [] if episode.get("missing")),
+                        "is_special": int(season.get("season") or 0) == 0,
+                        "is_undated": not bool(first_date),
+                    })
+                item["quarter_entries"] = quarter_entries
+            else:
+                raw = decode_payload(row["raw_json"])
+                item = dict(row)
+                item.pop("raw_json", None)
+                item.update({
+                    "library_id": library_id,
+                    "summary": raw.get("summary") or "",
+                    "external_ids": raw.get("external_ids") or extract_external_ids(raw),
+                    "collections": [],
+                })
+                item["tmdb_id"] = int(row["tmdb_id"]) if row["tmdb_id"] else tmdb_id
+                item["imdb_id"] = row["imdb_id"] or item["external_ids"].get("imdb") or ""
+                item["tvdb_id"] = row["tvdb_id"] or item["external_ids"].get("tvdb") or ""
+                item["poster_url"] = raw.get("poster_url") or ""
+            item["media_type"] = media_type
+            item["system_managed"] = bool(row["system_managed"])
+            item["plex_present"] = not bool(row["system_managed"])
+            item["library_title"] = str(library["title"] or "")
+            item["library_item_count"] = int(db.execute(
+                "SELECT COUNT(*) AS count FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key='' AND plex_type IN ('movie','show','collection')",
+                (server_id, library_id),
+            ).fetchone()["count"])
         return jsonify(item)
 
     @jobs_bp.post("/api/jobs")
