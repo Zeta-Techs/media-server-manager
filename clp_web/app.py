@@ -313,6 +313,46 @@ def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any
     return item
 
 
+def _cached_show_summary(show_row: Any, library_id: int, library: Any, season_count: int = 0, episode_count: int = 0) -> dict[str, Any]:
+    """Build a show card without loading its season and episode payloads."""
+    show = dict(show_row)
+    raw = decode_payload(show.get("raw_json"))
+    external_ids = raw.get("external_ids") or extract_external_ids(raw)
+    external_ids = {
+        **external_ids,
+        "tmdb": str(show.get("tmdb_id") or external_ids.get("tmdb") or ""),
+        "imdb": str(show.get("imdb_id") or external_ids.get("imdb") or ""),
+        "tvdb": str(show.get("tvdb_id") or external_ids.get("tvdb") or ""),
+    }
+    return {
+        "rating_key": str(show.get("rating_key") or ""),
+        "title": str(show.get("title") or ""),
+        "original_title": str(show.get("original_title") or ""),
+        "year": show.get("year"),
+        "added_at": show.get("added_at"),
+        "release_date": show.get("release_date") or "",
+        "rating": show.get("rating"),
+        "audience_rating": show.get("audience_rating"),
+        "duration": show.get("duration") or 0,
+        "content_rating": str(show.get("content_rating") or ""),
+        "genre": str(show.get("genre") or ""),
+        "thumb": show.get("thumb") or "",
+        "art": show.get("art") or "",
+        "type": "show",
+        "library_id": int(library_id),
+        "show_kind": _cached_show_kind(show, library),
+        "seasons": [],
+        "season_count": int(season_count),
+        "episode_count": int(episode_count),
+        "external_ids": external_ids,
+        "tmdb_id": int(show["tmdb_id"]) if show.get("tmdb_id") else None,
+        "imdb_id": show.get("imdb_id") or external_ids.get("imdb") or "",
+        "tvdb_id": show.get("tvdb_id") or external_ids.get("tvdb") or "",
+        "summary": raw.get("summary") or "",
+        "poster_url": raw.get("poster_url") or "",
+    }
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     auth_bp = Blueprint("auth", __name__)
@@ -1012,9 +1052,10 @@ def create_app() -> Flask:
             output = []
             for library in libraries:
                 count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library["library_id"])).fetchone()["count"]
+                episode_count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode'", (server_id, library["library_id"])).fetchone()["count"]
                 output.append({"id": int(library["library_id"]), "title": library["title"], "plex_type": int(library["plex_type"]),
                                "kind": "movie" if int(library["plex_type"]) == 1 else "show" if int(library["plex_type"]) == 2 else "collection",
-                               "items": [], "item_count": int(count), "animation_mode": library["animation_mode"], "sort_key": library["sort_key"], "sort_direction": library["sort_direction"], "auto_recheck_new_episodes": bool(library["auto_recheck_new_episodes"]),
+                               "items": [], "item_count": int(count), "episode_count": int(episode_count), "animation_mode": library["animation_mode"], "sort_key": library["sort_key"], "sort_direction": library["sort_direction"], "auto_recheck_new_episodes": bool(library["auto_recheck_new_episodes"]),
                                "display_order": int(library["display_order"] or 0), "auto_animation": bool(library["auto_animation"]), "is_animation": _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]),
                                "plex_synced_at": library["plex_synced_at"], "tmdb_synced_at": library["tmdb_synced_at"],
                                "sync_status": library["job_status"] or library["sync_status"], "sync_job_id": library["sync_job_id"],
@@ -1026,11 +1067,33 @@ def create_app() -> Flask:
     @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/items")
     @login_required
     def media_library_items(server_id: int, library_id: int):
+        try:
+            offset = max(0, int(request.args.get("offset", 0)))
+            limit = min(200, max(1, int(request.args.get("limit", 40))))
+        except (TypeError, ValueError):
+            return api_error("分页参数无效", "invalid_media_library_pagination", 400)
+        sort = str(request.args.get("sort") or "name")
+        direction = str(request.args.get("direction") or "asc").lower()
+        allowed_sort = {"name", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "season_count", "episode_count", "content_rating", "genre"}
+        if sort not in allowed_sort:
+            return api_error("媒体库排序字段无效", "invalid_media_library_sort", 400)
+        if direction not in {"asc", "desc"}:
+            return api_error("媒体库排序方向无效", "invalid_media_library_sort_direction", 400)
         with connect() as db:
             library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
             if library is None:
                 return api_error("媒体库缓存不存在，请先同步", "library_cache_missing", 404)
-            rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection') ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
+            rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library_id)).fetchall()
+            counts = db.execute("""
+                SELECT parent_rating_key,
+                       COUNT(DISTINCT CASE WHEN plex_type = 'season' THEN season_number END) AS season_count,
+                       COUNT(CASE WHEN plex_type = 'episode' THEN 1 END) AS episode_count,
+                       SUM(CASE WHEN plex_type = 'episode' AND json_extract(raw_json, '$.expected') = 1 THEN 1 ELSE 0 END) AS missing_count
+                FROM media_library_items
+                WHERE server_id = ? AND library_id = ? AND parent_rating_key <> ''
+                GROUP BY parent_rating_key
+            """, (server_id, library_id)).fetchall()
+            counts_by_parent = {str(row["parent_rating_key"]): dict(row) for row in counts}
             items = []
             seen_tmdb: set[tuple[str, int]] = set()
             real_signatures = {("movie" if row["plex_type"] == "movie" else "tv", int(row["year"] or 0), _title_key(row["title"])) for row in rows if not row["system_managed"] and row["plex_type"] in {"movie", "show"} and _title_key(row["title"])}
@@ -1052,10 +1115,15 @@ def create_app() -> Flask:
                 item["library_id"] = library_id
                 item["show_kind"] = item.get("animation_kind") or ("动画" if library["plex_type"] == 2 and _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人")
                 item["system_genres"] = decode_json(item.get("system_genres"), [])
-                item["season_count"] = db.execute("SELECT COUNT(DISTINCT season_number) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season'", (server_id, library_id, row["rating_key"])).fetchone()["count"]
-                item["episode_count"] = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode'", (server_id, library_id, row["rating_key"])).fetchone()["count"]
+                aggregate = counts_by_parent.get(str(row["rating_key"]), {})
+                item["season_count"] = int(aggregate.get("season_count") or 0)
+                item["episode_count"] = int(aggregate.get("episode_count") or 0)
+                item["missing_count"] = int(aggregate.get("missing_count") or 0)
                 items.append(item)
-        return jsonify({"server_id": server_id, "library_id": library_id, "items": items})
+            items = _sort_items(items, sort, direction)
+            total = len(items)
+            page = items[offset:offset + limit]
+        return jsonify({"server_id": server_id, "library_id": library_id, "items": page, "total": total, "offset": offset, "limit": limit, "has_more": offset + len(page) < total})
 
     @servers_bp.get("/api/servers/<int:server_id>/media-library/search")
     @login_required
@@ -1337,21 +1405,36 @@ def create_app() -> Flask:
             if library is None or int(library["plex_type"]) != 2:
                 return api_error("电视剧库缓存不存在", "library_not_found", 404)
             shows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'show' ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
+            season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'season' ORDER BY parent_rating_key, season_number, id", (server_id, library_id)).fetchall()
+            episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode' ORDER BY parent_rating_key, season_number, episode_number", (server_id, library_id)).fetchall()
+            seasons_by_show: dict[str, list[Any]] = {}
+            episodes_by_season: dict[tuple[str, int], list[Any]] = {}
+            for row in season_rows:
+                seasons_by_show.setdefault(str(row["parent_rating_key"]), []).append(row)
+            for row in episode_rows:
+                key = (str(row["parent_rating_key"]), int(row["season_number"] or 0))
+                episodes_by_season.setdefault(key, []).append(row)
             entries, live_items = [], []
             is_animation_library = _library_is_animation(library["animation_mode"], library["title"], library["plex_type"])
             for show in shows:
-                full = _cached_show_payload(db, server_id, library_id, show, library)
+                show_seasons = seasons_by_show.get(str(show["rating_key"]), [])
+                season_count = len({int(row["season_number"] or 0) for row in show_seasons})
+                episode_count = sum(len(episodes_by_season.get((str(show["rating_key"]), int(row["season_number"] or 0)), [])) for row in show_seasons)
+                summary = _cached_show_summary(show, library_id, library, season_count, episode_count)
                 if is_animation_library:
-                    for season in full["seasons"]:
-                        dates = [episode["air_date"] for episode in season["episodes"] if episode.get("air_date")]
-                        first_date = min(dates) if dates else season.get("release_date") or ""
-                        added = [episode["added_at"] for episode in season["episodes"] if episode.get("added_at")]
-                        entries.append({**full, "season": season["season"], "bucket": season["bucket"], "release_date": season.get("release_date") or "",
+                    for season_row in show_seasons:
+                        season_number = int(season_row["season_number"] or 0)
+                        episodes = episodes_by_season.get((str(show["rating_key"]), season_number), [])
+                        dates = [str(episode["release_date"] or "")[:10] for episode in episodes if episode["release_date"]]
+                        first_date = min(dates) if dates else str(season_row["release_date"] or "")[:10]
+                        added = [episode["added_at"] for episode in episodes if episode["added_at"]]
+                        missing_count = sum(1 for episode in episodes if decode_payload(episode["raw_json"]).get("expected") is True or str(episode["rating_key"] or "").startswith("tmdb:"))
+                        entries.append({**summary, "season": season_number, "bucket": "特别篇" if season_number == 0 else _season_bucket(first_date), "release_date": first_date,
                                         "first_episode_date": first_date, "latest_added_at": max(added) if added else "",
-                                        "episode_count": len(season["episodes"]), "missing_count": sum(1 for episode in season["episodes"] if episode.get("missing")),
-                                        "is_special": season["season"] == 0, "is_undated": not bool(first_date)})
+                                        "episode_count": len(episodes), "missing_count": missing_count,
+                                        "is_special": season_number == 0, "is_undated": not bool(first_date)})
                 else:
-                    live_items.append(full)
+                    live_items.append(summary)
             groups = {}
             for entry in entries:
                 groups.setdefault(entry["bucket"], []).append(entry)

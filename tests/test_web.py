@@ -251,6 +251,58 @@ def test_overview_media_and_thumbnail_proxy_are_authenticated_and_scoped(tmp_pat
     ).get_json()["code"] == "invalid_media_path"
 
 
+def test_media_library_items_are_paginated_and_quarter_index_is_summary_only(tmp_path, monkeypatch):
+    app, client, db_file = make_client(tmp_path, monkeypatch)
+    headers = setup_admin(client)
+    server_id = create_server(client, headers)
+    now = "2026-01-01T00:00:00Z"
+    with db_module.connect(db_file) as db:
+        db.execute(
+            "INSERT INTO media_libraries(server_id, library_id, title, plex_type, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (server_id, 7, "动画", 2, now),
+        )
+        for index in range(3):
+            rating_key = f"show-{index}"
+            db.execute(
+                "INSERT INTO media_library_items(server_id, library_id, rating_key, plex_type, title, raw_json, scanned_at) VALUES (?, ?, ?, 'show', ?, '{}', ?)",
+                (server_id, 7, rating_key, f"Show {index}", now),
+            )
+            db.execute(
+                "INSERT INTO media_library_items(server_id, library_id, rating_key, plex_type, parent_rating_key, season_number, title, raw_json, scanned_at) VALUES (?, ?, ?, 'season', ?, 1, 'Season 1', '{}', ?)",
+                (server_id, 7, f"season-{index}", rating_key, now),
+            )
+            db.execute(
+                "INSERT INTO media_library_items(server_id, library_id, rating_key, plex_type, parent_rating_key, season_number, episode_number, title, raw_json, scanned_at) VALUES (?, ?, ?, 'episode', ?, 1, 1, 'Episode 1', ?, ?)",
+                (server_id, 7, f"episode-{index}", rating_key, '{"expected": true}', now),
+            )
+        db.commit()
+
+    page = client.get(
+        f"/api/servers/{server_id}/media-library/7/items?offset=1&limit=1&sort=name&direction=desc",
+        headers=headers,
+    )
+    assert page.status_code == 200
+    payload = page.get_json()
+    assert payload["total"] == 3
+    assert payload["offset"] == 1
+    assert payload["limit"] == 1
+    assert payload["has_more"] is True
+    assert len(payload["items"]) == 1
+    assert payload["items"][0]["season_count"] == 1
+    assert payload["items"][0]["episode_count"] == 1
+    assert payload["items"][0]["missing_count"] == 1
+
+    quarter = client.get(
+        f"/api/servers/{server_id}/media-library/7/quarter-index", headers=headers
+    )
+    assert quarter.status_code == 200
+    quarter_payload = quarter.get_json()
+    assert quarter_payload["groups"]
+    assert "seasons" not in quarter_payload["groups"][0]["items"][0] or quarter_payload["groups"][0]["items"][0]["seasons"] == []
+    assert quarter_payload["groups"][0]["items"][0]["episode_count"] == 1
+    app.extensions["task_manager"].shutdown()
+
+
 def test_error_codes_and_public_change_statuses(tmp_path, monkeypatch):
     _, client, db_file = make_client(tmp_path, monkeypatch)
     headers = setup_admin(client)
