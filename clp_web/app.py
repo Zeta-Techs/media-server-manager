@@ -267,17 +267,7 @@ def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any
         if existing is None:
             seasons_by_number[season_number] = season
             continue
-        existing_raw = decode_payload(existing.get("raw_json"))
-        season_raw = decode_payload(season.get("raw_json"))
-        existing_expected = existing_raw.get("expected") is True or str(existing.get("rating_key") or "").startswith("tmdb")
-        season_expected = season_raw.get("expected") is True or str(season.get("rating_key") or "").startswith("tmdb")
-        existing_specials = str(existing.get("title") or "").strip().casefold() == "specials"
-        season_specials = str(season.get("title") or "").strip().casefold() == "specials"
-        if (
-            (existing_expected and not season_expected)
-            or (existing_specials and not season_specials and season_number > 0)
-        ):
-            seasons_by_number[season_number] = season
+        seasons_by_number[season_number] = _prefer_cached_child(existing, season)
 
     for season_number in sorted(seasons_by_number):
         season = seasons_by_number[season_number]
@@ -285,7 +275,7 @@ def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any
         episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? ORDER BY episode_number", (server_id, library_id, show["rating_key"], season["season_number"])).fetchall()
         for episode_row in episode_rows:
             episode = dict(episode_row)
-            expected = decode_payload(episode.get("raw_json")).get("expected") is True or str(episode.get("rating_key") or "").startswith("tmdb:")
+            expected = _cached_child_is_expected(episode)
             payload = {"rating_key": episode["rating_key"], "season": int(episode["season_number"] or 0), "episode": int(episode["episode_number"] or 0),
                        "title": episode["title"], "air_date": episode["release_date"], "duration": episode["duration"] or 0,
                        "thumb": episode["thumb"], "added_at": episode["added_at"], "expected": expected, "missing": expected}
@@ -351,6 +341,26 @@ def _cached_show_summary(show_row: Any, library_id: int, library: Any, season_co
         "summary": raw.get("summary") or "",
         "poster_url": raw.get("poster_url") or "",
     }
+
+
+def _cached_child_is_expected(row: Any) -> bool:
+    """Return whether a cached season or episode is a synthetic expectation."""
+    return str(row["rating_key"] or "").startswith("tmdb") or decode_payload(row["raw_json"]).get("expected") is True
+
+
+def _prefer_cached_child(existing: Any, candidate: Any) -> Any:
+    """Prefer a real Plex child over a synthetic TMDB placeholder."""
+    if existing is None:
+        return candidate
+    existing_expected = _cached_child_is_expected(existing)
+    candidate_expected = _cached_child_is_expected(candidate)
+    existing_specials = str(existing["title"] or "").strip().casefold() == "specials"
+    candidate_specials = str(candidate["title"] or "").strip().casefold() == "specials"
+    if candidate_expected != existing_expected:
+        return existing if candidate_expected else candidate
+    if existing_specials and not candidate_specials and int(candidate["season_number"] or 0) > 0:
+        return candidate
+    return existing
 
 
 def create_app() -> Flask:
@@ -1401,28 +1411,33 @@ def create_app() -> Flask:
             shows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'show' ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
             season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'season' ORDER BY parent_rating_key, season_number, id", (server_id, library_id)).fetchall()
             episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode' ORDER BY parent_rating_key, season_number, episode_number", (server_id, library_id)).fetchall()
-            seasons_by_show: dict[str, list[Any]] = {}
-            episodes_by_season: dict[tuple[str, int], list[Any]] = {}
+            seasons_by_show: dict[str, dict[int, Any]] = {}
+            episodes_by_season: dict[tuple[str, int], dict[int, Any]] = {}
             for row in season_rows:
-                seasons_by_show.setdefault(str(row["parent_rating_key"]), []).append(row)
+                parent_key = str(row["parent_rating_key"])
+                season_number = int(row["season_number"] or 0)
+                seasons = seasons_by_show.setdefault(parent_key, {})
+                seasons[season_number] = _prefer_cached_child(seasons.get(season_number), row)
             for row in episode_rows:
                 key = (str(row["parent_rating_key"]), int(row["season_number"] or 0))
-                episodes_by_season.setdefault(key, []).append(row)
+                episodes = episodes_by_season.setdefault(key, {})
+                episode_number = int(row["episode_number"] or 0)
+                episodes[episode_number] = _prefer_cached_child(episodes.get(episode_number), row)
             entries, live_items = [], []
             is_animation_library = _library_is_animation(library["animation_mode"], library["title"], library["plex_type"])
             for show in shows:
-                show_seasons = seasons_by_show.get(str(show["rating_key"]), [])
+                show_seasons = list(seasons_by_show.get(str(show["rating_key"]), {}).values())
                 season_count = len({int(row["season_number"] or 0) for row in show_seasons})
                 episode_count = sum(len(episodes_by_season.get((str(show["rating_key"]), int(row["season_number"] or 0)), [])) for row in show_seasons)
                 summary = _cached_show_summary(show, library_id, library, season_count, episode_count)
                 if is_animation_library:
                     for season_row in show_seasons:
                         season_number = int(season_row["season_number"] or 0)
-                        episodes = episodes_by_season.get((str(show["rating_key"]), season_number), [])
+                        episodes = list(episodes_by_season.get((str(show["rating_key"]), season_number), {}).values())
                         dates = [str(episode["release_date"] or "")[:10] for episode in episodes if episode["release_date"]]
                         first_date = min(dates) if dates else str(season_row["release_date"] or "")[:10]
                         added = [episode["added_at"] for episode in episodes if episode["added_at"]]
-                        missing_count = sum(1 for episode in episodes if decode_payload(episode["raw_json"]).get("expected") is True or str(episode["rating_key"] or "").startswith("tmdb:"))
+                        missing_count = sum(1 for episode in episodes if _cached_child_is_expected(episode))
                         entries.append({**summary, "season": season_number, "bucket": "特别篇" if season_number == 0 else _season_bucket(first_date), "release_date": first_date,
                                         "first_episode_date": first_date, "latest_added_at": max(added) if added else "",
                                         "episode_count": len(episodes), "missing_count": missing_count,

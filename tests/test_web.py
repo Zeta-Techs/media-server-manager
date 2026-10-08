@@ -303,6 +303,66 @@ def test_media_library_items_are_paginated_and_quarter_index_is_summary_only(tmp
     app.extensions["task_manager"].shutdown()
 
 
+def test_quarter_index_merges_expected_and_real_seasons_and_episodes(tmp_path, monkeypatch):
+    app, client, db_file = make_client(tmp_path, monkeypatch)
+    headers = setup_admin(client)
+    server_id = create_server(client, headers)
+    now = "2026-01-01T00:00:00Z"
+    with db_module.connect(db_file) as db:
+        db.execute(
+            "INSERT INTO media_libraries(server_id, library_id, title, plex_type, animation_mode, updated_at) VALUES (?, 7, 'Animation', 2, 'animation', ?)",
+            (server_id, now),
+        )
+        for show_key in ("show-a", "show-b"):
+            db.execute(
+                "INSERT INTO media_library_items(server_id, library_id, rating_key, plex_type, title, scanned_at) VALUES (?, 7, ?, 'show', 'Same title', ?)",
+                (server_id, show_key, now),
+            )
+        # Both insertion orders must prefer the real season, whose fallback
+        # date differs from the placeholder's. Preserve separate shows with
+        # identical titles and a second season in the same quarter.
+        children = [
+            ("tmdb-season:1:1", "season", "show-a", 1, None, "2023-01-01", '{}'),
+            ("real-a-1", "season", "show-a", 1, None, "2024-10-01", '{}'),
+            ("real-a-2", "season", "show-a", 2, None, "2024-10-02", '{}'),
+            ("tmdb-season:1:2", "season", "show-a", 2, None, "2023-01-02", '{}'),
+            ("tmdb-season:2:1", "season", "show-b", 1, None, "2025-01-01", '{"expected": true}'),
+            ("tmdb:1:1:1", "episode", "show-a", 1, 1, "2023-01-01", '{"expected": true}'),
+            ("real-e-1", "episode", "show-a", 1, 1, "2024-10-01", '{}'),
+            ("real-e-2", "episode", "show-a", 1, 2, "2024-10-02", '{}'),
+            ("tmdb:1:1:2", "episode", "show-a", 1, 2, "2023-01-02", '{"expected": true}'),
+            ("tmdb:1:1:3", "episode", "show-a", 1, 3, "2024-10-03", '{"expected": true}'),
+            ("tmdb:2:1:1", "episode", "show-b", 1, 1, "2025-01-01", '{"expected": true}'),
+        ]
+        db.executemany(
+            "INSERT INTO media_library_items(server_id, library_id, rating_key, plex_type, parent_rating_key, season_number, episode_number, title, release_date, raw_json, scanned_at) VALUES (?, 7, ?, ?, ?, ?, ?, 'Season', ?, ?, ?)",
+            [(server_id, *child[:5], child[5], child[6], now) for child in children],
+        )
+        db.commit()
+    try:
+        response = client.get(f"/api/servers/{server_id}/media-library/7/quarter-index", headers=headers)
+        assert response.status_code == 200
+        groups = response.get_json()["groups"]
+        entries = [item for group in groups for item in group["items"]]
+        assert len(entries) == 3
+        assert {(item["rating_key"], item["season"]) for item in entries} == {
+            ("show-a", 1), ("show-a", 2), ("show-b", 1),
+        }
+        assert {group["label"] for group in groups} == {"2024 Q4 / 10月番", "2025 Q1 / 1月番"}
+        season_one = next(item for item in entries if item["rating_key"] == "show-a" and item["season"] == 1)
+        assert season_one["episode_count"] == 3
+        assert season_one["missing_count"] == 1
+        details = client.get(
+            f"/api/servers/{server_id}/media-library/item?library_id=7&rating_key=show-a&media_type=show", headers=headers,
+        ).get_json()
+        assert details["season_count"] == 2
+        assert details["episode_count"] == 3
+        assert details["seasons"][0]["release_date"] == season_one["release_date"]
+        assert details["seasons"][1]["release_date"] == "2024-10-02"
+    finally:
+        app.extensions["task_manager"].shutdown()
+
+
 def test_error_codes_and_public_change_statuses(tmp_path, monkeypatch):
     _, client, db_file = make_client(tmp_path, monkeypatch)
     headers = setup_admin(client)
