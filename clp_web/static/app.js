@@ -2450,6 +2450,15 @@ window.addEventListener("beforeunload", (event) => {
   event.returnValue = "";
 });
 
+$("#page-scroll-top")?.addEventListener("click", () => {
+  (document.scrollingElement || document.documentElement).scrollTo({ top: 0, behavior: "smooth" });
+});
+
+$("#page-scroll-bottom")?.addEventListener("click", () => {
+  const scrollingElement = document.scrollingElement || document.documentElement;
+  scrollingElement.scrollTo({ top: scrollingElement.scrollHeight, behavior: "smooth" });
+});
+
 bindOverview();
 bootstrap();
 updateScheduleMode();

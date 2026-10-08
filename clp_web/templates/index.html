@@ -486,9 +486,14 @@
       </main>
     </div>
 
+    <div class="page-scroll-controls" aria-label="页面滚动控制">
+      <button id="page-scroll-top" type="button" title="回到页面顶部" aria-label="回到页面顶部">↑</button>
+      <button id="page-scroll-bottom" type="button" title="跳到页面底部" aria-label="跳到页面底部">↓</button>
+    </div>
+
     <script>
       window.CLP_INITIALIZED = {{ 'true' if initialized else 'false' }};
     </script>
-    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v35') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v36') }}"></script>
   </body>
 </html>
