@@ -154,14 +154,21 @@
           <div id="media-library-auto-recheck-help" class="meta" hidden></div>
           <div id="media-library-sync-status" class="notice media-library-sync-status"></div>
           <div id="media-library-search" class="media-library-search panel">
-            <div class="form-grid">
-              <label>搜索<input id="media-library-search-query" placeholder="名称、TMDB ID 或 TMDB URL"></label>
-              <label>类型<select id="media-library-search-type"><option value="all">全部</option><option value="movie">电影</option><option value="tv">剧集</option></select></label>
-              <label>发布年份<input id="media-library-search-year" type="number" min="1800" max="2200" placeholder="例如 2024"></label>
-              <div class="search-actions"><button id="media-library-search-submit" class="primary" type="button">搜索</button><button id="media-library-search-clear" type="button">清空</button></div>
+            <div class="media-library-search-toolbar">
+              <div>
+                <strong>批量搜索</strong>
+                <span class="meta">支持从 Word、Excel 或目录粘贴多行剧名</span>
+              </div>
+              <div class="search-actions">
+                <button id="media-library-search-add-one" type="button">+1 行</button>
+                <button id="media-library-search-add-five" type="button">+5 行</button>
+                <button id="media-library-search-add-ten" type="button">+10 行</button>
+                <button id="media-library-search-submit" class="primary" type="button">搜索全部</button>
+                <button id="media-library-search-clear" type="button">清空全部</button>
+              </div>
             </div>
             <div id="media-library-search-message" class="message"></div>
-            <div id="media-library-search-results" class="media-library-search-results"></div>
+            <div id="media-library-search-rows" class="media-library-search-rows"></div>
           </div>
           <div id="media-library-sync-progress" class="sync-progress" hidden>
             <div class="sync-progress-head"><strong id="media-library-sync-progress-title">正在拉取</strong><span id="media-library-sync-progress-text">0 / 0</span></div>
@@ -482,6 +489,6 @@
     <script>
       window.CLP_INITIALIZED = {{ 'true' if initialized else 'false' }};
     </script>
-    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v31') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v35') }}"></script>
   </body>
 </html>

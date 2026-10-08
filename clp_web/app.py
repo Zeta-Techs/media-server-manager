@@ -43,7 +43,7 @@ from .security import (
 from .services import TERMINAL_JOB_STATUSES, JobQueue
 from .catalog import resolve_plex_rating_key, sync_media_library_full
 from .rechecks import request_recheck
-from .bulk_media import MAX_BULK_ROWS, decode_json, row_dict, add_system_media_item, parse_line, _summary, dedupe_system_media_items, _title_key
+from .bulk_media import MAX_BULK_ROWS, decode_json, row_dict, add_system_media_item, parse_line, _summary, _title_key
 from .tmdb import TMDBClient, TMDBError
 
 
@@ -1018,10 +1018,6 @@ def create_app() -> Flask:
     @servers_bp.get("/api/servers/<int:server_id>/media-library")
     @login_required
     def media_library(server_id: int):
-        # Clean up legacy synthetic rows before returning library counts/items.
-        # This is idempotent and also repairs duplicates created by old batch
-        # imports after the corresponding Plex item has appeared.
-        dedupe_system_media_items(DB_FILE)
         with connect() as db:
             server = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
             if server is None:
@@ -1128,7 +1124,6 @@ def create_app() -> Flask:
     @servers_bp.get("/api/servers/<int:server_id>/media-library/search")
     @login_required
     def search_media_library(server_id: int):
-        dedupe_system_media_items(DB_FILE)
         query = str(request.args.get("q") or "").strip()
         media_type = str(request.args.get("media_type") or "all").strip().lower()
         year_text = str(request.args.get("year") or "").strip()
@@ -1399,7 +1394,6 @@ def create_app() -> Flask:
     @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/quarter-index")
     @login_required
     def media_library_quarter_index(server_id: int, library_id: int):
-        dedupe_system_media_items(DB_FILE)
         with connect() as db:
             library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
             if library is None or int(library["plex_type"]) != 2:
