@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 from media_server_manager.core import CONFIG_DIR, TEMPLATE_TAGS_FILE, ServerConfig, split_skip_libraries
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DB_FILE = CONFIG_DIR / "media_server_manager.db"
 DEFAULT_USERNAME = "admin"
 
@@ -73,7 +73,10 @@ def _existing_schema_version(db_file: Path) -> int | None:
     if not db_file.exists() or db_file.stat().st_size == 0:
         return None
     uri = f"{db_file.resolve().as_uri()}?mode=ro&immutable=1"
-    with sqlite3.connect(uri, uri=True) as db:
+    db = sqlite3.connect(uri, uri=True)
+    incompatible = False
+    result: int | None = None
+    try:
         db.row_factory = sqlite3.Row
         tables = {
             row["name"]
@@ -82,17 +85,24 @@ def _existing_schema_version(db_file: Path) -> int | None:
         if not tables:
             return None
         if "schema_meta" not in tables:
-            raise IncompatibleSchemaError(
-                "检测到旧版数据库。请先运行 `python -m media_server_manager_admin reset-db --backup`。"
-            )
-        row = db.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
-        return int(row["version"]) if row else 0
+            incompatible = True
+        else:
+            row = db.execute("SELECT version FROM schema_meta WHERE id = 1").fetchone()
+            result = int(row["version"]) if row else 0
+    finally:
+        db.close()
+        del db
+    if incompatible:
+        raise IncompatibleSchemaError(
+            "检测到旧版数据库。请先运行 `python -m media_server_manager_admin reset-db --backup`。"
+        )
+    return result
 
 
 def init_db(db_file: Path | None = None) -> None:
     db_file = Path(db_file or DB_FILE)
     version = _existing_schema_version(db_file)
-    if version not in (None, 2, 3, SCHEMA_VERSION):
+    if version not in (None, 2, 3, 4, SCHEMA_VERSION):
         raise IncompatibleSchemaError(
             f"数据库版本 {version} 与应用版本 {SCHEMA_VERSION} 不兼容。"
             "请运行 `python -m media_server_manager_admin reset-db --backup`。"
@@ -350,6 +360,8 @@ def init_db(db_file: Path | None = None) -> None:
                 library_id INTEGER NOT NULL,
                 plex_rating_key TEXT NOT NULL,
                 tmdb_id INTEGER NOT NULL,
+                imdb_id TEXT NOT NULL DEFAULT '',
+                tvdb_id TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(server_id, library_id, plex_rating_key),
@@ -449,6 +461,8 @@ def init_db(db_file: Path | None = None) -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tmdb_id INTEGER NOT NULL,
                 media_type TEXT NOT NULL CHECK (media_type IN ('movie','tv','season','episode')),
+                imdb_id TEXT NOT NULL DEFAULT '',
+                tvdb_id TEXT NOT NULL DEFAULT '',
                 parent_tmdb_id INTEGER,
                 season_number INTEGER,
                 episode_number INTEGER,
@@ -546,6 +560,119 @@ def init_db(db_file: Path | None = None) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_plex_inventory_ids ON plex_inventory_items(server_id, tmdb_id, plex_type);
 
+            CREATE TABLE IF NOT EXISTS media_libraries (
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                plex_type INTEGER NOT NULL DEFAULT 0,
+                animation_mode TEXT NOT NULL DEFAULT 'auto' CHECK (animation_mode IN ('auto','animation','normal')),
+                auto_animation INTEGER NOT NULL DEFAULT 0 CHECK (auto_animation IN (0,1)),
+                plex_synced_at TEXT,
+                tmdb_synced_at TEXT,
+                sync_job_id INTEGER,
+                sync_status TEXT NOT NULL DEFAULT 'idle',
+                sync_error TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(server_id, library_id),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_libraries_server ON media_libraries(server_id, plex_type);
+
+            CREATE TABLE IF NOT EXISTS media_library_recheck_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                rating_key TEXT NOT NULL,
+                first_event_at TEXT NOT NULL,
+                last_event_at TEXT NOT NULL,
+                next_run_at TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','running','succeeded','retrying','failed')),
+                job_id INTEGER,
+                last_error TEXT NOT NULL DEFAULT '',
+                dispatched_event_at TEXT NOT NULL DEFAULT '',
+                missing_count INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(server_id, library_id, rating_key),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_library_recheck_due
+                ON media_library_recheck_requests(status, next_run_at);
+
+            CREATE TABLE IF NOT EXISTS media_library_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                library_id INTEGER NOT NULL,
+                rating_key TEXT NOT NULL,
+                plex_type TEXT NOT NULL DEFAULT '',
+                parent_rating_key TEXT NOT NULL DEFAULT '',
+                season_number INTEGER,
+                episode_number INTEGER,
+                title TEXT NOT NULL DEFAULT '',
+                original_title TEXT NOT NULL DEFAULT '',
+                year INTEGER,
+                added_at TEXT,
+                release_date TEXT NOT NULL DEFAULT '',
+                rating REAL,
+                audience_rating REAL,
+                duration INTEGER,
+                content_rating TEXT NOT NULL DEFAULT '',
+                genre TEXT NOT NULL DEFAULT '',
+                thumb TEXT NOT NULL DEFAULT '',
+                art TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                scanned_at TEXT NOT NULL,
+                UNIQUE(server_id, library_id, rating_key),
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_library_items_lookup
+                ON media_library_items(server_id, library_id, plex_type, parent_rating_key);
+
+            CREATE TABLE IF NOT EXISTS media_library_bulk_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                resolve_job_id INTEGER,
+                confirm_job_id INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE,
+                FOREIGN KEY(resolve_job_id) REFERENCES jobs(id) ON DELETE SET NULL,
+                FOREIGN KEY(confirm_job_id) REFERENCES jobs(id) ON DELETE SET NULL
+            );
+            CREATE TABLE IF NOT EXISTS media_library_bulk_rows (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER NOT NULL,
+                line_number INTEGER NOT NULL,
+                input_text TEXT NOT NULL,
+                input_kind TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                media_type TEXT NOT NULL DEFAULT '',
+                tmdb_id INTEGER,
+                title TEXT NOT NULL DEFAULT '',
+                original_title TEXT NOT NULL DEFAULT '',
+                year INTEGER,
+                poster_path TEXT NOT NULL DEFAULT '',
+                genres TEXT NOT NULL DEFAULT '[]',
+                animation_kind TEXT NOT NULL DEFAULT '真人',
+                candidates TEXT NOT NULL DEFAULT '[]',
+                selected INTEGER NOT NULL DEFAULT 0,
+                custom_genres TEXT NOT NULL DEFAULT '[]',
+                custom_animation_kind TEXT NOT NULL DEFAULT '',
+                target_library_id INTEGER,
+                message TEXT NOT NULL DEFAULT '',
+                raw_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(batch_id, line_number),
+                FOREIGN KEY(batch_id) REFERENCES media_library_bulk_batches(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_media_library_bulk_rows_batch ON media_library_bulk_rows(batch_id, line_number);
+
             CREATE TABLE IF NOT EXISTS media_match_results (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 media_type TEXT NOT NULL,
@@ -564,94 +691,57 @@ def init_db(db_file: Path | None = None) -> None:
                 FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_media_match_status ON media_match_results(server_id, status, media_type);
-
-            CREATE TABLE IF NOT EXISTS anime_seasons (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                year INTEGER NOT NULL,
-                quarter TEXT NOT NULL CHECK (quarter IN ('Q1','Q2','Q3','Q4')),
-                start_date TEXT NOT NULL,
-                end_date TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'historical',
-                sync_policy TEXT NOT NULL DEFAULT 'weekly',
-                last_synced_at TEXT,
-                next_sync_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE(year, quarter)
-            );
-
-            CREATE TABLE IF NOT EXISTS anime_season_items (
-                season_id INTEGER NOT NULL,
-                tmdb_id INTEGER NOT NULL,
-                discover_rank INTEGER NOT NULL DEFAULT 0,
-                popularity REAL NOT NULL DEFAULT 0,
-                vote_average REAL NOT NULL DEFAULT 0,
-                first_discovered_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(season_id, tmdb_id),
-                FOREIGN KEY(season_id) REFERENCES anime_seasons(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS anime_manual_overrides (
-                tmdb_id INTEGER PRIMARY KEY,
-                year INTEGER NOT NULL,
-                quarter TEXT NOT NULL,
-                reason TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS anime_show_schedule (
-                tmdb_id INTEGER PRIMARY KEY,
-                last_aired_episode_date TEXT,
-                last_aired_season INTEGER,
-                last_aired_episode INTEGER,
-                next_air_date TEXT,
-                next_air_season INTEGER,
-                next_air_episode INTEGER,
-                schedule_source TEXT NOT NULL DEFAULT 'tmdb',
-                last_schedule_checked_at TEXT,
-                next_sync_at TEXT,
-                active_until TEXT,
-                sync_mode TEXT NOT NULL DEFAULT 'history_weekly',
-                schedule_status TEXT NOT NULL DEFAULT 'unknown',
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_anime_schedule_due ON anime_show_schedule(next_sync_at);
-
-            CREATE TABLE IF NOT EXISTS anime_sync_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tmdb_id INTEGER NOT NULL,
-                event_type TEXT NOT NULL,
-                scheduled_at TEXT NOT NULL,
-                executed_at TEXT,
-                status TEXT NOT NULL DEFAULT 'scheduled',
-                error TEXT NOT NULL DEFAULT '',
-                job_id INTEGER,
-                FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE SET NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_anime_sync_events_due ON anime_sync_events(status, scheduled_at);
-
-            CREATE TABLE IF NOT EXISTS anime_match_results (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tmdb_id INTEGER NOT NULL,
-                media_type TEXT NOT NULL CHECK (media_type IN ('tv','season','episode')),
-                season_number INTEGER,
-                episode_number INTEGER,
-                server_id INTEGER NOT NULL,
-                library_id INTEGER,
-                status TEXT NOT NULL,
-                match_source TEXT NOT NULL DEFAULT '',
-                confidence REAL NOT NULL DEFAULT 0,
-                plex_rating_key TEXT NOT NULL DEFAULT '',
-                details TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL,
-                UNIQUE(tmdb_id, media_type, season_number, episode_number, server_id, library_id),
-                FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
-            );
-            CREATE INDEX IF NOT EXISTS idx_anime_match_lookup ON anime_match_results(server_id, status, tmdb_id);
             """
         )
+        # Added after the initial media-library cache schema.  Keep this as a
+        # lightweight migration so existing installations retain their data.
+        media_library_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_libraries)").fetchall()}
+        if "display_order" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0")
+            current_server = None
+            index = 0
+            for row in db.execute("SELECT server_id, library_id FROM media_libraries ORDER BY server_id, title COLLATE NOCASE").fetchall():
+                if row["server_id"] != current_server:
+                    current_server = row["server_id"]
+                    index = 0
+                db.execute("UPDATE media_libraries SET display_order = ? WHERE server_id = ? AND library_id = ?", (index, row["server_id"], row["library_id"]))
+                index += 1
+        if "auto_recheck_new_episodes" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN auto_recheck_new_episodes INTEGER NOT NULL DEFAULT 0")
+        recheck_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_library_recheck_requests)").fetchall()}
+        if "dispatched_event_at" not in recheck_columns:
+            db.execute("ALTER TABLE media_library_recheck_requests ADD COLUMN dispatched_event_at TEXT NOT NULL DEFAULT ''")
+        if "missing_count" not in recheck_columns:
+            db.execute("ALTER TABLE media_library_recheck_requests ADD COLUMN missing_count INTEGER")
+        if "sort_key" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''")
+        if "sort_direction" not in media_library_columns:
+            db.execute("ALTER TABLE media_libraries ADD COLUMN sort_direction TEXT NOT NULL DEFAULT 'asc'")
+        item_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_library_items)").fetchall()}
+        for name, definition in {
+            "tmdb_media_type": "TEXT NOT NULL DEFAULT ''",
+            "tmdb_id": "INTEGER",
+            "imdb_id": "TEXT NOT NULL DEFAULT ''",
+            "tvdb_id": "TEXT NOT NULL DEFAULT ''",
+            "source": "TEXT NOT NULL DEFAULT 'plex'",
+            "system_managed": "INTEGER NOT NULL DEFAULT 0",
+            "resolution": "TEXT NOT NULL DEFAULT ''",
+            "animation_kind": "TEXT NOT NULL DEFAULT ''",
+            "system_genres": "TEXT NOT NULL DEFAULT '[]'",
+        }.items():
+            if name not in item_columns:
+                db.execute(f"ALTER TABLE media_library_items ADD COLUMN {name} {definition}")
+        tmdb_item_columns = {row["name"] for row in db.execute("PRAGMA table_info(tmdb_items)").fetchall()}
+        for name, definition in {"imdb_id": "TEXT NOT NULL DEFAULT ''", "tvdb_id": "TEXT NOT NULL DEFAULT ''"}.items():
+            if name not in tmdb_item_columns:
+                db.execute(f"ALTER TABLE tmdb_items ADD COLUMN {name} {definition}")
+        # Backfill external ids already present in cached Plex payloads.
+        for row in db.execute("SELECT server_id, library_id, rating_key, raw_json, imdb_id, tvdb_id FROM media_library_items WHERE imdb_id='' OR tvdb_id='' OR tmdb_id IS NULL").fetchall():
+            payload = decode_payload(row["raw_json"])
+            ids = payload.get("external_ids") or {}
+            if not ids:
+                continue
+            db.execute("UPDATE media_library_items SET tmdb_id=COALESCE(tmdb_id, ?), tmdb_media_type=CASE WHEN COALESCE(tmdb_media_type,'')='' AND ? IS NOT NULL THEN CASE WHEN plex_type='movie' THEN 'movie' WHEN plex_type='show' THEN 'tv' ELSE '' END ELSE tmdb_media_type END, imdb_id=CASE WHEN imdb_id='' THEN ? ELSE imdb_id END, tvdb_id=CASE WHEN tvdb_id='' THEN ? ELSE tvdb_id END WHERE server_id=? AND library_id=? AND rating_key=?", (int(ids["tmdb"]) if ids.get("tmdb") else None, int(ids["tmdb"]) if ids.get("tmdb") else None, str(ids.get("imdb") or ""), str(ids.get("tvdb") or ""), row["server_id"], row["library_id"], row["rating_key"]))
         db.execute(
             "INSERT INTO schema_meta (id, version, created_at) VALUES (1, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET version = excluded.version",
@@ -682,14 +772,16 @@ def reset_database(db_file: Path | None = None, backup: bool = True) -> Path | N
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         backup_path = db_file.with_name(f"{db_file.name}.backup-{stamp}")
         if backup:
-            shutil.move(str(db_file), str(backup_path))
+            shutil.copy2(str(db_file), str(backup_path))
+            db_file.unlink()
         else:
             db_file.unlink()
     for suffix in ("-wal", "-shm"):
         sidecar = Path(f"{db_file}{suffix}")
         if sidecar.exists():
             if backup and backup_path is not None:
-                shutil.move(str(sidecar), f"{backup_path}{suffix}")
+                shutil.copy2(str(sidecar), f"{backup_path}{suffix}")
+                sidecar.unlink()
             else:
                 sidecar.unlink()
     init_db(db_file)
@@ -747,5 +839,3 @@ def save_tags(tags: Dict[str, str], db_file: Path | None = None) -> None:
             "INSERT INTO tag_mappings (source, target) VALUES (?, ?)",
             sorted((source, target) for source, target in tags.items()),
         )
-
-

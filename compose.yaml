@@ -1,19 +1,21 @@
+name: media-server-manager
+
 x-msm-common: &msm-common
-  image: ${CLP_IMAGE:-media-server-manager:latest}
+  image: ${MSM_IMAGE:-media-server-manager:latest}
   environment:
     TZ: Asia/Shanghai
-    CLP_TIMEZONE: Asia/Shanghai
-    CLP_WORKER_CONCURRENCY: "2"
-    CLP_ITEM_WORKERS: "4"
+    MSM_TIMEZONE: Asia/Shanghai
+    MSM_WORKER_CONCURRENCY: "2"
+    MSM_ITEM_WORKERS: "4"
   volumes:
-    - ${CLP_CONFIG_PATH:-/自定义目录/media-server-manager/config}:/app/config
+    - ${MSM_CONFIG_PATH:-/自定义目录/media-server-manager/config}:/app/config
   restart: unless-stopped
 
 services:
   media-server-manager-web:
     <<: *msm-common
     container_name: media-server-manager-web
-    command: python -m clp_web
+    command: python -m media_server_manager_web
     ports:
       - "8088:8088"
     healthcheck:
@@ -26,10 +28,10 @@ services:
   media-server-manager-worker:
     <<: *msm-common
     container_name: media-server-manager-worker
-    command: python -m clp_worker
+    command: python -m media_server_manager_worker
     stop_grace_period: 45s
     healthcheck:
-      test: ["CMD", "python", "-m", "clp_worker", "--healthcheck"]
+      test: ["CMD", "python", "-m", "media_server_manager_worker", "--healthcheck"]
       interval: 15s
       timeout: 5s
       retries: 3

@@ -61,7 +61,7 @@ function renderMediaShelf() {
         <article class="media-card">
           <div class="media-poster">
             <div class="media-fallback" ${item.image_url ? "hidden" : ""} aria-hidden="true">${initial}</div>
-            ${item.image_url ? `<img loading="lazy" src="${escapeHtml(item.image_url)}" alt="${title} 海报" data-media-fallback>` : ""}
+            ${item.image_url ? `<img loading="lazy" decoding="async" src="${escapeHtml(item.image_url)}" alt="${title} 海报" data-media-fallback>` : ""}
           </div>
           <div class="media-meta"><strong title="${title}">${title}</strong><span>${escapeHtml(details || item.server_name || "Plex 媒体")}</span></div>
         </article>`;

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 
-from clp_web.db import connect, init_db, new_secret, utcnow
-from clp_web.catalog import resolve_plex_rating_key
-from clp_web.rechecks import enqueue_due_rechecks, request_recheck
+from media_server_manager_web.db import connect, init_db, new_secret, utcnow
+from media_server_manager_web.catalog import resolve_plex_rating_key
+from media_server_manager_web.rechecks import enqueue_due_rechecks, request_recheck
 
 
 def _database(tmp_path):
-    path = tmp_path / "clp.db"
+    path = tmp_path / "media_server_manager.db"
     init_db(path)
     now = utcnow()
     with connect(path) as db:
@@ -82,5 +82,5 @@ def test_synthetic_tmdb_show_key_resolves_to_plex_item(tmp_path, monkeypatch):
         def list_library_items(self, _library_id, _plex_type):
             return [{"ratingKey": "real-1", "type": "show", "title": "雷霆三人行", "year": 2026, "Guid": [{"id": "tmdb://326119"}]}]
 
-    monkeypatch.setattr("clp_web.catalog.PlexServer", FakePlex)
+    monkeypatch.setattr("media_server_manager_web.catalog.PlexServer", FakePlex)
     assert resolve_plex_rating_key(path, server_id, 2, "tmdb:tv:326119") == "real-1"

@@ -5,9 +5,9 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
-from clp_web.db import connect, init_db, new_secret, utcnow
-from clp_web.services import JobQueue
-from clp_worker.worker import Worker, worker_is_healthy
+from media_server_manager_web.db import connect, init_db, new_secret, utcnow
+from media_server_manager_web.services import JobQueue
+from media_server_manager_worker.worker import Worker, worker_is_healthy
 
 
 def add_server(db_file, name):
@@ -25,7 +25,7 @@ def add_server(db_file, name):
 
 
 def test_worker_claims_different_servers_without_starvation(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     first = add_server(db_file, "A")
     second = add_server(db_file, "B")
@@ -47,7 +47,7 @@ def test_worker_claims_different_servers_without_starvation(tmp_path):
 
 
 def test_worker_restart_interrupts_running_but_keeps_queued(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file, "A")
     queue = JobQueue(db_file)
@@ -64,7 +64,7 @@ def test_worker_restart_interrupts_running_but_keeps_queued(tmp_path):
 
 
 def test_due_schedule_is_enqueued_once_and_advanced(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file, "A")
     past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -90,7 +90,7 @@ def test_due_schedule_is_enqueued_once_and_advanced(tmp_path):
 
 
 def test_worker_executes_persisted_job(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file, "A")
     queue = JobQueue(db_file)
@@ -107,7 +107,7 @@ def test_worker_executes_persisted_job(tmp_path):
 
 
 def test_worker_heartbeat_health_cleanup_and_error_path(tmp_path, monkeypatch):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file, "A")
     queue = JobQueue(db_file)
@@ -136,7 +136,7 @@ def test_worker_heartbeat_health_cleanup_and_error_path(tmp_path, monkeypatch):
 
 
 def test_worker_marks_unhandled_runner_error_failed(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file, "A")
     queue = JobQueue(db_file)
@@ -152,7 +152,7 @@ def test_worker_marks_unhandled_runner_error_failed(tmp_path):
 
 
 def test_worker_run_stops_cleanly_and_signal_setup_skips_child_thread(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     worker = Worker(db_file, concurrency=1)
     worker.stop_event.set()

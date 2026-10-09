@@ -312,6 +312,29 @@ class PlexServer:
                 libraries.append([int(item["key"]), TYPE[plex_type], item["title"]])
         return libraries
 
+    def list_library_items(self, library_id: int, plex_type: int) -> List[Dict[str, Any]]:
+        """Return all top-level items in a Plex library.
+
+        The management UI needs a dense inventory view, so this intentionally
+        uses Plex's full library endpoint instead of the paged presentation
+        endpoints used by the overview.
+        """
+        data = self._request(
+            "GET",
+            f"{self.host}/library/sections/{int(library_id)}/all",
+            params={"type": int(plex_type), "X-Plex-Container-Start": 0, "X-Plex-Container-Size": 100000},
+        ).json()
+        return data.get("MediaContainer", {}).get("Metadata", []) or []
+
+    def list_library_collections(self, library_id: int) -> List[Dict[str, Any]]:
+        """Return collections exposed by a Plex library."""
+        data = self._request(
+            "GET",
+            f"{self.host}/library/sections/{int(library_id)}/collections",
+            params={"X-Plex-Container-Start": 0, "X-Plex-Container-Size": 100000},
+        ).json()
+        return data.get("MediaContainer", {}).get("Metadata", []) or []
+
     def list_media_keys(self, select: List[Any], print_counts: bool = True) -> List[str]:
         response = self._request(
             "GET", f"{self.host}/library/sections/{select[0]}/all?type={select[1]}"
@@ -864,4 +887,3 @@ class PlexServer:
 
     def activities(self) -> Dict[str, Any]:
         return self._request("GET", f"{self.host}/activities").json()
-

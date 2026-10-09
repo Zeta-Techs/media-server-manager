@@ -124,5 +124,3 @@ def choose_best_connection(connections: List[Dict[str, Any]]) -> Dict[str, Any] 
         ),
     )
     return sorted_connections[0]
-
-

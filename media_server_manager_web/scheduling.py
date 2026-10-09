@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 
@@ -42,7 +42,11 @@ def next_run_at(
     timezone_name: str = DEFAULT_TIMEZONE,
 ) -> str:
     validate_schedule(schedule_type, value)
-    tz = ZoneInfo(timezone_name)
+    try:
+        tz = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        # Minimal virtual environments may not bundle IANA tzdata.
+        tz = timezone(timedelta(hours=8)) if timezone_name == "Asia/Shanghai" else timezone.utc
     current = (base or datetime.now(timezone.utc)).astimezone(tz)
     if schedule_type == "interval":
         result = current + timedelta(minutes=int(value))
@@ -94,4 +98,3 @@ def describe_schedule(schedule_type: str, value: str) -> str:
     if day != "*" and month == "*" and weekday == "*":
         return f"每月 {day} 日 {time_text}"
     return f"Cron: {value}"
-

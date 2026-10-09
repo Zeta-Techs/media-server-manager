@@ -5,10 +5,10 @@ from datetime import date, timedelta
 
 import pytest
 
-from clp_web import tasks as tasks_module
-from clp_web.db import connect, init_db, new_secret, utcnow
-from clp_web.services import JobQueue
-from clp_web.tasks import TaskManager
+from media_server_manager_web import tasks as tasks_module
+from media_server_manager_web.db import connect, init_db, new_secret, utcnow
+from media_server_manager_web.services import JobQueue
+from media_server_manager_web.tasks import TaskManager
 
 
 def seed_server(db_file):
@@ -69,7 +69,7 @@ class FakePlex:
 
 
 def test_apply_preview_uses_exact_snapshot(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = seed_server(db_file)
     preview_job, _ = seed_preview(db_file, server_id)
@@ -85,7 +85,7 @@ def test_apply_preview_uses_exact_snapshot(tmp_path):
 
 
 def test_apply_preview_marks_conflict_without_write(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = seed_server(db_file)
     preview_job, _ = seed_preview(db_file, server_id)
@@ -100,7 +100,7 @@ def test_apply_preview_marks_conflict_without_write(tmp_path):
 
 
 def test_rollback_requires_current_new_value_and_restores_lock(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = seed_server(db_file)
     now = utcnow()
@@ -136,7 +136,7 @@ def test_rollback_requires_current_new_value_and_restores_lock(tmp_path):
 
 
 def test_manual_tmdb_override_has_priority(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = seed_server(db_file)
     now = utcnow()
@@ -163,7 +163,7 @@ def test_manual_tmdb_override_has_priority(tmp_path):
 
 
 def test_tmdb_unique_ambiguous_and_future_episode_handling(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = seed_server(db_file)
     runner = TaskManager(db_file)
@@ -213,7 +213,7 @@ def test_tmdb_unique_ambiguous_and_future_episode_handling(tmp_path):
 
 
 def test_localize_change_buffer_flushes_batches_and_final_rows(tmp_path, monkeypatch):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = seed_server(db_file)
     queue = JobQueue(db_file)

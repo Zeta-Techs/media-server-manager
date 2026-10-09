@@ -15,6 +15,7 @@ from typing import Any
 from media_server_manager_web.db import DB_FILE, connect, decode_payload, utcnow
 from media_server_manager_web.scheduling import next_run_at
 from media_server_manager_web.tasks import TaskManager
+from media_server_manager_web.rechecks import enqueue_due_rechecks
 
 
 def worker_is_healthy(db_file: Path | None = None, stale_seconds: int = 15) -> bool:
@@ -37,15 +38,13 @@ class Worker:
         self.worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.runner = TaskManager(self.db_file)
         self.executor = ThreadPoolExecutor(
-            max_workers=self.concurrency, thread_name_prefix="media-server-manager-job"
+            max_workers=self.concurrency, thread_name_prefix="msm-job"
         )
         self.stop_event = threading.Event()
         self.futures: dict[Future[None], tuple[int, int]] = {}
         self.started_at = utcnow()
         self._last_heartbeat = 0.0
         self._last_schedule_check = 0.0
-        self._last_anime_check = 0.0
-        self._last_anime_discovery = 0.0
         self._last_cleanup = 0.0
 
     def run(self) -> None:
@@ -66,12 +65,7 @@ class Worker:
         if now - self._last_schedule_check >= 1:
             self._last_schedule_check = now
             self._enqueue_due_schedules()
-        if now - self._last_anime_check >= 60:
-            self._last_anime_check = now
-            self._enqueue_due_anime()
-        if now - self._last_anime_discovery >= 7 * 86400:
-            self._last_anime_discovery = now
-            self._enqueue_anime_discovery()
+            enqueue_due_rechecks(self.db_file)
         if now - self._last_cleanup >= 3600:
             self._last_cleanup = now
             self._cleanup_history()
@@ -130,7 +124,8 @@ class Worker:
     def _claim_next_job(self, active_servers: set[int]) -> tuple[int, int] | None:
         with connect(self.db_file) as db:
             db.execute("BEGIN IMMEDIATE")
-            clauses = ["jobs.status = 'queued'", "servers.enabled = 1"]
+            clauses = ["jobs.status = 'queued'", "servers.enabled = 1",
+                       "NOT EXISTS (SELECT 1 FROM jobs active WHERE active.server_id=jobs.server_id AND active.status='running')"]
             params: list[Any] = []
             if active_servers:
                 placeholders = ",".join("?" for _ in active_servers)
@@ -188,13 +183,7 @@ class Worker:
         for future in list(self.futures):
             if not future.done():
                 continue
-            # Never let an unexpected future exception terminate the worker
-            # loop. TaskManager normally records failures itself, but this
-            # guard also covers executor/runtime errors outside that path.
-            try:
-                future.result()
-            except Exception:
-                pass
+            future.result()
             self.futures.pop(future, None)
 
     def _enqueue_due_schedules(self) -> None:
@@ -259,7 +248,7 @@ class Worker:
 
     def _cleanup_history(self) -> None:
         job_days = max(1, int(os.environ.get("MSM_JOB_RETENTION_DAYS", "90")))
-        webhook_days = max(1, int(os.environ.get("media_server_manager_webHOOK_RETENTION_DAYS", "30")))
+        webhook_days = max(1, int(os.environ.get("MSM_WEBHOOK_RETENTION_DAYS", "30")))
         job_cutoff = (
             datetime.now(timezone.utc) - timedelta(days=job_days)
         ).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -275,38 +264,6 @@ class Worker:
             db.execute("DELETE FROM webhook_rate_limits WHERE created_at < ?", (webhook_cutoff,))
             db.execute("DELETE FROM auth_attempts WHERE created_at < ?", (webhook_cutoff,))
             db.execute("DELETE FROM oauth_flows WHERE expires_at < ?", (utcnow(),))
-            db.commit()
-
-    def _enqueue_due_anime(self) -> None:
-        now = utcnow()
-        with connect(self.db_file) as db:
-            due = db.execute("SELECT tmdb_id, next_sync_at FROM anime_show_schedule WHERE next_sync_at IS NOT NULL AND next_sync_at <= ? ORDER BY next_sync_at LIMIT 100", (now,)).fetchall()
-            server = db.execute("SELECT id FROM servers WHERE enabled=1 ORDER BY id LIMIT 1").fetchone()
-            if server is None:
-                return
-            for row in due:
-                tmdb_id = int(row["tmdb_id"])
-                exists = db.execute("SELECT 1 FROM jobs WHERE type IN ('anime_scheduled_sync','anime_active_fallback_sync') AND status IN ('queued','running') AND payload LIKE ? LIMIT 1", (f'%\"tmdb_id\": {tmdb_id}%',)).fetchone()
-                if exists:
-                    continue
-                payload = json.dumps({"tmdb_id": tmdb_id}, ensure_ascii=False)
-                cur = db.execute("INSERT INTO jobs (type, server_id, status, payload, created_at) VALUES ('anime_scheduled_sync', ?, 'queued', ?, ?)", (int(server["id"]), payload, now))
-                job_id = int(cur.lastrowid or 0)
-                db.execute("INSERT INTO job_logs (job_id, message, created_at) VALUES (?, ?, ?)", (job_id, "由新番播出排期自动创建。", now))
-                db.execute("UPDATE anime_sync_events SET status='queued', job_id=? WHERE tmdb_id=? AND status='scheduled' AND scheduled_at <= ?", (job_id, tmdb_id, now))
-            db.commit()
-
-    def _enqueue_anime_discovery(self) -> None:
-        with connect(self.db_file) as db:
-            server = db.execute("SELECT id FROM servers WHERE enabled=1 ORDER BY id LIMIT 1").fetchone()
-            if server is None:
-                return
-            exists = db.execute("SELECT 1 FROM jobs WHERE type='anime_schedule_discovery' AND status IN ('queued','running') LIMIT 1").fetchone()
-            if exists:
-                return
-            now = utcnow()
-            cur = db.execute("INSERT INTO jobs (type, server_id, status, payload, created_at) VALUES ('anime_schedule_discovery', ?, 'queued', '{}', ?)", (int(server["id"]), now))
-            db.execute("INSERT INTO job_logs (job_id, message, created_at) VALUES (?, ?, ?)", (int(cur.lastrowid or 0), "由新番排期发现周期自动创建。", now))
             db.commit()
 
     def _graceful_shutdown(self) -> None:
@@ -338,5 +295,3 @@ class Worker:
             db.execute("DELETE FROM worker_heartbeats WHERE worker_id = ?", (self.worker_id,))
             db.commit()
         self.executor.shutdown(wait=False, cancel_futures=True)
-
-

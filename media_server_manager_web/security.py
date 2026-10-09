@@ -51,5 +51,3 @@ def new_csrf_token() -> str:
 
 def verify_csrf(expected: str, supplied: str) -> bool:
     return bool(expected and supplied and hmac.compare_digest(expected, supplied))
-
-

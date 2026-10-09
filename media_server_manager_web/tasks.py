@@ -13,7 +13,8 @@ from .db import DB_FILE, connect, get_setting, load_tags, server_config_from_row
 from .scheduling import validate_schedule
 from .services import JobQueue
 from .tmdb import TMDBClient
-from .catalog import sync_catalog, scan_plex_inventory, reconcile, reconcile_anime, sync_anime_quarter, discover_anime_schedules, due_anime_ids, update_show_schedule, enrich_item
+from .catalog import resolve_plex_rating_key, sync_catalog, scan_plex_inventory, reconcile, sync_media_library, sync_media_library_tmdb
+from .bulk_media import resolve_batch, confirm_batch, add_system_media_item
 
 
 class TaskManager:
@@ -114,18 +115,11 @@ class TaskManager:
             elif job_type == "continue_watching_apply":
                 self._run_continue_watching_apply_job(job_id, self._make_plex(job_id, server), payload)
             elif job_type == "notification_test":
-                self._send_notifications("notification_test", {"job_id": job_id, "message": "CLP 通知测试"})
+                self._send_notifications("notification_test", {"job_id": job_id, "message": "MSM 通知测试"})
             elif job_type == "notification_event":
                 self._send_notifications("webhook_event", payload)
             elif job_type == "tmdb_catalog_sync":
-                run_id = int(payload.get("run_id") or 0)
-                if run_id:
-                    with connect(self.db_file) as db:
-                        db.execute("UPDATE tmdb_sync_runs SET status='running', started_at=? WHERE id=?", (utcnow(), run_id)); db.commit()
                 result = sync_catalog(self.db_file, payload, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
-                if run_id:
-                    with connect(self.db_file) as db:
-                        db.execute("UPDATE tmdb_sync_runs SET status='succeeded', processed=?, errors=?, finished_at=? WHERE id=?", (result['processed'], result['errors'], utcnow(), run_id)); db.commit()
                 self._log(job_id, f"TMDB 目录同步完成：{result['processed']} 项，错误 {result['errors']} 项。")
             elif job_type == "plex_inventory_sync":
                 count = scan_plex_inventory(self.db_file, int(payload["server_id"]), payload.get("library_ids"), progress=lambda p: self._progress(job_id, p))
@@ -139,40 +133,85 @@ class TaskManager:
                 for server_id in payload.get("server_ids") or []:
                     scan_plex_inventory(self.db_file, int(server_id))
                     reconcile(self.db_file, int(server_id))
-            elif job_type == "anime_quarter_sync":
-                result = sync_anime_quarter(self.db_file, int(payload["year"]), str(payload["quarter"]), progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id), max_pages=int(payload.get("max_pages", 20)))
-                self._log(job_id, f"季度新番同步完成：{result['year']} {result['quarter']}，共 {result['processed']} 部。")
-            elif job_type == "anime_current_sync":
-                today = date.today(); quarter = f"Q{((today.month - 1) // 3) + 1}"
-                result = sync_anime_quarter(self.db_file, today.year, quarter, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id), max_pages=int(payload.get("max_pages", 20)))
-                self._log(job_id, f"当前季度同步完成：{result['year']} {result['quarter']}。")
-            elif job_type == "anime_schedule_discovery":
-                count = discover_anime_schedules(self.db_file, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
-                self._log(job_id, f"新番排期发现完成：{count} 部。")
-            elif job_type in {"anime_scheduled_sync", "anime_active_fallback_sync"}:
-                tmdb_id = int(payload["tmdb_id"])
-                details = enrich_item(self.db_file, "tv", tmdb_id)
-                update_show_schedule(self.db_file, tmdb_id, details)
+            elif job_type == "media_library_refresh":
+                library_id = int(payload["library_id"])
+                try:
+                    sync_media_library(self.db_file, int(payload["server_id"]), library_id,
+                                       progress=lambda p: self._progress(job_id, p),
+                                       cancelled=lambda: self._cancel_requested(job_id))
+                except Exception as exc:
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.commit()
+                    raise
+            elif job_type == "media_library_full_refresh":
+                library_id = int(payload["library_id"])
+                try:
+                    server_id = int(payload["server_id"])
+                    progress = lambda p: self._progress(job_id, p)
+                    cancelled = lambda: self._cancel_requested(job_id)
+                    # The Plex and TMDB passes are separate progress stages.
+                    # Reset the counters before TMDB so the UI never displays
+                    # a sum of two different stage totals.
+                    sync_media_library(self.db_file, server_id, library_id,
+                                       progress=progress, cancelled=cancelled)
+                    self._reset_progress(job_id, "tmdb_media_library")
+                    sync_media_library_tmdb(self.db_file, server_id, library_id,
+                                            progress=progress, cancelled=cancelled,
+                                            logger=lambda message: self._log(job_id, message))
+                except Exception as exc:
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.commit()
+                    raise
+            elif job_type == "media_library_show_recheck":
+                library_id = int(payload["library_id"])
+                server_id = int(payload["server_id"])
+                rating_key = resolve_plex_rating_key(self.db_file, server_id, library_id, str(payload["rating_key"]))
+                progress = lambda p: self._progress(job_id, p)
+                cancelled = lambda: self._cancel_requested(job_id)
+                sync_media_library(self.db_file, server_id, library_id, progress=progress,
+                                   cancelled=cancelled, rating_keys={rating_key})
+                self._reset_progress(job_id, "tmdb_media_library")
+                sync_media_library_tmdb(self.db_file, server_id, library_id,
+                                        progress=progress, cancelled=cancelled,
+                                        rating_keys={rating_key},
+                                        logger=lambda message: self._log(job_id, message), strict_errors=True)
                 with connect(self.db_file) as db:
-                    server_ids = [int(payload.get("server_id"))] if payload.get("server_id") else [int(row["id"]) for row in db.execute("SELECT id FROM servers WHERE enabled=1").fetchall()]
-                    db.execute("""UPDATE anime_sync_events SET executed_at=?, status='succeeded', job_id=?
-                                 WHERE tmdb_id=? AND status='scheduled' AND scheduled_at <= ?""", (utcnow(), job_id, tmdb_id, utcnow()))
+                    count = db.execute("SELECT COUNT(*) FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key=? AND plex_type='episode' AND rating_key LIKE 'tmdb:%'", (server_id,library_id,rating_key)).fetchone()[0]
+                    db.execute("UPDATE media_library_recheck_requests SET missing_count=? WHERE id=? AND job_id=?", (count,payload.get("auto_recheck_request_id"),job_id))
                     db.commit()
-                for server_id in server_ids:
-                    reconcile_anime(self.db_file, server_id)
-                self._log(job_id, f"已同步番剧排期与详情：TMDB {tmdb_id}。")
-            elif job_type == "anime_history_sync":
-                for year in range(int(payload.get("start_year", 2000)), int(payload.get("end_year", date.today().year)) + 1):
-                    for quarter in ("Q1", "Q2", "Q3", "Q4"):
-                        if self._cancel_requested(job_id): raise TaskCancelled("任务已取消")
-                        sync_anime_quarter(self.db_file, year, quarter, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
-            elif job_type == "plex_tv_inventory_sync":
-                count = scan_plex_inventory(self.db_file, int(payload["server_id"]), payload.get("library_ids"), progress=lambda p: self._progress(job_id, p))
-                reconcile_anime(self.db_file, int(payload["server_id"]))
-                self._log(job_id, f"电视剧库扫描完成：{count} 项。")
-            elif job_type == "anime_reconcile":
-                count = reconcile_anime(self.db_file, int(payload["server_id"]))
-                self._log(job_id, f"新番对比完成：{count} 项。")
+                self._log(job_id, f"剧集 {rating_key} 自动重检完成：缺失/待发布 {count} 集。")
+            elif job_type == "media_library_tmdb_refresh":
+                library_id = int(payload["library_id"])
+                try:
+                    sync_media_library_tmdb(self.db_file, int(payload["server_id"]), library_id,
+                                            progress=lambda p: self._progress(job_id, p),
+                                            cancelled=lambda: self._cancel_requested(job_id),
+                                            logger=lambda message: self._log(job_id, message))
+                except Exception as exc:
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.commit()
+                    raise
+            elif job_type == "media_library_bulk_resolve":
+                try:
+                    result = resolve_batch(self.db_file, int(payload["batch_id"]), progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
+                except Exception as exc:
+                    # Keep the batch auditable and terminal even when a worker-level
+                    # failure occurs outside the per-row TMDB error handling.
+                    with connect(self.db_file) as db:
+                        db.execute("UPDATE media_library_bulk_batches SET status='failed', error=?, updated_at=? WHERE id=?", (str(exc), utcnow(), int(payload["batch_id"])))
+                        db.commit()
+                    raise
+                self._log(job_id, f"批量媒体解析完成：{result['processed']} 行，错误 {result['errors']} 行。")
+            elif job_type == "media_library_bulk_confirm":
+                result = confirm_batch(self.db_file, int(payload["batch_id"]), payload, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
+                self._log(job_id, f"批量媒体确认完成：新增 {result['added']}，跳过 {result['skipped']}，错误 {result['errors']}。")
+            elif job_type == "media_library_search_add":
+                result = add_system_media_item(self.db_file, int(payload["server_id"]), int(payload["library_id"]), str(payload["media_type"]), int(payload["tmdb_id"]))
+                self._progress(job_id, {"total": 1, "processed_delta": 1, "stage": "media_library_search_add"}, force=True)
+                self._log(job_id, ("媒体已存在于系统媒体库。" if result.get("status") == "exists" else f"已添加系统媒体条目：{result.get('title') or payload['tmdb_id']}"))
             else:
                 raise ValueError(f"未知任务类型：{job_type}")
             if self._cancel_requested(job_id):
@@ -232,6 +271,14 @@ class TaskManager:
                 should_flush = True
         if should_flush:
             self._flush_progress(job_id)
+
+    def _reset_progress(self, job_id: int, stage: str, total: int = 0) -> None:
+        """Start a new progress stage with independent counters."""
+        self._flush_progress(job_id, force_publish=False)
+        with connect(self.db_file) as db:
+            db.execute("UPDATE jobs SET processed = 0, total = ?, stage = ? WHERE id = ?", (int(total), stage, job_id))
+            db.commit()
+        self._publish_job(job_id)
 
     def _flush_progress(self, job_id: int, force_publish: bool = True) -> None:
         with self.progress_lock:
@@ -1148,4 +1195,3 @@ def build_trigger(schedule_type: str, value: str) -> tuple[str, str]:
     """Compatibility validator for callers from the pre-worker architecture."""
     validate_schedule(schedule_type, value)
     return schedule_type, value.strip()
-

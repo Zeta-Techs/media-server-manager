@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from clp.core import (
+from media_server_manager.core import (
     TYPE,
     PlexServer,
     ServerConfig,

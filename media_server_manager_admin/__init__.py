@@ -1,2 +1,1 @@
-"""Administrative commands for CLP."""
-
+"""Administrative commands for Media Server Manager."""

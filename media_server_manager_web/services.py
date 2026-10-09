@@ -25,14 +25,13 @@ JOB_TYPES = {
     "plex_inventory_sync",
     "media_reconcile",
     "media_sync",
-    "anime_quarter_sync",
-    "anime_current_sync",
-    "anime_schedule_discovery",
-    "anime_scheduled_sync",
-    "anime_active_fallback_sync",
-    "anime_history_sync",
-    "plex_tv_inventory_sync",
-    "anime_reconcile",
+    "media_library_refresh",
+    "media_library_tmdb_refresh",
+    "media_library_full_refresh",
+    "media_library_show_recheck",
+    "media_library_bulk_resolve",
+    "media_library_bulk_confirm",
+    "media_library_search_add",
 }
 TERMINAL_JOB_STATUSES = {"succeeded", "failed", "cancelled", "interrupted"}
 
@@ -55,12 +54,7 @@ class JobQueue:
             raise ValueError("不支持的任务类型")
         payload = payload or {}
         with connect(self.db_file) as db:
-            if not server_id:
-                fallback = db.execute("SELECT id FROM servers WHERE enabled = 1 ORDER BY id LIMIT 1").fetchone()
-                if fallback is None:
-                    raise ValueError("需要至少一台启用的 Plex 服务器作为任务归属")
-                server_id = int(fallback["id"])
-            row = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+            row = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone() if server_id else True
             if row is None:
                 raise ValueError("服务器不存在或已禁用")
             cur = db.execute(
@@ -158,6 +152,9 @@ class JobQueue:
         source = self.get_job(source_job_id)
         if source["status"] not in {"failed", "cancelled", "interrupted"}:
             raise ValueError("只有失败、取消或中断的任务可以重试")
+        if source["type"] == "media_library_show_recheck":
+            from .rechecks import retry_recheck
+            return retry_recheck(self.db_file, source)
         return self.create_job(
             source["type"], int(source["server_id"]), source.get("payload") or {}, source_job_id
         )

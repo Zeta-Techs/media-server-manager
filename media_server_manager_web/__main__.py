@@ -9,4 +9,3 @@ if __name__ == "__main__":
     port = int(os.environ.get("MSM_WEB_PORT", "8088"))
     threads = max(2, int(os.environ.get("MSM_WEB_THREADS", "8")))
     serve(create_app(), host=host, port=port, threads=threads)
-

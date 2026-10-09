@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from clp.core import (
+from media_server_manager.core import (
     PLEX_PRODUCT,
     PlexServer,
     ServerConfig,

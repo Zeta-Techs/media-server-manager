@@ -19,7 +19,7 @@ from playwright.sync_api import sync_playwright
 
 pytestmark = [
     pytest.mark.e2e,
-    pytest.mark.skipif(os.environ.get("CLP_E2E") != "1", reason="set CLP_E2E=1 to run"),
+    pytest.mark.skipif(os.environ.get("MSM_E2E") != "1", reason="set MSM_E2E=1 to run"),
 ]
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -136,16 +136,16 @@ def test_webui_worker_sse_restart_and_mobile(tmp_path):
     env = os.environ.copy()
     env.update(
         {
-            "CLP_CONFIG_DIR": str(tmp_path),
-            "CLP_WEB_HOST": "127.0.0.1",
-            "CLP_WEB_PORT": str(web_port),
-            "CLP_WORKER_CONCURRENCY": "2",
-            "CLP_ITEM_WORKERS": "2",
+            "MSM_CONFIG_DIR": str(tmp_path),
+            "MSM_WEB_HOST": "127.0.0.1",
+            "MSM_WEB_PORT": str(web_port),
+            "MSM_WORKER_CONCURRENCY": "2",
+            "MSM_ITEM_WORKERS": "2",
         }
     )
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
 
-    with fake_plex() as plex_url, process([sys.executable, "-m", "clp_web"], env):
+    with fake_plex() as plex_url, process([sys.executable, "-m", "media_server_manager_web"], env):
         wait_for_url(f"{base_url}/healthz")
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch()
@@ -170,7 +170,7 @@ def test_webui_worker_sse_restart_and_mobile(tmp_path):
             assert token_input.input_value() == ""
             assert token_input.get_attribute("placeholder") == "已配置，留空保持不变"
 
-            with process([sys.executable, "-m", "clp_worker"], env) as worker:
+            with process([sys.executable, "-m", "media_server_manager_worker"], env) as worker:
                 deadline = time.monotonic() + 15
                 while time.monotonic() < deadline:
                     page.locator('.nav[data-view="overview"]').click()
@@ -209,7 +209,7 @@ def test_webui_worker_sse_restart_and_mobile(tmp_path):
                 )
                 db.commit()
 
-            with process([sys.executable, "-m", "clp_worker"], env):
+            with process([sys.executable, "-m", "media_server_manager_worker"], env):
                 wait_for_job(db_file, running_id, "interrupted")
                 wait_for_job(db_file, queued_id, "succeeded")
 

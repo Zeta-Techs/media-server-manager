@@ -29,16 +29,14 @@ dev = [
 include = ["media_server_manager*"]
 
 [tool.setuptools.package-data]
-clp = ["default_tags.json"]
 media_server_manager = ["default_tags.json"]
-clp_web = ["templates/*.html", "static/*.css", "static/*.js", "static/views/*.js"]
 media_server_manager_web = ["templates/*.html", "static/*.css", "static/*.js", "static/views/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
 markers = [
-  "e2e: browser and multi-process integration tests (set CLP_E2E=1)",
+  "e2e: browser and multi-process integration tests (set MSM_E2E=1)",
 ]
 
 [tool.ruff]

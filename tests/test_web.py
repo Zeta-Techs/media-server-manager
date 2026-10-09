@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import threading
 from types import SimpleNamespace
 
-from clp_web import app as app_module
-from clp_web import db as db_module
-from clp_web import services as services_module
+from media_server_manager_web import app as app_module
+from media_server_manager_web import db as db_module
+from media_server_manager_web import services as services_module
 
 
 def make_client(tmp_path, monkeypatch):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     monkeypatch.setattr(db_module, "DB_FILE", db_file)
     monkeypatch.setattr(app_module, "DB_FILE", db_file)
     monkeypatch.setattr(services_module, "DB_FILE", db_file)
@@ -83,7 +84,8 @@ def test_first_setup_csrf_session_secret_and_server_redaction(tmp_path, monkeypa
         assert db.execute("SELECT token FROM servers WHERE id = ?", (server_id,)).fetchone()["token"] == "plex-secret"
     secret_file = tmp_path / "session_secret"
     assert secret_file.exists()
-    assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+    if os.name != "nt":
+        assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
     app.extensions["task_manager"].shutdown()
 
 

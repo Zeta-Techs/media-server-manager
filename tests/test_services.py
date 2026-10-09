@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import sqlite3
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from clp_web.db import (
+from media_server_manager_web.db import (
     SCHEMA_VERSION,
     IncompatibleSchemaError,
     connect,
@@ -14,21 +15,21 @@ from clp_web.db import (
     reset_database,
     utcnow,
 )
-from clp_web.scheduling import (
+from media_server_manager_web.scheduling import (
     describe_schedule,
     format_utc,
     next_run_at,
     parse_utc,
     validate_schedule,
 )
-from clp_web.security import (
+from media_server_manager_web.security import (
     hash_password,
     load_session_secret,
     new_csrf_token,
     verify_csrf,
     verify_password,
 )
-from clp_web.services import JobQueue
+from media_server_manager_web.services import JobQueue
 
 
 def add_server(db_file):
@@ -60,16 +61,18 @@ def test_security_helpers_and_secret_sources(tmp_path, monkeypatch):
     secret_file.write_text("short", encoding="ascii")
     with pytest.raises(RuntimeError):
         load_session_secret(secret_file)
-    monkeypatch.setenv("CLP_SECRET_KEY", "configured-secret-value")
+    monkeypatch.setenv("MSM_SECRET_KEY", "configured-secret-value")
     assert load_session_secret(tmp_path / "unused") == "configured-secret-value"
 
 
 def test_old_database_requires_explicit_backup_reset(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     with sqlite3.connect(db_file) as db:
         db.execute("CREATE TABLE legacy_servers (id INTEGER PRIMARY KEY)")
-    db_file.with_name("clp.db-wal").write_bytes(b"legacy wal")
-    db_file.with_name("clp.db-shm").write_bytes(b"legacy shm")
+    if sys.platform == "win32":
+        db.close()
+    db_file.with_name("media_server_manager.db-wal").write_bytes(b"legacy wal")
+    db_file.with_name("media_server_manager.db-shm").write_bytes(b"legacy shm")
 
     with pytest.raises(IncompatibleSchemaError, match="reset-db --backup"):
         init_db(db_file)
@@ -105,7 +108,7 @@ def test_schedule_validation_description_and_next_times():
 
 
 def test_job_queue_read_cancel_retry_and_errors(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     queue = JobQueue(db_file)
     with pytest.raises(ValueError):
@@ -146,7 +149,7 @@ def test_job_queue_read_cancel_retry_and_errors(tmp_path):
 
 
 def test_preview_validation_and_worker_status(tmp_path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file)
     queue = JobQueue(db_file)

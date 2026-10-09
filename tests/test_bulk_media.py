@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from clp_web.bulk_media import parse_line, row_dict
-from clp_web.db import connect, init_db, new_secret, utcnow
+from media_server_manager_web.bulk_media import parse_line, row_dict
+from media_server_manager_web.db import connect, init_db, new_secret, utcnow
 
 
 def test_bulk_input_parsing():
@@ -11,7 +11,7 @@ def test_bulk_input_parsing():
 
 
 def test_bulk_schema_is_initialized(tmp_path: Path):
-    db_file = tmp_path / "clp.db"
+    db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     with connect(db_file) as db:
         now = utcnow()
