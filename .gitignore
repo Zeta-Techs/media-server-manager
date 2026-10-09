@@ -20,6 +20,8 @@ htmlcov/
 *.db-wal
 *.db-shm
 *.db-journal
+web/node_modules/
+web/dist/
 .env
 .env.*
 .DS_Store
