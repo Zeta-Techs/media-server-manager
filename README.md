@@ -37,7 +37,7 @@ docker compose up -d
 4. 访问 `http://服务器IP:8088`，创建首个本地管理员账号。密码至少 10 位。
 5. 添加 Plex 服务器，并把服务器页面生成的带密钥 Webhook URL 填入 Plex Webhooks。
 
-Media Server Manager 不再提供默认账号或固定会话密钥。首次启动会在配置目录生成权限为 `0600` 的 `session_secret`。通过 HTTPS 反向代理访问时设置 `MSM_COOKIE_SECURE=1`。
+Media Server Manager 不再提供默认账号或固定会话密钥。首次启动会在 SQLite 数据库的 `settings` 表中生成会话密钥；旧版本配置目录中的 `session_secret` 文件只会在首次启动时导入一次并删除。通过 HTTPS 反向代理访问时设置 `MSM_COOKIE_SECURE=1`。
 
 ### v1 升级
 
@@ -88,7 +88,7 @@ python3 -m media_server_manager --all --enqueue-only
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MSM_CONFIG_DIR` | `./config` | 数据库和会话密钥目录 |
+| `MSM_CONFIG_DIR` | `./config` | 数据库和可重建缓存目录 |
 | `MSM_WEB_HOST` | `0.0.0.0` | Web 服务监听地址 |
 | `MSM_WEB_PORT` | `8088` | Web 服务监听端口 |
 | `MSM_WEB_THREADS` | `8` | Web 服务线程数 |

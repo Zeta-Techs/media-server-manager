@@ -50,6 +50,7 @@ class ServerConfig:
     pinyin_mode: str = "first_letter"
     client_identifier: str = DEFAULT_CLIENT_IDENTIFIER
 
+
 def plex_headers(token: str = "", client_identifier: str = DEFAULT_CLIENT_IDENTIFIER) -> Dict[str, str]:
     headers = {
         "Accept": "application/json",
@@ -285,9 +286,7 @@ class PlexServer:
             value: Any = metadata.get("titleSort", "")
         elif field in {"genre", "style", "mood"}:
             value = [
-                item.get("tag")
-                for item in metadata.get(field.capitalize(), []) or []
-                if item.get("tag")
+                item.get("tag") for item in metadata.get(field.capitalize(), []) or [] if item.get("tag")
             ]
         else:
             raise ValueError(f"不支持的变更字段：{field}")
@@ -388,7 +387,9 @@ class PlexServer:
         return data.get("MediaContainer", {}).get("Metadata", []) or []
 
     def list_show_items(self, library_id: int) -> List[Dict[str, Any]]:
-        data = self._request("GET", f"{self.host}/library/sections/{library_id}/all", params={"type": TYPE["show"]}).json()
+        data = self._request(
+            "GET", f"{self.host}/library/sections/{library_id}/all", params={"type": TYPE["show"]}
+        ).json()
         return data.get("MediaContainer", {}).get("Metadata", []) or []
 
     def list_show_episodes(self, show_rating_key: str) -> List[Dict[str, Any]]:
@@ -431,7 +432,9 @@ class PlexServer:
             }
         return collected
 
-    def episode_progress_candidates(self, library_id: int, default_offset_ms: int = 60000) -> List[Dict[str, Any]]:
+    def episode_progress_candidates(
+        self, library_id: int, default_offset_ms: int = 60000
+    ) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
         for show in self.list_show_items(library_id):
             episodes = self.list_show_episodes(str(show.get("ratingKey") or ""))
@@ -526,7 +529,9 @@ class PlexServer:
         params.update({f"{field}[{i}].tag.tag": tag for i, tag in enumerate(tags)})
         self._request("PUT", f"{self.host}/library/metadata/{rating_key}", params=params)
 
-    def _put_tag_field(self, select: List[Any], rating_key: str, source_tag: str, new_tag: str, field: str) -> None:
+    def _put_tag_field(
+        self, select: List[Any], rating_key: str, source_tag: str, new_tag: str, field: str
+    ) -> None:
         metadata = self.get_metadata(rating_key)
         current_tags = [item.get("tag") for item in metadata.get(field.capitalize(), [])]
         current_tags = [tag for tag in current_tags if tag and tag != source_tag]
@@ -574,7 +579,9 @@ class PlexServer:
             )
             self._mark_change()
 
-    def _process_tag_field(self, select: List[Any], rating_key: str, title: str, metadata: Dict[str, Any], field: str) -> None:
+    def _process_tag_field(
+        self, select: List[Any], rating_key: str, title: str, metadata: Dict[str, Any], field: str
+    ) -> None:
         if not self._field_allowed(field):
             return
         plex_field = field.capitalize()
@@ -605,7 +612,9 @@ class PlexServer:
         )
         self._progress(changes_delta=len(replacements))
 
-    def _process_tags(self, select: List[Any], rating_key: str, title: str, metadata: Dict[str, Any], fields: List[str]) -> None:
+    def _process_tags(
+        self, select: List[Any], rating_key: str, title: str, metadata: Dict[str, Any], fields: List[str]
+    ) -> None:
         for field_name in ("genre", "style", "mood"):
             if field_name in fields:
                 self._process_tag_field(select, rating_key, title, metadata, field_name)
@@ -720,7 +729,9 @@ class PlexServer:
             self._run_items(worker, [(select, key) for key in keys])
         self._log("")
 
-    def put_collection_title_sort(self, select: List[Any], rating_key: str, sort_title: str, lock: int) -> None:
+    def put_collection_title_sort(
+        self, select: List[Any], rating_key: str, sort_title: str, lock: int
+    ) -> None:
         self.put_title_sort(select, rating_key, sort_title, lock)
 
     def loop_all_collections(self) -> None:
@@ -842,9 +853,7 @@ class PlexServer:
             return
         if field in {"genre", "style", "mood"}:
             tags = value if isinstance(value, list) else []
-            self._put_tag_field_values(
-                select, rating_key, [str(tag) for tag in tags], field, lock=lock
-            )
+            self._put_tag_field_values(select, rating_key, [str(tag) for tag in tags], field, lock=lock)
             return
         raise ValueError(f"不支持回滚字段：{field}")
 
@@ -858,7 +867,11 @@ class PlexServer:
                 continue
             if not self._library_allowed(library):
                 continue
-            selects = [[library[0], TYPE["artist"]], [library[0], TYPE["album"]], [library[0], TYPE["track"]]] if library[1] == TYPE["artist"] else [library[:2]]
+            selects = (
+                [[library[0], TYPE["artist"]], [library[0], TYPE["album"]], [library[0], TYPE["track"]]]
+                if library[1] == TYPE["artist"]
+                else [library[:2]]
+            )
             for select in selects:
                 for rating_key in self.list_media_keys(select, print_counts=False):
                     try:

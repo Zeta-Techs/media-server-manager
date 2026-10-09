@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
@@ -42,6 +42,7 @@ def next_run_at(
     timezone_name: str = DEFAULT_TIMEZONE,
 ) -> str:
     validate_schedule(schedule_type, value)
+    tz: tzinfo
     try:
         tz = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:

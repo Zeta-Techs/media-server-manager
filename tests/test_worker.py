@@ -67,7 +67,11 @@ def test_due_schedule_is_enqueued_once_and_advanced(tmp_path):
     db_file = tmp_path / "media_server_manager.db"
     init_db(db_file)
     server_id = add_server(db_file, "A")
-    past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    past = (
+        (datetime.now(timezone.utc) - timedelta(minutes=1))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
     now = utcnow()
     with connect(db_file) as db:
         db.execute(
@@ -114,9 +118,7 @@ def test_worker_heartbeat_health_cleanup_and_error_path(tmp_path, monkeypatch):
     old_job = queue.create_job("notification_event", server_id, {})
     old = "2000-01-01T00:00:00Z"
     with connect(db_file) as db:
-        db.execute(
-            "UPDATE jobs SET status = 'succeeded', finished_at = ? WHERE id = ?", (old, old_job)
-        )
+        db.execute("UPDATE jobs SET status = 'succeeded', finished_at = ? WHERE id = ?", (old, old_job))
         db.execute(
             "INSERT INTO webhook_events (server_id, event, created_at) VALUES (?, 'x', ?)",
             (server_id, old),

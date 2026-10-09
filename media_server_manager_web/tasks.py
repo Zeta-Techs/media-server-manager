@@ -9,12 +9,19 @@ from typing import Any, Dict, List, Optional
 
 from media_server_manager.core import PlexServer, TaskCancelled, extract_external_ids
 
+from .bulk_media import add_system_media_item, confirm_batch, resolve_batch
+from .catalog import (
+    reconcile,
+    resolve_plex_rating_key,
+    scan_plex_inventory,
+    sync_catalog,
+    sync_media_library,
+    sync_media_library_tmdb,
+)
 from .db import DB_FILE, connect, get_setting, load_tags, server_config_from_row, utcnow
 from .scheduling import validate_schedule
 from .services import JobQueue
 from .tmdb import TMDBClient
-from .catalog import resolve_plex_rating_key, sync_catalog, scan_plex_inventory, reconcile, sync_media_library, sync_media_library_tmdb
-from .bulk_media import resolve_batch, confirm_batch, add_system_media_item
 
 
 class TaskManager:
@@ -119,106 +126,220 @@ class TaskManager:
             elif job_type == "notification_event":
                 self._send_notifications("webhook_event", payload)
             elif job_type == "tmdb_catalog_sync":
-                result = sync_catalog(self.db_file, payload, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
-                self._log(job_id, f"TMDB 目录同步完成：{result['processed']} 项，错误 {result['errors']} 项。")
+                result = sync_catalog(
+                    self.db_file,
+                    payload,
+                    progress=lambda p: self._progress(job_id, p),
+                    cancelled=lambda: self._cancel_requested(job_id),
+                )
+                self._log(
+                    job_id, f"TMDB 目录同步完成：{result['processed']} 项，错误 {result['errors']} 项。"
+                )
             elif job_type == "plex_inventory_sync":
-                count = scan_plex_inventory(self.db_file, int(payload["server_id"]), payload.get("library_ids"), progress=lambda p: self._progress(job_id, p))
+                count = scan_plex_inventory(
+                    self.db_file,
+                    int(payload["server_id"]),
+                    payload.get("library_ids"),
+                    progress=lambda p: self._progress(job_id, p),
+                )
                 reconcile(self.db_file, int(payload["server_id"]))
                 self._log(job_id, f"Plex 资源扫描完成：{count} 项。")
             elif job_type == "media_reconcile":
                 count = reconcile(self.db_file, int(payload["server_id"]))
                 self._log(job_id, f"媒体对比完成：{count} 项。")
             elif job_type == "media_sync":
-                sync_catalog(self.db_file, payload, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
+                def progress(p: dict[str, Any]) -> None:
+                    self._progress(job_id, p)
+
+                def cancelled() -> bool:
+                    return self._cancel_requested(job_id)
+
+                sync_catalog(
+                    self.db_file,
+                    payload,
+                    progress=progress,
+                    cancelled=cancelled,
+                )
                 for server_id in payload.get("server_ids") or []:
                     scan_plex_inventory(self.db_file, int(server_id))
                     reconcile(self.db_file, int(server_id))
             elif job_type == "media_library_refresh":
                 library_id = int(payload["library_id"])
                 try:
-                    sync_media_library(self.db_file, int(payload["server_id"]), library_id,
-                                       progress=lambda p: self._progress(job_id, p),
-                                       cancelled=lambda: self._cancel_requested(job_id))
+                    def progress(p: dict[str, Any]) -> None:
+                        self._progress(job_id, p)
+
+                    def cancelled() -> bool:
+                        return self._cancel_requested(job_id)
+
+                    sync_media_library(
+                        self.db_file,
+                        int(payload["server_id"]),
+                        library_id,
+                        progress=progress,
+                        cancelled=cancelled,
+                    )
                 except Exception as exc:
                     with connect(self.db_file) as db:
-                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.execute(
+                            "UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?",
+                            (str(exc), utcnow(), int(payload["server_id"]), library_id),
+                        )
                         db.commit()
                     raise
             elif job_type == "media_library_full_refresh":
                 library_id = int(payload["library_id"])
                 try:
                     server_id = int(payload["server_id"])
-                    progress = lambda p: self._progress(job_id, p)
-                    cancelled = lambda: self._cancel_requested(job_id)
+                    def progress(p: dict[str, Any]) -> None:
+                        self._progress(job_id, p)
+
+                    def cancelled() -> bool:
+                        return self._cancel_requested(job_id)
                     # The Plex and TMDB passes are separate progress stages.
                     # Reset the counters before TMDB so the UI never displays
                     # a sum of two different stage totals.
-                    sync_media_library(self.db_file, server_id, library_id,
-                                       progress=progress, cancelled=cancelled)
+                    sync_media_library(
+                        self.db_file, server_id, library_id, progress=progress, cancelled=cancelled
+                    )
                     self._reset_progress(job_id, "tmdb_media_library")
-                    sync_media_library_tmdb(self.db_file, server_id, library_id,
-                                            progress=progress, cancelled=cancelled,
-                                            logger=lambda message: self._log(job_id, message))
+                    sync_media_library_tmdb(
+                        self.db_file,
+                        server_id,
+                        library_id,
+                        progress=progress,
+                        cancelled=cancelled,
+                        logger=lambda message: self._log(job_id, message),
+                    )
                 except Exception as exc:
                     with connect(self.db_file) as db:
-                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.execute(
+                            "UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?",
+                            (str(exc), utcnow(), int(payload["server_id"]), library_id),
+                        )
                         db.commit()
                     raise
             elif job_type == "media_library_show_recheck":
                 library_id = int(payload["library_id"])
                 server_id = int(payload["server_id"])
-                rating_key = resolve_plex_rating_key(self.db_file, server_id, library_id, str(payload["rating_key"]))
-                progress = lambda p: self._progress(job_id, p)
-                cancelled = lambda: self._cancel_requested(job_id)
-                sync_media_library(self.db_file, server_id, library_id, progress=progress,
-                                   cancelled=cancelled, rating_keys={rating_key})
+                rating_key = resolve_plex_rating_key(
+                    self.db_file, server_id, library_id, str(payload["rating_key"])
+                )
+                def progress(p: dict[str, Any]) -> None:
+                    self._progress(job_id, p)
+
+                def cancelled() -> bool:
+                    return self._cancel_requested(job_id)
+                sync_media_library(
+                    self.db_file,
+                    server_id,
+                    library_id,
+                    progress=progress,
+                    cancelled=cancelled,
+                    rating_keys={rating_key},
+                )
                 self._reset_progress(job_id, "tmdb_media_library")
-                sync_media_library_tmdb(self.db_file, server_id, library_id,
-                                        progress=progress, cancelled=cancelled,
-                                        rating_keys={rating_key},
-                                        logger=lambda message: self._log(job_id, message), strict_errors=True)
+                sync_media_library_tmdb(
+                    self.db_file,
+                    server_id,
+                    library_id,
+                    progress=progress,
+                    cancelled=cancelled,
+                    rating_keys={rating_key},
+                    logger=lambda message: self._log(job_id, message),
+                    strict_errors=True,
+                )
                 with connect(self.db_file) as db:
-                    count = db.execute("SELECT COUNT(*) FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key=? AND plex_type='episode' AND rating_key LIKE 'tmdb:%'", (server_id,library_id,rating_key)).fetchone()[0]
-                    db.execute("UPDATE media_library_recheck_requests SET missing_count=? WHERE id=? AND job_id=?", (count,payload.get("auto_recheck_request_id"),job_id))
+                    count = db.execute(
+                        "SELECT COUNT(*) FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key=? AND plex_type='episode' AND rating_key LIKE 'tmdb:%'",
+                        (server_id, library_id, rating_key),
+                    ).fetchone()[0]
+                    db.execute(
+                        "UPDATE media_library_recheck_requests SET missing_count=? WHERE id=? AND job_id=?",
+                        (count, payload.get("auto_recheck_request_id"), job_id),
+                    )
                     db.commit()
                 self._log(job_id, f"剧集 {rating_key} 自动重检完成：缺失/待发布 {count} 集。")
             elif job_type == "media_library_tmdb_refresh":
                 library_id = int(payload["library_id"])
                 try:
-                    sync_media_library_tmdb(self.db_file, int(payload["server_id"]), library_id,
-                                            progress=lambda p: self._progress(job_id, p),
-                                            cancelled=lambda: self._cancel_requested(job_id),
-                                            logger=lambda message: self._log(job_id, message))
+                    sync_media_library_tmdb(
+                        self.db_file,
+                        int(payload["server_id"]),
+                        library_id,
+                        progress=lambda p: self._progress(job_id, p),
+                        cancelled=lambda: self._cancel_requested(job_id),
+                        logger=lambda message: self._log(job_id, message),
+                    )
                 except Exception as exc:
                     with connect(self.db_file) as db:
-                        db.execute("UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", (str(exc), utcnow(), int(payload["server_id"]), library_id))
+                        db.execute(
+                            "UPDATE media_libraries SET sync_status = 'failed', sync_error = ?, updated_at = ? WHERE server_id = ? AND library_id = ?",
+                            (str(exc), utcnow(), int(payload["server_id"]), library_id),
+                        )
                         db.commit()
                     raise
             elif job_type == "media_library_bulk_resolve":
                 try:
-                    result = resolve_batch(self.db_file, int(payload["batch_id"]), progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
+                    result = resolve_batch(
+                        self.db_file,
+                        int(payload["batch_id"]),
+                        progress=lambda p: self._progress(job_id, p),
+                        cancelled=lambda: self._cancel_requested(job_id),
+                    )
                 except Exception as exc:
                     # Keep the batch auditable and terminal even when a worker-level
                     # failure occurs outside the per-row TMDB error handling.
                     with connect(self.db_file) as db:
-                        db.execute("UPDATE media_library_bulk_batches SET status='failed', error=?, updated_at=? WHERE id=?", (str(exc), utcnow(), int(payload["batch_id"])))
+                        db.execute(
+                            "UPDATE media_library_bulk_batches SET status='failed', error=?, updated_at=? WHERE id=?",
+                            (str(exc), utcnow(), int(payload["batch_id"])),
+                        )
                         db.commit()
                     raise
                 self._log(job_id, f"批量媒体解析完成：{result['processed']} 行，错误 {result['errors']} 行。")
             elif job_type == "media_library_bulk_confirm":
-                result = confirm_batch(self.db_file, int(payload["batch_id"]), payload, progress=lambda p: self._progress(job_id, p), cancelled=lambda: self._cancel_requested(job_id))
-                self._log(job_id, f"批量媒体确认完成：新增 {result['added']}，跳过 {result['skipped']}，错误 {result['errors']}。")
+                result = confirm_batch(
+                    self.db_file,
+                    int(payload["batch_id"]),
+                    payload,
+                    progress=lambda p: self._progress(job_id, p),
+                    cancelled=lambda: self._cancel_requested(job_id),
+                )
+                self._log(
+                    job_id,
+                    f"批量媒体确认完成：新增 {result['added']}，跳过 {result['skipped']}，错误 {result['errors']}。",
+                )
             elif job_type == "media_library_search_add":
-                result = add_system_media_item(self.db_file, int(payload["server_id"]), int(payload["library_id"]), str(payload["media_type"]), int(payload["tmdb_id"]))
-                self._progress(job_id, {"total": 1, "processed_delta": 1, "stage": "media_library_search_add"}, force=True)
-                self._log(job_id, ("媒体已存在于系统媒体库。" if result.get("status") == "exists" else f"已添加系统媒体条目：{result.get('title') or payload['tmdb_id']}"))
+                result = add_system_media_item(
+                    self.db_file,
+                    int(payload["server_id"]),
+                    int(payload["library_id"]),
+                    str(payload["media_type"]),
+                    int(payload["tmdb_id"]),
+                )
+                self._progress(
+                    job_id,
+                    {"total": 1, "processed_delta": 1, "stage": "media_library_search_add"},
+                    force=True,
+                )
+                self._log(
+                    job_id,
+                    (
+                        "媒体已存在于系统媒体库。"
+                        if result.get("status") == "exists"
+                        else f"已添加系统媒体条目：{result.get('title') or payload['tmdb_id']}"
+                    ),
+                )
             else:
                 raise ValueError(f"未知任务类型：{job_type}")
             if self._cancel_requested(job_id):
                 raise TaskCancelled("任务已取消")
             with connect(self.db_file) as db:
                 self._flush_progress(job_id, force_publish=False)
-                db.execute("UPDATE jobs SET status = 'succeeded', finished_at = ? WHERE id = ?", (utcnow(), job_id))
+                db.execute(
+                    "UPDATE jobs SET status = 'succeeded', finished_at = ? WHERE id = ?", (utcnow(), job_id)
+                )
                 db.commit()
             self._log(job_id, "任务执行完成。")
             self._send_notifications("job_succeeded", self.get_job(job_id))
@@ -276,7 +397,10 @@ class TaskManager:
         """Start a new progress stage with independent counters."""
         self._flush_progress(job_id, force_publish=False)
         with connect(self.db_file) as db:
-            db.execute("UPDATE jobs SET processed = 0, total = ?, stage = ? WHERE id = ?", (int(total), stage, job_id))
+            db.execute(
+                "UPDATE jobs SET processed = 0, total = ?, stage = ? WHERE id = ?",
+                (int(total), stage, job_id),
+            )
             db.commit()
         self._publish_job(job_id)
 
@@ -335,13 +459,10 @@ class TaskManager:
     def _log(self, job_id: int, message: str) -> None:
         should_flush = False
         with self.log_lock:
-            buffer = self.log_buffers.setdefault(
-                job_id, {"messages": [], "last_flush": 0.0}
-            )
+            buffer = self.log_buffers.setdefault(job_id, {"messages": [], "last_flush": 0.0})
             buffer["messages"].append((job_id, message, utcnow()))
             should_flush = (
-                len(buffer["messages"]) >= 20
-                or time.monotonic() - float(buffer["last_flush"]) >= 0.25
+                len(buffer["messages"]) >= 20 or time.monotonic() - float(buffer["last_flush"]) >= 0.25
             )
         if should_flush:
             self._flush_logs(job_id)
@@ -437,9 +558,7 @@ class TaskManager:
         )
         try:
             total = plex.count_all_items()
-            self._progress(
-                job_id, {"total": total, "stage": "preview" if dry_run else "apply"}, force=True
-            )
+            self._progress(job_id, {"total": total, "stage": "preview" if dry_run else "apply"}, force=True)
             plex.loop_all()
             plex.loop_all_collections()
         finally:
@@ -451,9 +570,7 @@ class TaskManager:
     def apply_preview_job(self, source_job_id: int) -> int:
         return self.queue.apply_preview_job(source_job_id)
 
-    def _run_apply_change_set_job(
-        self, job_id: int, plex: PlexServer, payload: Dict[str, Any]
-    ) -> None:
+    def _run_apply_change_set_job(self, job_id: int, plex: PlexServer, payload: Dict[str, Any]) -> None:
         source_change_set_id = int(payload["source_change_set_id"])
         job = self.get_job(job_id)
         with connect(self.db_file) as db:
@@ -547,9 +664,7 @@ class TaskManager:
             change = dict(row)
             change["old_value"] = json.loads(change.get("old_value") or "null")
             change["new_value"] = json.loads(change.get("new_value") or "null")
-            change["old_locked"] = (
-                None if change.get("old_locked") is None else bool(change["old_locked"])
-            )
+            change["old_locked"] = None if change.get("old_locked") is None else bool(change["old_locked"])
             try:
                 current_value, _ = plex.read_field_state(change["rating_key"], change["field"])
                 if current_value != change["new_value"]:
@@ -636,7 +751,9 @@ class TaskManager:
             db.commit()
         self._log(job_id, f"已生成 {sum(len(values) for values in suggestions.values())} 条标签推荐。")
 
-    def _run_continue_watching_preview_job(self, job_id: int, plex: PlexServer, payload: Dict[str, Any]) -> None:
+    def _run_continue_watching_preview_job(
+        self, job_id: int, plex: PlexServer, payload: Dict[str, Any]
+    ) -> None:
         library_id = int(payload["library_id"])
         server_id = int(self.get_job(job_id)["server_id"])
         now = utcnow()
@@ -652,7 +769,9 @@ class TaskManager:
             db.commit()
         try:
             candidates = plex.episode_progress_candidates(library_id)
-            self._progress(job_id, {"stage": "continue_watching_preview", "total": len(candidates)}, force=True)
+            self._progress(
+                job_id, {"stage": "continue_watching_preview", "total": len(candidates)}, force=True
+            )
             with connect(self.db_file) as db:
                 for candidate in candidates:
                     db.execute(
@@ -687,16 +806,24 @@ class TaskManager:
                 )
                 db.commit()
             for candidate in candidates:
-                self._log(job_id, f"候选：{candidate['show_title']} S{int(candidate['season']):02d}E{int(candidate['episode']):02d} {candidate['episode_title']}")
+                self._log(
+                    job_id,
+                    f"候选：{candidate['show_title']} S{int(candidate['season']):02d}E{int(candidate['episode']):02d} {candidate['episode_title']}",
+                )
                 self._progress(job_id, {"processed_delta": 1})
             self._log(job_id, f"继续观看候选生成完成：{len(candidates)} 个。")
         except Exception:
             with connect(self.db_file) as db:
-                db.execute("UPDATE continue_watching_runs SET status = 'failed', finished_at = ? WHERE id = ?", (utcnow(), run_id))
+                db.execute(
+                    "UPDATE continue_watching_runs SET status = 'failed', finished_at = ? WHERE id = ?",
+                    (utcnow(), run_id),
+                )
                 db.commit()
             raise
 
-    def _run_continue_watching_apply_job(self, job_id: int, plex: PlexServer, payload: Dict[str, Any]) -> None:
+    def _run_continue_watching_apply_job(
+        self, job_id: int, plex: PlexServer, payload: Dict[str, Any]
+    ) -> None:
         item_ids = [int(item_id) for item_id in (payload.get("item_ids") or [])]
         if not item_ids:
             raise ValueError("请选择要执行的候选剧集")
@@ -706,7 +833,7 @@ class TaskManager:
             source_items = db.execute(
                 f"""
                 SELECT * FROM continue_watching_items
-                WHERE id IN ({','.join(['?'] * len(item_ids))})
+                WHERE id IN ({",".join(["?"] * len(item_ids))})
                   AND server_id = ? AND status = 'candidate'
                 ORDER BY id ASC
                 """,
@@ -775,19 +902,23 @@ class TaskManager:
                     )
                     self._progress(job_id, {"processed_delta": 1, "errors_delta": 1})
                 else:
-                    plex.set_playback_progress(
-                        str(item["episode_rating_key"]), int(item["planned_offset"])
-                    )
+                    plex.set_playback_progress(str(item["episode_rating_key"]), int(item["planned_offset"]))
                     applied_count += 1
                     result = "已写入播放进度，Plex 首页可能需要刷新后显示。"
                     status = "applied"
-                    self._log(job_id, f"已尝试加入继续观看：{item['show_title']} S{int(item['season']):02d}E{int(item['episode']):02d}")
+                    self._log(
+                        job_id,
+                        f"已尝试加入继续观看：{item['show_title']} S{int(item['season']):02d}E{int(item['episode']):02d}",
+                    )
                     self._progress(job_id, {"processed_delta": 1, "changes_delta": 1})
             except Exception as exc:
                 error_count += 1
                 result = str(exc)
                 status = "failed"
-                self._log(job_id, f"继续观看写入失败：{item['show_title']} S{int(item['season']):02d}E{int(item['episode']):02d}：{exc}")
+                self._log(
+                    job_id,
+                    f"继续观看写入失败：{item['show_title']} S{int(item['season']):02d}E{int(item['episode']):02d}：{exc}",
+                )
                 self._progress(job_id, {"processed_delta": 1, "errors_delta": 1})
             with connect(self.db_file) as db:
                 db.execute(
@@ -856,7 +987,9 @@ class TaskManager:
                     show_ignore = self._episode_ignore_for_show(server_id, library_id, show, match)
                     if show_ignore:
                         ignored_count += 1
-                        self._insert_episode_audit_item(run_id, show, match, "ignored_show", {"reason": show_ignore.get("reason") or ""})
+                        self._insert_episode_audit_item(
+                            run_id, show, match, "ignored_show", {"reason": show_ignore.get("reason") or ""}
+                        )
                         self._log(job_id, f"已忽略整部剧：{title}")
                         continue
                     if match.get("status") == "unmatched":
@@ -973,7 +1106,10 @@ class TaskManager:
             )
         except Exception:
             with connect(self.db_file) as db:
-                db.execute("UPDATE episode_audit_runs SET status = 'failed', finished_at = ? WHERE id = ?", (utcnow(), run_id))
+                db.execute(
+                    "UPDATE episode_audit_runs SET status = 'failed', finished_at = ? WHERE id = ?",
+                    (utcnow(), run_id),
+                )
                 db.commit()
             raise
 
@@ -1143,20 +1279,27 @@ class TaskManager:
             data = dict(row)
             if data.get("season") is None and data.get("episode") is None:
                 return data
-            if season is not None and episode is not None and int(data.get("season") or -1) == season and int(data.get("episode") or -1) == episode:
+            if (
+                season is not None
+                and episode is not None
+                and int(data.get("season") or -1) == season
+                and int(data.get("episode") or -1) == episode
+            ):
                 return data
         return None
 
-    def preview_collection_rule(self, rule_id: int, plex: Optional[PlexServer] = None) -> List[Dict[str, Any]]:
+    def preview_collection_rule(
+        self, rule_id: int, plex: Optional[PlexServer] = None
+    ) -> List[Dict[str, Any]]:
         with connect(self.db_file) as db:
             rule = db.execute("SELECT * FROM collection_rules WHERE id = ?", (rule_id,)).fetchone()
             if rule is None:
                 raise ValueError("合集规则不存在")
             server = db.execute("SELECT * FROM servers WHERE id = ?", (rule["server_id"],)).fetchone()
-        plex = plex or PlexServer(
-            server_config_from_row(server, self.db_file), tags=load_tags(self.db_file)
+        plex = plex or PlexServer(server_config_from_row(server, self.db_file), tags=load_tags(self.db_file))
+        library = next(
+            (item for item in plex.list_library() if int(item[0]) == int(rule["library_id"])), None
         )
-        library = next((item for item in plex.list_library() if int(item[0]) == int(rule["library_id"])), None)
         if not library:
             return []
         matches: List[Dict[str, Any]] = []

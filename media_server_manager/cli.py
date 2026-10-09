@@ -21,7 +21,9 @@ def run_cli(argv: list[str] | None = None) -> int:
     init_db(DB_FILE)
     queue = JobQueue(DB_FILE)
     if not args.enqueue_only and not queue.worker_status()["online"]:
-        print("任务 Worker 离线；请先启动 media-server-manager-worker，或使用 --enqueue-only。", file=sys.stderr)
+        print(
+            "任务 Worker 离线；请先启动 media-server-manager-worker，或使用 --enqueue-only。", file=sys.stderr
+        )
         return 2
 
     with connect(DB_FILE) as db:
@@ -32,9 +34,7 @@ def run_cli(argv: list[str] | None = None) -> int:
                 args.server_id,
             ).fetchall()
         else:
-            rows = db.execute(
-                "SELECT id, name FROM servers WHERE enabled = 1 ORDER BY id"
-            ).fetchall()
+            rows = db.execute("SELECT id, name FROM servers WHERE enabled = 1 ORDER BY id").fetchall()
     if not rows:
         print("没有找到启用的 Plex 服务器。", file=sys.stderr)
         return 1
@@ -42,9 +42,7 @@ def run_cli(argv: list[str] | None = None) -> int:
     job_ids = []
     scope = {"fields": ["titleSort", "genre", "style", "mood", "collections"]}
     for row in rows:
-        job_id = queue.create_job(
-            "localize", int(row["id"]), {"mode": "apply", "scope": scope}
-        )
+        job_id = queue.create_job("localize", int(row["id"]), {"mode": "apply", "scope": scope})
         job_ids.append(job_id)
         print(f"已为 {row['name']} 创建任务 #{job_id}")
     if args.enqueue_only:

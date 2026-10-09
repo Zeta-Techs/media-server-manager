@@ -1,6 +1,7 @@
 export const state = {
   initialized: window.MSM_INITIALIZED,
   authenticated: false,
+  preferences: {},
   servers: [],
   jobs: [],
   schedules: [],

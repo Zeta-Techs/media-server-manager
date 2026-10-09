@@ -27,7 +27,12 @@ def test_bulk_schema_is_initialized(tmp_path: Path):
             "INSERT INTO media_library_bulk_rows(batch_id,line_number,input_text,created_at,updated_at) VALUES(?,?,?,?,?)",
             (batch_id, 1, "550", now, now),
         )
-        assert db.execute("SELECT COUNT(*) FROM media_library_bulk_rows WHERE batch_id=?", (batch_id,)).fetchone()[0] == 1
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM media_library_bulk_rows WHERE batch_id=?", (batch_id,)
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_bulk_row_arrays_are_returned_as_arrays():

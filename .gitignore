@@ -8,9 +8,11 @@ dist/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
-/config
+/config/
 /logs/
 /.venv/
+/venv/
+/env/
 *.log
 *.db
 *.sqlite

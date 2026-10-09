@@ -106,14 +106,29 @@ def test_continue_watching_candidates_and_progress_call():
         def request(self, method, url, **kwargs):
             calls.append((method, url, kwargs))
             if url.endswith("/library/sections/7/all"):
-                return FakeResponse({"MediaContainer": {"Metadata": [{"ratingKey": "show-1", "title": "Example"}]}})
+                return FakeResponse(
+                    {"MediaContainer": {"Metadata": [{"ratingKey": "show-1", "title": "Example"}]}}
+                )
             if url.endswith("/library/metadata/show-1/allLeaves"):
                 return FakeResponse(
                     {
                         "MediaContainer": {
                             "Metadata": [
-                                {"ratingKey": "e1", "parentIndex": 1, "index": 1, "title": "One", "viewCount": 1, "duration": 1200000},
-                                {"ratingKey": "e2", "parentIndex": 1, "index": 2, "title": "Two", "duration": 1200000},
+                                {
+                                    "ratingKey": "e1",
+                                    "parentIndex": 1,
+                                    "index": 1,
+                                    "title": "One",
+                                    "viewCount": 1,
+                                    "duration": 1200000,
+                                },
+                                {
+                                    "ratingKey": "e2",
+                                    "parentIndex": 1,
+                                    "index": 2,
+                                    "title": "Two",
+                                    "duration": 1200000,
+                                },
                             ]
                         }
                     }

@@ -54,7 +54,11 @@ class JobQueue:
             raise ValueError("不支持的任务类型")
         payload = payload or {}
         with connect(self.db_file) as db:
-            row = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone() if server_id else True
+            row = (
+                db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+                if server_id
+                else True
+            )
             if row is None:
                 raise ValueError("服务器不存在或已禁用")
             cur = db.execute(
@@ -154,6 +158,7 @@ class JobQueue:
             raise ValueError("只有失败、取消或中断的任务可以重试")
         if source["type"] == "media_library_show_recheck":
             from .rechecks import retry_recheck
+
             return retry_recheck(self.db_file, source)
         return self.create_job(
             source["type"], int(source["server_id"]), source.get("payload") or {}, source_job_id
@@ -161,9 +166,7 @@ class JobQueue:
 
     def rollback_job(self, source_job_id: int) -> int:
         source = self.get_job(source_job_id)
-        return self.create_job(
-            "rollback", int(source["server_id"]), {"source_job_id": source_job_id}
-        )
+        return self.create_job("rollback", int(source["server_id"]), {"source_job_id": source_job_id})
 
     def apply_preview_job(self, source_job_id: int) -> int:
         source = self.get_job(source_job_id)
@@ -212,12 +215,9 @@ class JobQueue:
     def worker_status(self, stale_seconds: int = 15) -> Dict[str, Any]:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_seconds)
         with connect(self.db_file) as db:
-            rows = db.execute(
-                "SELECT * FROM worker_heartbeats ORDER BY heartbeat_at DESC"
-            ).fetchall()
+            rows = db.execute("SELECT * FROM worker_heartbeats ORDER BY heartbeat_at DESC").fetchall()
         workers = [dict(row) for row in rows]
         online = any(
-            datetime.fromisoformat(row["heartbeat_at"].replace("Z", "+00:00")) >= cutoff
-            for row in workers
+            datetime.fromisoformat(row["heartbeat_at"].replace("Z", "+00:00")) >= cutoff for row in workers
         )
         return {"online": online, "workers": workers}

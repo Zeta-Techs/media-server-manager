@@ -80,7 +80,9 @@ def test_apply_preview_uses_exact_snapshot(tmp_path):
     runner._run_apply_change_set_job(apply_job, plex, queue.get_job(apply_job)["payload"])
     assert plex.applied == [("42", "JIU", True)]
     with connect(db_file) as db:
-        row = db.execute("SELECT apply_status, applied FROM changes WHERE job_id = ?", (apply_job,)).fetchone()
+        row = db.execute(
+            "SELECT apply_status, applied FROM changes WHERE job_id = ?", (apply_job,)
+        ).fetchone()
         assert dict(row) == {"apply_status": "applied", "applied": 1}
 
 
@@ -96,7 +98,12 @@ def test_apply_preview_marks_conflict_without_write(tmp_path):
     runner._run_apply_change_set_job(apply_job, plex, queue.get_job(apply_job)["payload"])
     assert plex.applied == []
     with connect(db_file) as db:
-        assert db.execute("SELECT apply_status FROM changes WHERE job_id = ?", (apply_job,)).fetchone()["apply_status"] == "conflict"
+        assert (
+            db.execute("SELECT apply_status FROM changes WHERE job_id = ?", (apply_job,)).fetchone()[
+                "apply_status"
+            ]
+            == "conflict"
+        )
 
 
 def test_rollback_requires_current_new_value_and_restores_lock(tmp_path):
@@ -132,7 +139,12 @@ def test_rollback_requires_current_new_value_and_restores_lock(tmp_path):
     runner._run_rollback_job(rollback_job, plex, {"source_job_id": source_job})
     assert plex.applied == [("42", "旧", False)]
     with connect(db_file) as db:
-        assert db.execute("SELECT rollback_status FROM changes WHERE job_id = ?", (source_job,)).fetchone()["rollback_status"] == "rolled_back"
+        assert (
+            db.execute("SELECT rollback_status FROM changes WHERE job_id = ?", (source_job,)).fetchone()[
+                "rollback_status"
+            ]
+            == "rolled_back"
+        )
 
 
 def test_manual_tmdb_override_has_priority(tmp_path):
@@ -200,9 +212,7 @@ def test_tmdb_unique_ambiguous_and_future_episode_handling(tmp_path):
         {"id": 30, "name": "First", "first_air_date": "2020-01-01"},
         {"id": 31, "name": "Second", "first_air_date": "2021-01-01"},
     ]
-    ambiguous = runner._match_tmdb_show(
-        tmdb, {"ratingKey": "ambiguous", "title": "Example"}, server_id, 7
-    )
+    ambiguous = runner._match_tmdb_show(tmdb, {"ratingKey": "ambiguous", "title": "Example"}, server_id, 7)
     assert ambiguous["status"] == "ambiguous"
     assert [item["id"] for item in ambiguous["candidates"]] == [30, 31]
 

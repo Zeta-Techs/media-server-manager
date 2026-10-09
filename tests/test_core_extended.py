@@ -117,9 +117,7 @@ def test_field_state_login_and_basic_reads(monkeypatch):
     monkeypatch.setattr(
         plex,
         "_request",
-        lambda _method, _url, **_kwargs: FakeResponse(
-            {"MediaContainer": {"friendlyName": "Mock Plex"}}
-        ),
+        lambda _method, _url, **_kwargs: FakeResponse({"MediaContainer": {"friendlyName": "Mock Plex"}}),
     )
     assert plex.login() == "Mock Plex"
     monkeypatch.setattr(plex, "_request", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError()))
@@ -186,9 +184,7 @@ def test_library_metadata_and_show_episode_fallback(monkeypatch):
             {"parentIndex": "bad", "index": 3},
         ],
     )
-    assert fallback.collect_show_episode_numbers("show") == {
-        (1, 1): {"title": "One", "rating_key": "e1"}
-    }
+    assert fallback.collect_show_episode_numbers("show") == {(1, 1): {"title": "One", "rating_key": "e1"}}
 
 
 def test_episode_candidate_rejection_branches(monkeypatch):
@@ -338,7 +334,9 @@ def test_work_plan_loops_and_collections(monkeypatch):
             [11, TYPE["movie"], "Out of scope"],
         ],
     )
-    monkeypatch.setattr(plex, "list_media_keys", lambda select, print_counts=False: [f"{select[0]}-{select[1]}"])
+    monkeypatch.setattr(
+        plex, "list_media_keys", lambda select, print_counts=False: [f"{select[0]}-{select[1]}"]
+    )
     monkeypatch.setattr(
         plex,
         "_request",
@@ -438,7 +436,11 @@ def test_new_collection_and_new_item_dispatch(monkeypatch):
 def test_apply_changes_scan_tags_and_maintenance(monkeypatch):
     plex = make_plex(tags={"Mapped": "已映射"}, progress=lambda _payload: None)
     writes: list[tuple[str, Any]] = []
-    monkeypatch.setattr(plex, "put_title_sort", lambda select, key, value, lock: writes.append(("title", (select, key, value, lock))))
+    monkeypatch.setattr(
+        plex,
+        "put_title_sort",
+        lambda select, key, value, lock: writes.append(("title", (select, key, value, lock))),
+    )
     monkeypatch.setattr(
         plex,
         "_put_tag_field_values",

@@ -125,6 +125,15 @@ def init_db(db_file: Path | None = None) -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, key),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS auth_attempts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT NOT NULL,
@@ -695,29 +704,44 @@ def init_db(db_file: Path | None = None) -> None:
         )
         # Added after the initial media-library cache schema.  Keep this as a
         # lightweight migration so existing installations retain their data.
-        media_library_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_libraries)").fetchall()}
+        media_library_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(media_libraries)").fetchall()
+        }
         if "display_order" not in media_library_columns:
             db.execute("ALTER TABLE media_libraries ADD COLUMN display_order INTEGER NOT NULL DEFAULT 0")
             current_server = None
             index = 0
-            for row in db.execute("SELECT server_id, library_id FROM media_libraries ORDER BY server_id, title COLLATE NOCASE").fetchall():
+            for row in db.execute(
+                "SELECT server_id, library_id FROM media_libraries ORDER BY server_id, title COLLATE NOCASE"
+            ).fetchall():
                 if row["server_id"] != current_server:
                     current_server = row["server_id"]
                     index = 0
-                db.execute("UPDATE media_libraries SET display_order = ? WHERE server_id = ? AND library_id = ?", (index, row["server_id"], row["library_id"]))
+                db.execute(
+                    "UPDATE media_libraries SET display_order = ? WHERE server_id = ? AND library_id = ?",
+                    (index, row["server_id"], row["library_id"]),
+                )
                 index += 1
         if "auto_recheck_new_episodes" not in media_library_columns:
-            db.execute("ALTER TABLE media_libraries ADD COLUMN auto_recheck_new_episodes INTEGER NOT NULL DEFAULT 0")
-        recheck_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_library_recheck_requests)").fetchall()}
+            db.execute(
+                "ALTER TABLE media_libraries ADD COLUMN auto_recheck_new_episodes INTEGER NOT NULL DEFAULT 0"
+            )
+        recheck_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(media_library_recheck_requests)").fetchall()
+        }
         if "dispatched_event_at" not in recheck_columns:
-            db.execute("ALTER TABLE media_library_recheck_requests ADD COLUMN dispatched_event_at TEXT NOT NULL DEFAULT ''")
+            db.execute(
+                "ALTER TABLE media_library_recheck_requests ADD COLUMN dispatched_event_at TEXT NOT NULL DEFAULT ''"
+            )
         if "missing_count" not in recheck_columns:
             db.execute("ALTER TABLE media_library_recheck_requests ADD COLUMN missing_count INTEGER")
         if "sort_key" not in media_library_columns:
             db.execute("ALTER TABLE media_libraries ADD COLUMN sort_key TEXT NOT NULL DEFAULT ''")
         if "sort_direction" not in media_library_columns:
             db.execute("ALTER TABLE media_libraries ADD COLUMN sort_direction TEXT NOT NULL DEFAULT 'asc'")
-        item_columns = {row["name"] for row in db.execute("PRAGMA table_info(media_library_items)").fetchall()}
+        item_columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(media_library_items)").fetchall()
+        }
         for name, definition in {
             "tmdb_media_type": "TEXT NOT NULL DEFAULT ''",
             "tmdb_id": "INTEGER",
@@ -732,16 +756,32 @@ def init_db(db_file: Path | None = None) -> None:
             if name not in item_columns:
                 db.execute(f"ALTER TABLE media_library_items ADD COLUMN {name} {definition}")
         tmdb_item_columns = {row["name"] for row in db.execute("PRAGMA table_info(tmdb_items)").fetchall()}
-        for name, definition in {"imdb_id": "TEXT NOT NULL DEFAULT ''", "tvdb_id": "TEXT NOT NULL DEFAULT ''"}.items():
+        for name, definition in {
+            "imdb_id": "TEXT NOT NULL DEFAULT ''",
+            "tvdb_id": "TEXT NOT NULL DEFAULT ''",
+        }.items():
             if name not in tmdb_item_columns:
                 db.execute(f"ALTER TABLE tmdb_items ADD COLUMN {name} {definition}")
         # Backfill external ids already present in cached Plex payloads.
-        for row in db.execute("SELECT server_id, library_id, rating_key, raw_json, imdb_id, tvdb_id FROM media_library_items WHERE imdb_id='' OR tvdb_id='' OR tmdb_id IS NULL").fetchall():
+        for row in db.execute(
+            "SELECT server_id, library_id, rating_key, raw_json, imdb_id, tvdb_id FROM media_library_items WHERE imdb_id='' OR tvdb_id='' OR tmdb_id IS NULL"
+        ).fetchall():
             payload = decode_payload(row["raw_json"])
             ids = payload.get("external_ids") or {}
             if not ids:
                 continue
-            db.execute("UPDATE media_library_items SET tmdb_id=COALESCE(tmdb_id, ?), tmdb_media_type=CASE WHEN COALESCE(tmdb_media_type,'')='' AND ? IS NOT NULL THEN CASE WHEN plex_type='movie' THEN 'movie' WHEN plex_type='show' THEN 'tv' ELSE '' END ELSE tmdb_media_type END, imdb_id=CASE WHEN imdb_id='' THEN ? ELSE imdb_id END, tvdb_id=CASE WHEN tvdb_id='' THEN ? ELSE tvdb_id END WHERE server_id=? AND library_id=? AND rating_key=?", (int(ids["tmdb"]) if ids.get("tmdb") else None, int(ids["tmdb"]) if ids.get("tmdb") else None, str(ids.get("imdb") or ""), str(ids.get("tvdb") or ""), row["server_id"], row["library_id"], row["rating_key"]))
+            db.execute(
+                "UPDATE media_library_items SET tmdb_id=COALESCE(tmdb_id, ?), tmdb_media_type=CASE WHEN COALESCE(tmdb_media_type,'')='' AND ? IS NOT NULL THEN CASE WHEN plex_type='movie' THEN 'movie' WHEN plex_type='show' THEN 'tv' ELSE '' END ELSE tmdb_media_type END, imdb_id=CASE WHEN imdb_id='' THEN ? ELSE imdb_id END, tvdb_id=CASE WHEN tvdb_id='' THEN ? ELSE tvdb_id END WHERE server_id=? AND library_id=? AND rating_key=?",
+                (
+                    int(ids["tmdb"]) if ids.get("tmdb") else None,
+                    int(ids["tmdb"]) if ids.get("tmdb") else None,
+                    str(ids.get("imdb") or ""),
+                    str(ids.get("tvdb") or ""),
+                    row["server_id"],
+                    row["library_id"],
+                    row["rating_key"],
+                ),
+            )
         db.execute(
             "INSERT INTO schema_meta (id, version, created_at) VALUES (1, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET version = excluded.version",
@@ -788,9 +828,7 @@ def reset_database(db_file: Path | None = None, backup: bool = True) -> Path | N
     return backup_path
 
 
-def server_config_from_row(
-    row: sqlite3.Row | Dict[str, Any], db_file: Path | None = None
-) -> ServerConfig:
+def server_config_from_row(row: sqlite3.Row | Dict[str, Any], db_file: Path | None = None) -> ServerConfig:
     data = dict(row)
     client_identifier = get_setting("plex_client_identifier", db_file) or "media-server-manager"
     return ServerConfig(

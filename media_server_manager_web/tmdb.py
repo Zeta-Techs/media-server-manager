@@ -23,10 +23,17 @@ class TMDBClient:
         self.base_url = "https://api.themoviedb.org/3"
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json", "Authorization": f"Bearer {self.api_key}"})
-        retry = Retry(total=3, connect=3, read=3, status=3, backoff_factor=0.5,
-                      status_forcelist=(429, 500, 502, 503, 504),
-                      allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
-                      respect_retry_after_header=True, raise_on_status=False)
+        retry = Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
         self.session.mount("https://", HTTPAdapter(max_retries=retry))
 
     def _get(self, path: str, **params: Any) -> Dict[str, Any]:
@@ -55,13 +62,21 @@ class TMDBClient:
     def movie_details(self, tmdb_id: int) -> Dict[str, Any]:
         return self.details("movie", tmdb_id)
 
-    def search_movie(self, title: str, year: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def search_movie(
+        self, title: str, year: Optional[int] = None, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         data = self._get("/search/movie", query=title, year=year)
         results = data.get("results") or []
         return results[:limit] if limit else results
 
-    def episode_details(self, series_id: int, season_number: int, episode_number: int, language: str = "zh-CN") -> Dict[str, Any]:
-        return self._get(f"/tv/{series_id}/season/{season_number}/episode/{episode_number}", language=language, append_to_response="images,external_ids")
+    def episode_details(
+        self, series_id: int, season_number: int, episode_number: int, language: str = "zh-CN"
+    ) -> Dict[str, Any]:
+        return self._get(
+            f"/tv/{series_id}/season/{season_number}/episode/{episode_number}",
+            language=language,
+            append_to_response="images,external_ids",
+        )
 
     def configuration(self) -> Dict[str, Any]:
         return self._get("/configuration")
@@ -88,12 +103,16 @@ class TMDBClient:
             return {}
         return self._get(f"/find/{value}", external_source=source)
 
-    def search_tv(self, title: str, year: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def search_tv(
+        self, title: str, year: Optional[int] = None, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         data = self._get("/search/tv", query=title, first_air_date_year=year)
         results = data.get("results") or []
         return results[:limit] if limit else results
 
-    def search(self, media_type: str, query: str, year: Optional[int] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    def search(
+        self, media_type: str, query: str, year: Optional[int] = None, limit: Optional[int] = None
+    ) -> List[Dict[str, Any]]:
         if media_type == "movie":
             return self.search_movie(query, year, limit)
         if media_type == "tv":

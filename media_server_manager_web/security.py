@@ -6,9 +6,7 @@ import os
 import secrets
 from pathlib import Path
 
-from media_server_manager.core import CONFIG_DIR
-
-SESSION_SECRET_FILE = CONFIG_DIR / "session_secret"
+from .db import DB_FILE, connect, init_db
 
 
 def hash_password(password: str) -> str:
@@ -28,18 +26,31 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(digest.hex(), expected)
 
 
-def load_session_secret(secret_file: Path = SESSION_SECRET_FILE) -> str:
+def load_session_secret(db_file: Path | None = None) -> str:
     configured = os.environ.get("MSM_SECRET_KEY", "").strip()
     if configured:
         return configured
-    secret_file.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with secret_file.open("x", encoding="ascii") as handle:
-            handle.write(secrets.token_urlsafe(48))
-        os.chmod(secret_file, 0o600)
-    except FileExistsError:
-        pass
-    value = secret_file.read_text(encoding="ascii").strip()
+    db_path = Path(db_file or DB_FILE)
+    init_db(db_path)
+    legacy_secret = db_path.parent / "session_secret"
+    with connect(db_path) as db:
+        row = db.execute("SELECT value FROM settings WHERE key = ?", ("session_secret",)).fetchone()
+        value = str(row["value"] or "") if row else ""
+        if not value and legacy_secret.exists():
+            value = legacy_secret.read_text(encoding="ascii").strip()
+        if len(value) < 32:
+            value = secrets.token_urlsafe(48)
+        db.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("session_secret", value),
+        )
+        db.commit()
+    if legacy_secret.exists():
+        try:
+            legacy_secret.unlink()
+        except OSError:
+            pass
     if len(value) < 32:
         raise RuntimeError("会话密钥文件无效，请删除后重新启动。")
     return value

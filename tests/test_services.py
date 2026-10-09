@@ -55,14 +55,14 @@ def test_security_helpers_and_secret_sources(tmp_path, monkeypatch):
     assert verify_csrf("token", "token")
     assert not verify_csrf("token", "")
     assert len(new_csrf_token()) > 20
-    secret_file = tmp_path / "secret"
-    first = load_session_secret(secret_file)
-    assert load_session_secret(secret_file) == first
-    secret_file.write_text("short", encoding="ascii")
-    with pytest.raises(RuntimeError):
-        load_session_secret(secret_file)
+    db_file = tmp_path / "media_server_manager.db"
+    first = load_session_secret(db_file)
+    assert load_session_secret(db_file) == first
+    with connect(db_file) as db:
+        stored = db.execute("SELECT value FROM settings WHERE key = 'session_secret'").fetchone()["value"]
+        assert stored == first
     monkeypatch.setenv("MSM_SECRET_KEY", "configured-secret-value")
-    assert load_session_secret(tmp_path / "unused") == "configured-secret-value"
+    assert load_session_secret(db_file) == "configured-secret-value"
 
 
 def test_old_database_requires_explicit_backup_reset(tmp_path):
@@ -172,7 +172,11 @@ def test_preview_validation_and_worker_status(tmp_path):
     assert queue.worker_status()["online"] is True
     with pytest.raises(ValueError):
         queue.apply_preview_job(normal)
-    stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds").replace("+00:00", "Z")
+    stale = (
+        (datetime.now(timezone.utc) - timedelta(minutes=5))
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
     with connect(db_file) as db:
         db.execute("UPDATE worker_heartbeats SET heartbeat_at = ?", (stale,))
         db.commit()

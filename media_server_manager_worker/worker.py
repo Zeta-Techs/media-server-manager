@@ -13,9 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from media_server_manager_web.db import DB_FILE, connect, decode_payload, utcnow
+from media_server_manager_web.rechecks import enqueue_due_rechecks
 from media_server_manager_web.scheduling import next_run_at
 from media_server_manager_web.tasks import TaskManager
-from media_server_manager_web.rechecks import enqueue_due_rechecks
 
 
 def worker_is_healthy(db_file: Path | None = None, stale_seconds: int = 15) -> bool:
@@ -24,8 +24,7 @@ def worker_is_healthy(db_file: Path | None = None, stale_seconds: int = 15) -> b
         with connect(db_file or DB_FILE) as db:
             rows = db.execute("SELECT heartbeat_at FROM worker_heartbeats").fetchall()
         return any(
-            datetime.fromisoformat(row["heartbeat_at"].replace("Z", "+00:00")) >= cutoff
-            for row in rows
+            datetime.fromisoformat(row["heartbeat_at"].replace("Z", "+00:00")) >= cutoff for row in rows
         )
     except Exception:
         return False
@@ -37,9 +36,7 @@ class Worker:
         self.concurrency = max(1, concurrency)
         self.worker_id = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self.runner = TaskManager(self.db_file)
-        self.executor = ThreadPoolExecutor(
-            max_workers=self.concurrency, thread_name_prefix="msm-job"
-        )
+        self.executor = ThreadPoolExecutor(max_workers=self.concurrency, thread_name_prefix="msm-job")
         self.stop_event = threading.Event()
         self.futures: dict[Future[None], tuple[int, int]] = {}
         self.started_at = utcnow()
@@ -124,8 +121,11 @@ class Worker:
     def _claim_next_job(self, active_servers: set[int]) -> tuple[int, int] | None:
         with connect(self.db_file) as db:
             db.execute("BEGIN IMMEDIATE")
-            clauses = ["jobs.status = 'queued'", "servers.enabled = 1",
-                       "NOT EXISTS (SELECT 1 FROM jobs active WHERE active.server_id=jobs.server_id AND active.status='running')"]
+            clauses = [
+                "jobs.status = 'queued'",
+                "servers.enabled = 1",
+                "NOT EXISTS (SELECT 1 FROM jobs active WHERE active.server_id=jobs.server_id AND active.status='running')",
+            ]
             params: list[Any] = []
             if active_servers:
                 placeholders = ",".join("?" for _ in active_servers)
@@ -135,7 +135,7 @@ class Worker:
                 f"""
                 SELECT jobs.id, jobs.server_id
                 FROM jobs JOIN servers ON servers.id = jobs.server_id
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY jobs.id ASC LIMIT 1
                 """,
                 params,
@@ -237,9 +237,7 @@ class Worker:
                     "INSERT INTO job_logs (job_id, message, created_at) VALUES (?, ?, ?)",
                     (job_id, f"由定时任务「{schedule['name']}」创建。", utcnow()),
                 )
-                next_value = next_run_at(
-                    schedule["schedule_type"], schedule["schedule_value"]
-                )
+                next_value = next_run_at(schedule["schedule_type"], schedule["schedule_value"])
                 db.execute(
                     "UPDATE schedules SET last_run_at = ?, next_run_at = ? WHERE id = ?",
                     (utcnow(), next_value, schedule_id),
@@ -250,11 +248,15 @@ class Worker:
         job_days = max(1, int(os.environ.get("MSM_JOB_RETENTION_DAYS", "90")))
         webhook_days = max(1, int(os.environ.get("MSM_WEBHOOK_RETENTION_DAYS", "30")))
         job_cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=job_days)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            (datetime.now(timezone.utc) - timedelta(days=job_days))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         webhook_cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=webhook_days)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            (datetime.now(timezone.utc) - timedelta(days=webhook_days))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         with connect(self.db_file) as db:
             db.execute(
                 "DELETE FROM jobs WHERE status IN ('succeeded','failed','cancelled','interrupted') AND finished_at < ?",

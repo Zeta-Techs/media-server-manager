@@ -16,13 +16,20 @@ from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 from media_server_manager.core import PlexServer, extract_external_ids, join_skip_libraries
 
+from .bulk_media import (
+    _summary,
+    _title_key,
+    decode_json,
+    parse_line,
+)
+from .catalog import resolve_plex_rating_key, sync_media_library_full
 from .db import (
     DB_FILE,
     DEFAULT_USERNAME,
     connect,
     decode_payload,
     get_setting,
-    init_db,
+    init_db,  # noqa: F401 - retained as a public test/extension hook
     load_tags,
     new_secret,
     rows_to_dicts,
@@ -32,6 +39,7 @@ from .db import (
     utcnow,
 )
 from .plex_auth import check_pin, create_pin
+from .rechecks import request_recheck
 from .scheduling import describe_schedule, next_run_at, validate_schedule
 from .security import (
     hash_password,
@@ -41,10 +49,7 @@ from .security import (
     verify_password,
 )
 from .services import TERMINAL_JOB_STATUSES, JobQueue
-from .catalog import resolve_plex_rating_key, sync_media_library_full
-from .rechecks import request_recheck
-from .bulk_media import MAX_BULK_ROWS, decode_json, row_dict, add_system_media_item, parse_line, _summary, _title_key
-from .tmdb import TMDBClient, TMDBError
+from .tmdb import TMDBClient
 
 
 def _air_date(metadata: dict[str, Any]) -> str:
@@ -118,7 +123,7 @@ def _episode_payload(episode: dict[str, Any]) -> dict[str, Any]:
 
 def _show_payload(plex: PlexServer, show: dict[str, Any], library_id: int) -> dict[str, Any]:
     show_key = str(show.get("ratingKey") or "")
-    seasons = []
+    seasons: list[dict[str, Any]] = []
     episodes_by_season: dict[int, list[dict[str, Any]]] = {}
     try:
         for episode in plex.list_show_episodes(show_key):
@@ -130,6 +135,7 @@ def _show_payload(plex: PlexServer, show: dict[str, Any], library_id: int) -> di
         season_rows = plex.get_children(show_key)
     except Exception:
         season_rows = []
+
     def season_number_for(row: dict[str, Any]) -> int:
         try:
             value = row.get("index")
@@ -138,6 +144,7 @@ def _show_payload(plex: PlexServer, show: dict[str, Any], library_id: int) -> di
             return int(value or 0)
         except (TypeError, ValueError):
             return 0
+
     known_seasons = {season_number_for(row) for row in season_rows}
     for season_number in sorted(set(known_seasons) | set(episodes_by_season)):
         matching_seasons = [row for row in season_rows if season_number_for(row) == season_number]
@@ -152,18 +159,25 @@ def _show_payload(plex: PlexServer, show: dict[str, Any], library_id: int) -> di
         episodes = sorted(episodes_by_season.get(season_number, []), key=lambda item: item["episode"])
         dates = [item["air_date"] for item in episodes if item["air_date"]]
         release_date = min(dates) if dates else _air_date(season)
-        seasons.append({
-            "season": season_number,
-            "title": str(season.get("title") or f"第 {season_number} 季"),
-            "release_date": release_date,
-            "bucket": "特别篇" if season_number == 0 else _season_bucket(release_date),
-            "episodes": episodes,
-        })
+        seasons.append(
+            {
+                "season": season_number,
+                "title": str(season.get("title") or f"第 {season_number} 季"),
+                "release_date": release_date,
+                "bucket": "特别篇" if season_number == 0 else _season_bucket(release_date),
+                "episodes": episodes,
+            }
+        )
     seasons.sort(key=lambda item: item["season"])
     return {
         **_media_fields(show),
         "library_id": int(library_id),
-        "show_kind": "动画" if any(any(marker in str(item.get("tag") or "").lower() for marker in ("动画", "animation", "anime")) for item in (show.get("Genre") or [])) else "真人",
+        "show_kind": "动画"
+        if any(
+            any(marker in str(item.get("tag") or "").lower() for marker in ("动画", "animation", "anime"))
+            for item in (show.get("Genre") or [])
+        )
+        else "真人",
         "seasons": seasons,
         "season_count": len(seasons),
         "episode_count": sum(len(season["episodes"]) for season in seasons),
@@ -175,24 +189,45 @@ def _show_summary_payload(show: dict[str, Any], library_id: int) -> dict[str, An
     return {
         **_media_fields(show),
         "library_id": int(library_id),
-        "show_kind": "动画" if any(any(marker in str(item.get("tag") or "").lower() for marker in ("动画", "animation", "anime")) for item in (show.get("Genre") or [])) else "真人",
+        "show_kind": "动画"
+        if any(
+            any(marker in str(item.get("tag") or "").lower() for marker in ("动画", "animation", "anime"))
+            for item in (show.get("Genre") or [])
+        )
+        else "真人",
         "seasons": [],
         "season_count": int(show.get("childCount") or 0),
         "episode_count": int(show.get("leafCount") or 0),
     }
 
 
-def _sort_value(item: dict[str, Any], field: str) -> Any:
+def _sort_value(item: dict[str, Any], field: str) -> tuple[int, float | str]:
     aliases = {
-        "name": "title", "original_title": "original_title", "year": "year", "added_at": "added_at",
-        "release_date": "release_date", "rating": "rating", "audience_rating": "audience_rating",
-        "duration": "duration", "season_count": "season_count", "episode_count": "episode_count",
-        "content_rating": "content_rating", "genre": "genre",
+        "name": "title",
+        "original_title": "original_title",
+        "year": "year",
+        "added_at": "added_at",
+        "release_date": "release_date",
+        "rating": "rating",
+        "audience_rating": "audience_rating",
+        "duration": "duration",
+        "season_count": "season_count",
+        "episode_count": "episode_count",
+        "content_rating": "content_rating",
+        "genre": "genre",
     }
     value = item.get(aliases.get(field, "title"))
-    if value in (None, ""):
+    if value is None or value == "":
         return (1, "")
-    if field in {"year", "added_at", "rating", "audience_rating", "duration", "season_count", "episode_count"}:
+    if field in {
+        "year",
+        "added_at",
+        "rating",
+        "audience_rating",
+        "duration",
+        "season_count",
+        "episode_count",
+    }:
         try:
             return (0, float(value))
         except (TypeError, ValueError):
@@ -202,11 +237,15 @@ def _sort_value(item: dict[str, Any], field: str) -> Any:
 
 def _sort_items(items: list[dict[str, Any]], field: str, direction: str) -> list[dict[str, Any]]:
     reverse = direction == "desc"
-    return sorted(items, key=lambda item: (_sort_value(item, field), str(item.get("rating_key") or "")), reverse=reverse)
+    return sorted(
+        items, key=lambda item: (_sort_value(item, field), str(item.get("rating_key") or "")), reverse=reverse
+    )
 
 
 def _library_name_is_animation(title: str, plex_type: int) -> bool:
-    return int(plex_type) == 2 and any(keyword in str(title or "").casefold() for keyword in ("anime", "动画", "番"))
+    return int(plex_type) == 2 and any(
+        keyword in str(title or "").casefold() for keyword in ("anime", "动画", "番")
+    )
 
 
 def _library_is_animation(mode: str, title: str, plex_type: int) -> bool:
@@ -226,7 +265,11 @@ def _cached_show_kind(row: Any, library: Any) -> str:
     genre = str(row["genre"] or "").casefold() if row is not None else ""
     if genre:
         return "动画" if any(marker in genre for marker in ("动画", "animation", "anime")) else "真人"
-    return "动画" if _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人"
+    return (
+        "动画"
+        if _library_is_animation(library["animation_mode"], library["title"], library["plex_type"])
+        else "真人"
+    )
 
 
 def _quarter_entries(show: dict[str, Any], library_id: int, plex: PlexServer) -> list[dict[str, Any]]:
@@ -235,23 +278,30 @@ def _quarter_entries(show: dict[str, Any], library_id: int, plex: PlexServer) ->
     for season in full["seasons"]:
         dates = [episode["air_date"] for episode in season["episodes"] if episode.get("air_date")]
         first_date = min(dates) if dates else season.get("release_date") or ""
-        entries.append({
-            **_show_summary_payload(show, library_id),
-            "season": season["season"],
-            "bucket": season["bucket"],
-            "release_date": season.get("release_date") or "",
-            "first_episode_date": first_date,
-            "episode_count": len(season["episodes"]),
-            "is_special": season["season"] == 0,
-            "is_undated": not bool(first_date),
-        })
+        entries.append(
+            {
+                **_show_summary_payload(show, library_id),
+                "season": season["season"],
+                "bucket": season["bucket"],
+                "release_date": season.get("release_date") or "",
+                "first_episode_date": first_date,
+                "episode_count": len(season["episodes"]),
+                "is_special": season["season"] == 0,
+                "is_undated": not bool(first_date),
+            }
+        )
     return entries
 
 
-def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any, library: Any) -> dict[str, Any]:
+def _cached_show_payload(
+    db: Any, server_id: int, library_id: int, show_row: Any, library: Any
+) -> dict[str, Any]:
     show = dict(show_row)
-    seasons = []
-    season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' ORDER BY season_number, id", (server_id, library_id, show["rating_key"])).fetchall()
+    seasons: list[dict[str, Any]] = []
+    season_rows = db.execute(
+        "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'season' ORDER BY season_number, id",
+        (server_id, library_id, show["rating_key"]),
+    ).fetchall()
 
     # A Plex library can expose an anomalous ``Specials`` row with index 0,
     # while its cached season number has been normalised to 1.  If we render
@@ -271,14 +321,26 @@ def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any
 
     for season_number in sorted(seasons_by_number):
         season = seasons_by_number[season_number]
-        episodes_by_number = {}
-        episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? ORDER BY episode_number", (server_id, library_id, show["rating_key"], season["season_number"])).fetchall()
+        episodes_by_number: dict[int, dict[str, Any]] = {}
+        episode_rows = db.execute(
+            "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = ? AND plex_type = 'episode' AND season_number = ? ORDER BY episode_number",
+            (server_id, library_id, show["rating_key"], season["season_number"]),
+        ).fetchall()
         for episode_row in episode_rows:
             episode = dict(episode_row)
             expected = _cached_child_is_expected(episode)
-            payload = {"rating_key": episode["rating_key"], "season": int(episode["season_number"] or 0), "episode": int(episode["episode_number"] or 0),
-                       "title": episode["title"], "air_date": episode["release_date"], "duration": episode["duration"] or 0,
-                       "thumb": episode["thumb"], "added_at": episode["added_at"], "expected": expected, "missing": expected}
+            payload = {
+                "rating_key": episode["rating_key"],
+                "season": int(episode["season_number"] or 0),
+                "episode": int(episode["episode_number"] or 0),
+                "title": episode["title"],
+                "air_date": episode["release_date"],
+                "duration": episode["duration"] or 0,
+                "thumb": episode["thumb"],
+                "added_at": episode["added_at"],
+                "expected": expected,
+                "missing": expected,
+            }
             episode_number = payload["episode"]
             existing = episodes_by_number.get(episode_number)
             # A real Plex row supersedes a TMDB expected placeholder with the
@@ -289,21 +351,63 @@ def _cached_show_payload(db: Any, server_id: int, library_id: int, show_row: Any
         episodes = [episodes_by_number[number] for number in sorted(episodes_by_number)]
         dates = [item["air_date"] for item in episodes if item.get("air_date")]
         release_date = min(dates) if dates else season["release_date"] or ""
-        seasons.append({"season": season_number, "title": season["title"] or f"第 {season_number} 季",
-                        "release_date": release_date, "bucket": "特别篇" if season_number == 0 else _season_bucket(release_date),
-                        "episodes": episodes})
+        seasons.append(
+            {
+                "season": season_number,
+                "title": season["title"] or f"第 {season_number} 季",
+                "release_date": release_date,
+                "bucket": "特别篇" if season_number == 0 else _season_bucket(release_date),
+                "episodes": episodes,
+            }
+        )
     raw = decode_payload(show.get("raw_json"))
-    item = {key: show.get(key) for key in ("rating_key", "title", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "content_rating", "genre", "thumb", "art")}
+    item = {
+        key: show.get(key)
+        for key in (
+            "rating_key",
+            "title",
+            "original_title",
+            "year",
+            "added_at",
+            "release_date",
+            "rating",
+            "audience_rating",
+            "duration",
+            "content_rating",
+            "genre",
+            "thumb",
+            "art",
+        )
+    }
     external_ids = raw.get("external_ids") or extract_external_ids(raw)
-    external_ids = {**external_ids, "tmdb": str(show.get("tmdb_id") or external_ids.get("tmdb") or ""), "imdb": str(show.get("imdb_id") or external_ids.get("imdb") or ""), "tvdb": str(show.get("tvdb_id") or external_ids.get("tvdb") or "")}
-    item.update({"library_id": library_id, "type": "show", "summary": raw.get("summary") or "", "external_ids": external_ids,
-                 "tmdb_id": int(show["tmdb_id"]) if show.get("tmdb_id") else None, "imdb_id": show.get("imdb_id") or external_ids.get("imdb") or "", "tvdb_id": show.get("tvdb_id") or external_ids.get("tvdb") or "",
-                 "show_kind": _cached_show_kind(show, library), "seasons": seasons,
-                 "season_count": len(seasons), "episode_count": sum(len(item["episodes"]) for item in seasons), "poster_url": raw.get("poster_url") or ""})
+    external_ids = {
+        **external_ids,
+        "tmdb": str(show.get("tmdb_id") or external_ids.get("tmdb") or ""),
+        "imdb": str(show.get("imdb_id") or external_ids.get("imdb") or ""),
+        "tvdb": str(show.get("tvdb_id") or external_ids.get("tvdb") or ""),
+    }
+    item.update(
+        {
+            "library_id": library_id,
+            "type": "show",
+            "summary": raw.get("summary") or "",
+            "external_ids": external_ids,
+            "tmdb_id": int(show["tmdb_id"]) if show.get("tmdb_id") else None,
+            "imdb_id": show.get("imdb_id") or external_ids.get("imdb") or "",
+            "tvdb_id": show.get("tvdb_id") or external_ids.get("tvdb") or "",
+            "show_kind": _cached_show_kind(show, library),
+            "seasons": seasons,
+            "season_count": len(seasons),
+            "episode_count": sum(len(item["episodes"]) for item in seasons),
+            "poster_url": raw.get("poster_url") or "",
+        }
+    )
     return item
 
 
-def _cached_show_summary(show_row: Any, library_id: int, library: Any, season_count: int = 0, episode_count: int = 0) -> dict[str, Any]:
+def _cached_show_summary(
+    show_row: Any, library_id: int, library: Any, season_count: int = 0, episode_count: int = 0
+) -> dict[str, Any]:
     """Build a show card without loading its season and episode payloads."""
     show = dict(show_row)
     raw = decode_payload(show.get("raw_json"))
@@ -345,7 +449,10 @@ def _cached_show_summary(show_row: Any, library_id: int, library: Any, season_co
 
 def _cached_child_is_expected(row: Any) -> bool:
     """Return whether a cached season or episode is a synthetic expectation."""
-    return str(row["rating_key"] or "").startswith("tmdb") or decode_payload(row["raw_json"]).get("expected") is True
+    return (
+        str(row["rating_key"] or "").startswith("tmdb")
+        or decode_payload(row["raw_json"]).get("expected") is True
+    )
 
 
 def _prefer_cached_child(existing: Any, candidate: Any) -> Any:
@@ -371,13 +478,12 @@ def create_app() -> Flask:
     automation_bp = Blueprint("automation", __name__)
     tools_bp = Blueprint("tools", __name__)
     app.config.update(
-        SECRET_KEY=load_session_secret(DB_FILE.parent / "session_secret"),
+        SECRET_KEY=load_session_secret(DB_FILE),
         MAX_CONTENT_LENGTH=5 * 1024 * 1024,
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=os.environ.get("MSM_COOKIE_SECURE", "0") == "1",
     )
-    init_db()
     manager = JobQueue(DB_FILE)
     app.extensions["task_manager"] = manager
 
@@ -518,8 +624,10 @@ def create_app() -> Flask:
         password = data.get("password") or ""
         with connect() as db:
             cutoff = (
-                datetime.now(timezone.utc) - timedelta(minutes=10)
-            ).isoformat(timespec="seconds").replace("+00:00", "Z")
+                (datetime.now(timezone.utc) - timedelta(minutes=10))
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z")
+            )
             db.execute("DELETE FROM auth_attempts WHERE created_at < ?", (cutoff,))
             failures = db.execute(
                 "SELECT COUNT(*) AS count FROM auth_attempts WHERE username = ? AND ip_address = ?",
@@ -583,6 +691,39 @@ def create_app() -> Flask:
             }
         )
 
+    @auth_bp.get("/api/preferences")
+    @login_required
+    def api_preferences():
+        with connect() as db:
+            rows = db.execute("SELECT key, value FROM user_preferences WHERE user_id = ?", (session["user_id"],)).fetchall()
+        result: dict[str, Any] = {}
+        for row in rows:
+            try:
+                result[row["key"]] = json.loads(row["value"])
+            except (TypeError, json.JSONDecodeError):
+                result[row["key"]] = row["value"]
+        return jsonify(result)
+
+    @auth_bp.put("/api/preferences")
+    @login_required
+    def update_preferences():
+        data = request.get_json(force=True)
+        if not isinstance(data, dict) or any(not isinstance(key, str) or len(key) > 64 for key in data):
+            return api_error("用户偏好格式无效", "invalid_preferences", 400)
+        now = utcnow()
+        with connect() as db:
+            for key, value in data.items():
+                encoded = json.dumps(value, ensure_ascii=False)
+                if len(encoded) > 512 * 1024:
+                    return api_error("用户偏好内容过大", "invalid_preferences", 400)
+                db.execute(
+                    "INSERT INTO user_preferences (user_id, key, value, updated_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(user_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                    (session["user_id"], key, encoded, now),
+                )
+            db.commit()
+        return jsonify({"ok": True})
+
     @app.get("/healthz")
     def healthz():
         try:
@@ -597,9 +738,15 @@ def create_app() -> Flask:
     def api_overview():
         with connect() as db:
             server_count = db.execute("SELECT COUNT(*) AS count FROM servers").fetchone()["count"]
-            enabled_server_count = db.execute("SELECT COUNT(*) AS count FROM servers WHERE enabled = 1").fetchone()["count"]
-            running_jobs = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'running'").fetchone()["count"]
-            queued_jobs = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").fetchone()["count"]
+            enabled_server_count = db.execute(
+                "SELECT COUNT(*) AS count FROM servers WHERE enabled = 1"
+            ).fetchone()["count"]
+            running_jobs = db.execute(
+                "SELECT COUNT(*) AS count FROM jobs WHERE status = 'running'"
+            ).fetchone()["count"]
+            queued_jobs = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").fetchone()[
+                "count"
+            ]
             failed_jobs = rows_to_dicts(
                 db.execute(
                     """
@@ -620,15 +767,24 @@ def create_app() -> Flask:
                 ).fetchall()
             )
             webhook_events = db.execute("SELECT COUNT(*) AS count FROM webhook_events").fetchone()["count"]
-            active_schedules = db.execute("SELECT COUNT(*) AS count FROM schedules WHERE enabled = 1").fetchone()["count"]
-            notification_channels = db.execute("SELECT COUNT(*) AS count FROM notification_channels WHERE enabled = 1").fetchone()["count"]
+            active_schedules = db.execute(
+                "SELECT COUNT(*) AS count FROM schedules WHERE enabled = 1"
+            ).fetchone()["count"]
+            notification_channels = db.execute(
+                "SELECT COUNT(*) AS count FROM notification_channels WHERE enabled = 1"
+            ).fetchone()["count"]
             db_size = DB_FILE.stat().st_size if DB_FILE.exists() else 0
         for job in recent_jobs + failed_jobs:
             job["payload"] = decode_payload(job.get("payload", "{}"))
         return jsonify(
             {
                 "servers": {"total": server_count, "enabled": enabled_server_count},
-                "jobs": {"running": running_jobs, "queued": queued_jobs, "recent": recent_jobs, "failed": failed_jobs},
+                "jobs": {
+                    "running": running_jobs,
+                    "queued": queued_jobs,
+                    "recent": recent_jobs,
+                    "failed": failed_jobs,
+                },
                 "automation": {
                     "webhook_events": webhook_events,
                     "active_schedules": active_schedules,
@@ -727,7 +883,9 @@ def create_app() -> Flask:
     def update_server(server_id: int):
         data = request.get_json(force=True)
         skip_libraries = data.get("skip_libraries") or []
-        skip_value = skip_libraries if isinstance(skip_libraries, str) else join_skip_libraries(skip_libraries)
+        skip_value = (
+            skip_libraries if isinstance(skip_libraries, str) else join_skip_libraries(skip_libraries)
+        )
         with connect() as db:
             existing = db.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
             if existing is None:
@@ -767,8 +925,10 @@ def create_app() -> Flask:
         result = create_pin(forward_url)
         flow_id = secrets.token_urlsafe(24)
         expires_at = (
-            datetime.now(timezone.utc) + timedelta(minutes=10)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            (datetime.now(timezone.utc) + timedelta(minutes=10))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         with connect() as db:
             db.execute("DELETE FROM oauth_flows WHERE expires_at < ?", (utcnow(),))
             db.execute(
@@ -930,12 +1090,41 @@ def create_app() -> Flask:
             with connect() as db:
                 now = utcnow()
                 for item in upstream:
-                    db.execute("INSERT OR IGNORE INTO media_libraries (server_id, library_id, title, plex_type, auto_animation, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (server_id, int(item["key"]), item["title"], int(item["type"]), 1 if _library_name_is_animation(item["title"], item["type"]) else 0, now))
+                    db.execute(
+                        "INSERT OR IGNORE INTO media_libraries (server_id, library_id, title, plex_type, auto_animation, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            server_id,
+                            int(item["key"]),
+                            item["title"],
+                            int(item["type"]),
+                            1 if _library_name_is_animation(item["title"], item["type"]) else 0,
+                            now,
+                        ),
+                    )
                 db.commit()
-                settings = {int(row["library_id"]): dict(row) for row in db.execute("SELECT * FROM media_libraries WHERE server_id = ?", (server_id,)).fetchall()}
-            libraries = [{**item, "animation_mode": settings.get(int(item["key"]), {}).get("animation_mode", "auto"),
-                          "auto_animation": bool(settings.get(int(item["key"]), {}).get("auto_animation", _library_name_is_animation(item["title"], item["type"]))),
-                          "is_animation": _library_is_animation(settings.get(int(item["key"]), {}).get("animation_mode", "auto"), item["title"], item["type"])} for item in upstream]
+                settings = {
+                    int(row["library_id"]): dict(row)
+                    for row in db.execute(
+                        "SELECT * FROM media_libraries WHERE server_id = ?", (server_id,)
+                    ).fetchall()
+                }
+            libraries = [
+                {
+                    **item,
+                    "animation_mode": settings.get(int(item["key"]), {}).get("animation_mode", "auto"),
+                    "auto_animation": bool(
+                        settings.get(int(item["key"]), {}).get(
+                            "auto_animation", _library_name_is_animation(item["title"], item["type"])
+                        )
+                    ),
+                    "is_animation": _library_is_animation(
+                        settings.get(int(item["key"]), {}).get("animation_mode", "auto"),
+                        item["title"],
+                        item["type"],
+                    ),
+                }
+                for item in upstream
+            ]
             return jsonify(libraries)
         except Exception as exc:
             return api_error(str(exc), "plex_library_failed", 400)
@@ -952,31 +1141,66 @@ def create_app() -> Flask:
             return api_error("自动重检开关必须是布尔值", "invalid_auto_recheck", 400)
         if mode not in {"auto", "animation", "normal"}:
             return api_error("动画媒体库模式无效", "invalid_animation_mode", 400)
-        allowed_sort_keys = {"name", "original_title", "year", "added_at", "release_date", "first_episode_date", "latest_added_at", "rating", "audience_rating", "duration", "season_count", "episode_count", "content_rating", "genre"}
+        allowed_sort_keys = {
+            "name",
+            "original_title",
+            "year",
+            "added_at",
+            "release_date",
+            "first_episode_date",
+            "latest_added_at",
+            "rating",
+            "audience_rating",
+            "duration",
+            "season_count",
+            "episode_count",
+            "content_rating",
+            "genre",
+        }
         if sort_key is not None and str(sort_key) not in allowed_sort_keys:
             return api_error("媒体库排序字段无效", "invalid_media_library_sort", 400)
         if sort_direction is not None and str(sort_direction) not in {"asc", "desc"}:
             return api_error("媒体库排序方向无效", "invalid_media_library_sort_direction", 400)
         with connect() as db:
-            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            library = db.execute(
+                "SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?",
+                (server_id, library_id),
+            ).fetchone()
             if library is None:
                 return api_error("媒体库尚未同步，请先从媒体服务器重新拉取", "library_cache_missing", 404)
             if "animation_mode" not in data:
                 mode = library["animation_mode"]
             assignments = ["animation_mode = ?", "updated_at = ?"]
-            values = [mode, utcnow()]
+            values: list[Any] = [mode, utcnow()]
             if sort_key is not None:
-                assignments.append("sort_key = ?"); values.append(str(sort_key))
+                assignments.append("sort_key = ?")
+                values.append(str(sort_key))
             if sort_direction is not None:
-                assignments.append("sort_direction = ?"); values.append(str(sort_direction))
+                assignments.append("sort_direction = ?")
+                values.append(str(sort_direction))
             if auto_recheck is not None:
                 if int(library["plex_type"]) != 2:
-                    return api_error("只有电视剧媒体库支持新增剧集自动重检", "invalid_auto_recheck_library", 400)
-                assignments.append("auto_recheck_new_episodes = ?"); values.append(1 if bool(auto_recheck) else 0)
+                    return api_error(
+                        "只有电视剧媒体库支持新增剧集自动重检", "invalid_auto_recheck_library", 400
+                    )
+                assignments.append("auto_recheck_new_episodes = ?")
+                values.append(1 if bool(auto_recheck) else 0)
             values.extend([server_id, library_id])
-            db.execute(f"UPDATE media_libraries SET {', '.join(assignments)} WHERE server_id = ? AND library_id = ?", values)
+            db.execute(
+                f"UPDATE media_libraries SET {', '.join(assignments)} WHERE server_id = ? AND library_id = ?",
+                values,
+            )
             db.commit()
-        return jsonify({"ok": True, "animation_mode": mode, "sort_key": sort_key, "sort_direction": sort_direction, "auto_recheck_new_episodes": bool(auto_recheck) if auto_recheck is not None else None, "is_animation": _library_is_animation(mode, library["title"], library["plex_type"])})
+        return jsonify(
+            {
+                "ok": True,
+                "animation_mode": mode,
+                "sort_key": sort_key,
+                "sort_direction": sort_direction,
+                "auto_recheck_new_episodes": bool(auto_recheck) if auto_recheck is not None else None,
+                "is_animation": _library_is_animation(mode, library["title"], library["plex_type"]),
+            }
+        )
 
     @servers_bp.put("/api/servers/<int:server_id>/media-library/order")
     @login_required
@@ -986,14 +1210,22 @@ def create_app() -> Flask:
         if not isinstance(order, list) or any(str(item).strip() == "" for item in order):
             return api_error("媒体库顺序无效", "invalid_media_library_order", 400)
         with connect() as db:
-            existing = {int(row["library_id"]) for row in db.execute("SELECT library_id FROM media_libraries WHERE server_id = ?", (server_id,)).fetchall()}
+            existing = {
+                int(row["library_id"])
+                for row in db.execute(
+                    "SELECT library_id FROM media_libraries WHERE server_id = ?", (server_id,)
+                ).fetchall()
+            }
             try:
                 requested = [int(item) for item in order]
             except (TypeError, ValueError):
                 return api_error("媒体库顺序无效", "invalid_media_library_order", 400)
             if set(requested) != existing or len(requested) != len(existing):
                 return api_error("媒体库顺序必须包含全部媒体库", "invalid_media_library_order", 400)
-            db.executemany("UPDATE media_libraries SET display_order = ?, updated_at = ? WHERE server_id = ? AND library_id = ?", [(index, utcnow(), server_id, library_id) for index, library_id in enumerate(requested)])
+            db.executemany(
+                "UPDATE media_libraries SET display_order = ?, updated_at = ? WHERE server_id = ? AND library_id = ?",
+                [(index, utcnow(), server_id, library_id) for index, library_id in enumerate(requested)],
+            )
             db.commit()
         return jsonify({"ok": True, "order": requested})
 
@@ -1001,9 +1233,7 @@ def create_app() -> Flask:
     @login_required
     def media_image(server_id: int):
         with connect() as db:
-            server = db.execute(
-                "SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)
-            ).fetchone()
+            server = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
         if server is None:
             return api_error("服务器不存在或已停用", "server_not_found", 404)
         try:
@@ -1029,45 +1259,95 @@ def create_app() -> Flask:
     @login_required
     def media_library(server_id: int):
         with connect() as db:
-            server = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+            server = db.execute(
+                "SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)
+            ).fetchone()
             if server is None:
                 return api_error("服务器不存在或已停用", "server_not_found", 404)
-            libraries = db.execute("""SELECT media_libraries.*, jobs.status AS job_status, jobs.stage AS job_stage,
+            libraries = db.execute(
+                """SELECT media_libraries.*, jobs.status AS job_status, jobs.stage AS job_stage,
                                       jobs.current_library AS job_current_library, jobs.processed AS job_processed,
                                       jobs.total AS job_total, jobs.error AS job_error
                                FROM media_libraries LEFT JOIN jobs ON jobs.id = media_libraries.sync_job_id
-                               WHERE media_libraries.server_id = ? ORDER BY media_libraries.display_order, media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
+                               WHERE media_libraries.server_id = ? ORDER BY media_libraries.display_order, media_libraries.title COLLATE NOCASE""",
+                (server_id,),
+            ).fetchall()
         if not libraries:
             try:
                 with connect() as db:
-                    server_row = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+                    server_row = db.execute(
+                        "SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)
+                    ).fetchone()
                 plex = PlexServer(server_config_from_row(server_row), tags=load_tags(), auto_login=True)
                 now = utcnow()
                 with connect() as db:
                     for key, plex_type, title in plex.list_library():
-                        db.execute("INSERT OR IGNORE INTO media_libraries (server_id, library_id, title, plex_type, auto_animation, updated_at) VALUES (?, ?, ?, ?, ?, ?)", (server_id, int(key), str(title), int(plex_type), 1 if _library_name_is_animation(title, plex_type) else 0, now))
+                        db.execute(
+                            "INSERT OR IGNORE INTO media_libraries (server_id, library_id, title, plex_type, auto_animation, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                server_id,
+                                int(key),
+                                str(title),
+                                int(plex_type),
+                                1 if _library_name_is_animation(title, plex_type) else 0,
+                                now,
+                            ),
+                        )
                     db.commit()
-                    libraries = db.execute("""SELECT media_libraries.*, jobs.status AS job_status, jobs.stage AS job_stage,
+                    libraries = db.execute(
+                        """SELECT media_libraries.*, jobs.status AS job_status, jobs.stage AS job_stage,
                                               jobs.current_library AS job_current_library, jobs.processed AS job_processed,
                                               jobs.total AS job_total, jobs.error AS job_error
                                        FROM media_libraries LEFT JOIN jobs ON jobs.id = media_libraries.sync_job_id
-                                       WHERE media_libraries.server_id = ? ORDER BY media_libraries.display_order, media_libraries.title COLLATE NOCASE""", (server_id,)).fetchall()
+                                       WHERE media_libraries.server_id = ? ORDER BY media_libraries.display_order, media_libraries.title COLLATE NOCASE""",
+                        (server_id,),
+                    ).fetchall()
             except Exception as exc:
                 return api_error(str(exc), "media_library_bootstrap_failed", 400)
         with connect() as db:
             output = []
             for library in libraries:
-                count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library["library_id"])).fetchone()["count"]
-                episode_count = db.execute("SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode'", (server_id, library["library_id"])).fetchone()["count"]
-                output.append({"id": int(library["library_id"]), "title": library["title"], "plex_type": int(library["plex_type"]),
-                               "kind": "movie" if int(library["plex_type"]) == 1 else "show" if int(library["plex_type"]) == 2 else "collection",
-                               "items": [], "item_count": int(count), "episode_count": int(episode_count), "animation_mode": library["animation_mode"], "sort_key": library["sort_key"], "sort_direction": library["sort_direction"], "auto_recheck_new_episodes": bool(library["auto_recheck_new_episodes"]),
-                               "display_order": int(library["display_order"] or 0), "auto_animation": bool(library["auto_animation"]), "is_animation": _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]),
-                               "plex_synced_at": library["plex_synced_at"], "tmdb_synced_at": library["tmdb_synced_at"],
-                               "sync_status": library["job_status"] or library["sync_status"], "sync_job_id": library["sync_job_id"],
-                               "sync_error": library["job_error"] or library["sync_error"], "sync_stage": library["job_stage"] or "",
-                               "sync_current_library": library["job_current_library"] or "", "sync_processed": int(library["job_processed"] or 0),
-                               "sync_total": int(library["job_total"] or 0)})
+                count = db.execute(
+                    "SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')",
+                    (server_id, library["library_id"]),
+                ).fetchone()["count"]
+                episode_count = db.execute(
+                    "SELECT COUNT(*) AS count FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode'",
+                    (server_id, library["library_id"]),
+                ).fetchone()["count"]
+                output.append(
+                    {
+                        "id": int(library["library_id"]),
+                        "title": library["title"],
+                        "plex_type": int(library["plex_type"]),
+                        "kind": "movie"
+                        if int(library["plex_type"]) == 1
+                        else "show"
+                        if int(library["plex_type"]) == 2
+                        else "collection",
+                        "items": [],
+                        "item_count": int(count),
+                        "episode_count": int(episode_count),
+                        "animation_mode": library["animation_mode"],
+                        "sort_key": library["sort_key"],
+                        "sort_direction": library["sort_direction"],
+                        "auto_recheck_new_episodes": bool(library["auto_recheck_new_episodes"]),
+                        "display_order": int(library["display_order"] or 0),
+                        "auto_animation": bool(library["auto_animation"]),
+                        "is_animation": _library_is_animation(
+                            library["animation_mode"], library["title"], library["plex_type"]
+                        ),
+                        "plex_synced_at": library["plex_synced_at"],
+                        "tmdb_synced_at": library["tmdb_synced_at"],
+                        "sync_status": library["job_status"] or library["sync_status"],
+                        "sync_job_id": library["sync_job_id"],
+                        "sync_error": library["job_error"] or library["sync_error"],
+                        "sync_stage": library["job_stage"] or "",
+                        "sync_current_library": library["job_current_library"] or "",
+                        "sync_processed": int(library["job_processed"] or 0),
+                        "sync_total": int(library["job_total"] or 0),
+                    }
+                )
         return jsonify({"server_id": server_id, "libraries": output, "generated_at": utcnow()})
 
     @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/items")
@@ -1080,17 +1360,37 @@ def create_app() -> Flask:
             return api_error("分页参数无效", "invalid_media_library_pagination", 400)
         sort = str(request.args.get("sort") or "name")
         direction = str(request.args.get("direction") or "asc").lower()
-        allowed_sort = {"name", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "season_count", "episode_count", "content_rating", "genre"}
+        allowed_sort = {
+            "name",
+            "original_title",
+            "year",
+            "added_at",
+            "release_date",
+            "rating",
+            "audience_rating",
+            "duration",
+            "season_count",
+            "episode_count",
+            "content_rating",
+            "genre",
+        }
         if sort not in allowed_sort:
             return api_error("媒体库排序字段无效", "invalid_media_library_sort", 400)
         if direction not in {"asc", "desc"}:
             return api_error("媒体库排序方向无效", "invalid_media_library_sort_direction", 400)
         with connect() as db:
-            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            library = db.execute(
+                "SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?",
+                (server_id, library_id),
+            ).fetchone()
             if library is None:
                 return api_error("媒体库缓存不存在，请先同步", "library_cache_missing", 404)
-            rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')", (server_id, library_id)).fetchall()
-            counts = db.execute("""
+            rows = db.execute(
+                "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND parent_rating_key = '' AND plex_type IN ('movie','show','collection')",
+                (server_id, library_id),
+            ).fetchall()
+            counts = db.execute(
+                """
                 SELECT parent_rating_key,
                        COUNT(DISTINCT CASE WHEN plex_type = 'season' THEN season_number END) AS season_count,
                        COUNT(CASE WHEN plex_type = 'episode' THEN 1 END) AS episode_count,
@@ -1098,17 +1398,43 @@ def create_app() -> Flask:
                 FROM media_library_items
                 WHERE server_id = ? AND library_id = ? AND parent_rating_key <> ''
                 GROUP BY parent_rating_key
-            """, (server_id, library_id)).fetchall()
+            """,
+                (server_id, library_id),
+            ).fetchall()
             counts_by_parent = {str(row["parent_rating_key"]): dict(row) for row in counts}
             items = []
             seen_tmdb: set[tuple[str, int]] = set()
-            real_signatures = {("movie" if row["plex_type"] == "movie" else "tv", int(row["year"] or 0), _title_key(row["title"])) for row in rows if not row["system_managed"] and row["plex_type"] in {"movie", "show"} and _title_key(row["title"])}
+            real_signatures = {
+                (
+                    "movie" if row["plex_type"] == "movie" else "tv",
+                    int(row["year"] or 0),
+                    _title_key(row["title"]),
+                )
+                for row in rows
+                if not row["system_managed"]
+                and row["plex_type"] in {"movie", "show"}
+                and _title_key(row["title"])
+            }
             for row in rows:
                 item = dict(row)
-                tmdb_key = (str(item.get("tmdb_media_type") or item.get("plex_type") or ""), int(item.get("tmdb_id") or 0))
-                if item.get("system_managed") and tmdb_key[1] and db.execute("SELECT 1 FROM media_library_items WHERE server_id=? AND library_id=? AND tmdb_media_type=? AND tmdb_id=? AND system_managed=0 LIMIT 1", (server_id, library_id, tmdb_key[0], tmdb_key[1])).fetchone():
+                tmdb_key = (
+                    str(item.get("tmdb_media_type") or item.get("plex_type") or ""),
+                    int(item.get("tmdb_id") or 0),
+                )
+                if (
+                    item.get("system_managed")
+                    and tmdb_key[1]
+                    and db.execute(
+                        "SELECT 1 FROM media_library_items WHERE server_id=? AND library_id=? AND tmdb_media_type=? AND tmdb_id=? AND system_managed=0 LIMIT 1",
+                        (server_id, library_id, tmdb_key[0], tmdb_key[1]),
+                    ).fetchone()
+                ):
                     continue
-                signature = ("movie" if row["plex_type"] == "movie" else "tv", int(row["year"] or 0), _title_key(row["title"]))
+                signature = (
+                    "movie" if row["plex_type"] == "movie" else "tv",
+                    int(row["year"] or 0),
+                    _title_key(row["title"]),
+                )
                 if item.get("system_managed") and signature in real_signatures:
                     continue
                 if tmdb_key[1] and tmdb_key in seen_tmdb:
@@ -1119,7 +1445,14 @@ def create_app() -> Flask:
                 item["external_ids"] = raw.get("external_ids") or extract_external_ids(raw)
                 item["poster_url"] = raw.get("poster_url") or ""
                 item["library_id"] = library_id
-                item["show_kind"] = item.get("animation_kind") or ("动画" if library["plex_type"] == 2 and _library_is_animation(library["animation_mode"], library["title"], library["plex_type"]) else "真人")
+                item["show_kind"] = item.get("animation_kind") or (
+                    "动画"
+                    if library["plex_type"] == 2
+                    and _library_is_animation(
+                        library["animation_mode"], library["title"], library["plex_type"]
+                    )
+                    else "真人"
+                )
                 item["system_genres"] = decode_json(item.get("system_genres"), [])
                 aggregate = counts_by_parent.get(str(row["rating_key"]), {})
                 item["season_count"] = int(aggregate.get("season_count") or 0)
@@ -1128,8 +1461,18 @@ def create_app() -> Flask:
                 items.append(item)
             items = _sort_items(items, sort, direction)
             total = len(items)
-            page = items[offset:offset + limit]
-        return jsonify({"server_id": server_id, "library_id": library_id, "items": page, "total": total, "offset": offset, "limit": limit, "has_more": offset + len(page) < total})
+            page = items[offset : offset + limit]
+        return jsonify(
+            {
+                "server_id": server_id,
+                "library_id": library_id,
+                "items": page,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "has_more": offset + len(page) < total,
+            }
+        )
 
     @servers_bp.get("/api/servers/<int:server_id>/media-library/search")
     @login_required
@@ -1156,14 +1499,22 @@ def create_app() -> Flask:
         with connect() as db:
             if db.execute("SELECT 1 FROM servers WHERE id=? AND enabled=1", (server_id,)).fetchone() is None:
                 return api_error("服务器不存在或已停用", "server_not_found", 404)
-            libraries = {int(row["library_id"]): row for row in db.execute("SELECT * FROM media_libraries WHERE server_id=?", (server_id,)).fetchall()}
-            rows = db.execute("SELECT * FROM media_library_items WHERE server_id=? AND parent_rating_key='' AND plex_type IN ('movie','show') ORDER BY title COLLATE NOCASE", (server_id,)).fetchall()
-        local = {}
+            libraries = {
+                int(row["library_id"]): row
+                for row in db.execute(
+                    "SELECT * FROM media_libraries WHERE server_id=?", (server_id,)
+                ).fetchall()
+            }
+            rows = db.execute(
+                "SELECT * FROM media_library_items WHERE server_id=? AND parent_rating_key='' AND plex_type IN ('movie','show') ORDER BY title COLLATE NOCASE",
+                (server_id,),
+            ).fetchall()
+        local: dict[tuple[str, int | str], dict[str, Any]] = {}
         # Keep an index of every local TMDB-backed item even when its cached
         # title does not match the text query. System-maintained rows can have
         # stale/garbled localized title columns; the stable TMDB identity must
         # still allow them to merge with the TMDB search result.
-        local_tmdb_index = {}
+        local_tmdb_index: dict[tuple[str, int], dict[str, Any]] = {}
         needle = query.casefold()
         for row in rows:
             kind = str(row["tmdb_media_type"] or ("movie" if row["plex_type"] == "movie" else "tv"))
@@ -1181,7 +1532,8 @@ def create_app() -> Flask:
             # Prefer the cached TMDB payload for display and matching so the
             # item remains searchable even when the remote TMDB request is
             # unavailable or no longer returns the same search hit.
-            cached_tmdb = raw.get("tmdb") if isinstance(raw.get("tmdb"), dict) else raw
+            tmdb_payload = raw.get("tmdb")
+            cached_tmdb = tmdb_payload if isinstance(tmdb_payload, dict) else raw
             cached_title = str(cached_tmdb.get("title") or cached_tmdb.get("name") or "")
             cached_original = str(cached_tmdb.get("original_title") or cached_tmdb.get("original_name") or "")
             title = str(row["title"] or "")
@@ -1194,23 +1546,91 @@ def create_app() -> Flask:
                 local_key = (kind, tmdb_id)
                 indexed = local_tmdb_index.get(local_key)
                 if indexed is None or (indexed.get("system_managed") and not int(row["system_managed"] or 0)):
-                    indexed = {"source": "local", "media_type": kind, "tmdb_id": tmdb_id or None, "imdb_id": imdb_id, "tvdb_id": tvdb_id, "title": title, "original_title": original_title, "year": row["year"], "thumb": row["thumb"] or "", "poster_url": raw.get("poster_url") or "", "genres": decode_json(row["system_genres"], []) or [x.strip() for x in str(row["genre"] or "").split(",") if x.strip()], "library_ids": [], "library_titles": [], "locations": [], "source_labels": [], "library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "system_managed": bool(row["system_managed"]), "plex_present": not bool(row["system_managed"]), "resolution": row["resolution"] or "", "can_add": False, "duplicate_reason": "已存在于媒体库", "_real": not bool(row["system_managed"])}
+                    indexed = {
+                        "source": "local",
+                        "media_type": kind,
+                        "tmdb_id": tmdb_id or None,
+                        "imdb_id": imdb_id,
+                        "tvdb_id": tvdb_id,
+                        "title": title,
+                        "original_title": original_title,
+                        "year": row["year"],
+                        "thumb": row["thumb"] or "",
+                        "poster_url": raw.get("poster_url") or "",
+                        "genres": decode_json(row["system_genres"], [])
+                        or [x.strip() for x in str(row["genre"] or "").split(",") if x.strip()],
+                        "library_ids": [],
+                        "library_titles": [],
+                        "locations": [],
+                        "source_labels": [],
+                        "library_id": int(row["library_id"]),
+                        "rating_key": str(row["rating_key"]),
+                        "system_managed": bool(row["system_managed"]),
+                        "plex_present": not bool(row["system_managed"]),
+                        "resolution": row["resolution"] or "",
+                        "can_add": False,
+                        "duplicate_reason": "已存在于媒体库",
+                        "_real": not bool(row["system_managed"]),
+                    }
                     local_tmdb_index[local_key] = indexed
                 indexed["library_ids"].append(int(row["library_id"]))
-                indexed["locations"].append({"library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "media_type": kind})
+                indexed["locations"].append(
+                    {
+                        "library_id": int(row["library_id"]),
+                        "rating_key": str(row["rating_key"]),
+                        "media_type": kind,
+                    }
+                )
                 library_row = libraries.get(int(row["library_id"]))
-                indexed["library_titles"].append(str(library_row["title"] if library_row else row["library_id"]))
-                indexed["source_labels"].append("本系统" if bool(row["system_managed"]) else f"媒体服务器：{title}")
-            haystack = " ".join([title, original_title, cached_title, cached_original, str(tmdb_id), imdb_id, tvdb_id]) .casefold()
+                indexed["library_titles"].append(
+                    str(library_row["title"] if library_row else row["library_id"])
+                )
+                indexed["source_labels"].append(
+                    "本系统" if bool(row["system_managed"]) else f"媒体服务器：{title}"
+                )
+            haystack = " ".join(
+                [title, original_title, cached_title, cached_original, str(tmdb_id), imdb_id, tvdb_id]
+            ).casefold()
             if needle and needle not in haystack:
                 continue
             key = (kind, tmdb_id) if tmdb_id else (kind, f"local:{row['rating_key']}")
             item = local.get(key)
             if item is None or (item.get("system_managed") and not int(row["system_managed"] or 0)):
-                item = {"source": "local", "media_type": kind, "tmdb_id": tmdb_id or None, "imdb_id": imdb_id, "tvdb_id": tvdb_id, "title": title, "original_title": original_title, "year": row["year"], "thumb": row["thumb"] or "", "poster_url": raw.get("poster_url") or "", "genres": decode_json(row["system_genres"], []) or [x.strip() for x in str(row["genre"] or "").split(",") if x.strip()], "library_ids": [], "library_titles": [], "locations": [], "source_labels": [], "library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "system_managed": bool(row["system_managed"]), "plex_present": not bool(row["system_managed"]), "resolution": row["resolution"] or "", "can_add": False, "duplicate_reason": "已存在于媒体库", "_real": not bool(row["system_managed"])}
+                item = {
+                    "source": "local",
+                    "media_type": kind,
+                    "tmdb_id": tmdb_id or None,
+                    "imdb_id": imdb_id,
+                    "tvdb_id": tvdb_id,
+                    "title": title,
+                    "original_title": original_title,
+                    "year": row["year"],
+                    "thumb": row["thumb"] or "",
+                    "poster_url": raw.get("poster_url") or "",
+                    "genres": decode_json(row["system_genres"], [])
+                    or [x.strip() for x in str(row["genre"] or "").split(",") if x.strip()],
+                    "library_ids": [],
+                    "library_titles": [],
+                    "locations": [],
+                    "source_labels": [],
+                    "library_id": int(row["library_id"]),
+                    "rating_key": str(row["rating_key"]),
+                    "system_managed": bool(row["system_managed"]),
+                    "plex_present": not bool(row["system_managed"]),
+                    "resolution": row["resolution"] or "",
+                    "can_add": False,
+                    "duplicate_reason": "已存在于媒体库",
+                    "_real": not bool(row["system_managed"]),
+                }
                 local[key] = item
             item["library_ids"].append(int(row["library_id"]))
-            item["locations"].append({"library_id": int(row["library_id"]), "rating_key": str(row["rating_key"]), "media_type": kind})
+            item["locations"].append(
+                {
+                    "library_id": int(row["library_id"]),
+                    "rating_key": str(row["rating_key"]),
+                    "media_type": kind,
+                }
+            )
             library_row = libraries.get(int(row["library_id"]))
             item["library_titles"].append(str(library_row["title"] if library_row else row["library_id"]))
             item["source_labels"].append("本系统" if bool(row["system_managed"]) else f"媒体服务器：{title}")
@@ -1218,20 +1638,34 @@ def create_app() -> Flask:
         # does not return them. This is essential for system-maintained items:
         # adding them must be observable from the local database alone.
         for key, indexed in local_tmdb_index.items():
-            haystack = " ".join([str(indexed.get("title") or ""), str(indexed.get("original_title") or ""), str(indexed.get("tmdb_id") or "")]).casefold()
+            haystack = " ".join(
+                [
+                    str(indexed.get("title") or ""),
+                    str(indexed.get("original_title") or ""),
+                    str(indexed.get("tmdb_id") or ""),
+                ]
+            ).casefold()
             if (not needle or needle in haystack) and key not in local:
                 local[key] = indexed
         for item in local.values():
             item["library_ids"] = list(dict.fromkeys(item.get("library_ids") or []))
             item["library_titles"] = list(dict.fromkeys(item.get("library_titles") or []))
             item["source_labels"] = list(dict.fromkeys(item.get("source_labels") or []))
-            seen_locations = set()
-            item["locations"] = [loc for loc in item.get("locations") or [] if not ((loc_key := (loc.get("library_id"), loc.get("rating_key"))) in seen_locations or seen_locations.add(loc_key))]
+            seen_locations: set[tuple[Any, Any]] = set()
+            unique_locations = []
+            for loc in item.get("locations") or []:
+                loc_key = (loc.get("library_id"), loc.get("rating_key"))
+                if loc_key not in seen_locations:
+                    seen_locations.add(loc_key)
+                    unique_locations.append(loc)
+            item["locations"] = unique_locations
         tmdb_items = {}
         # The local TMDB catalog is a separate source from both Plex and live
         # TMDB requests. Include it in the same identity merge.
         with connect() as db:
-            catalog_rows = db.execute("SELECT * FROM tmdb_items WHERE media_type IN ('movie','tv') ORDER BY release_date DESC, id DESC").fetchall()
+            catalog_rows = db.execute(
+                "SELECT * FROM tmdb_items WHERE media_type IN ('movie','tv') ORDER BY release_date DESC, id DESC"
+            ).fetchall()
         for row in catalog_rows:
             release = str(row["release_date"] or "")
             catalog_year = int(release[:4]) if release[:4].isdigit() else None
@@ -1243,23 +1677,81 @@ def create_app() -> Flask:
             catalog_ids = catalog_raw.get("external_ids") or {}
             catalog_imdb = str(row["imdb_id"] or catalog_ids.get("imdb") or catalog_ids.get("imdb_id") or "")
             catalog_tvdb = str(row["tvdb_id"] or catalog_ids.get("tvdb") or catalog_ids.get("tvdb_id") or "")
-            haystack = " ".join([str(row["title"] or ""), str(row["original_title"] or ""), str(row["tmdb_id"]), catalog_imdb, catalog_tvdb]).casefold()
+            haystack = " ".join(
+                [
+                    str(row["title"] or ""),
+                    str(row["original_title"] or ""),
+                    str(row["tmdb_id"]),
+                    catalog_imdb,
+                    catalog_tvdb,
+                ]
+            ).casefold()
             if needle and needle not in haystack:
                 continue
             key = (str(row["media_type"]), int(row["tmdb_id"]))
             genres = decode_json(row["genres"], [])
             if genres and isinstance(genres[0], dict):
                 genres = [str(g.get("name") or g.get("id") or "") for g in genres]
-            tmdb_items[key] = {"source": "catalog", "media_type": str(row["media_type"]), "tmdb_id": int(row["tmdb_id"]), "imdb_id": catalog_imdb, "tvdb_id": catalog_tvdb, "title": row["title"], "original_title": row["original_title"], "year": catalog_year, "poster_url": f"https://image.tmdb.org/t/p/w342{row['poster_path']}" if row["poster_path"] else "", "genres": genres, "library_ids": [], "library_titles": [], "source_labels": ["本系统"], "system_managed": False, "plex_present": False, "resolution": "", "can_add": False, "duplicate_reason": "本系统资料库"}
+            tmdb_items[key] = {
+                "source": "catalog",
+                "media_type": str(row["media_type"]),
+                "tmdb_id": int(row["tmdb_id"]),
+                "imdb_id": catalog_imdb,
+                "tvdb_id": catalog_tvdb,
+                "title": row["title"],
+                "original_title": row["original_title"],
+                "year": catalog_year,
+                "poster_url": f"https://image.tmdb.org/t/p/w342{row['poster_path']}"
+                if row["poster_path"]
+                else "",
+                "genres": genres,
+                "library_ids": [],
+                "library_titles": [],
+                "source_labels": ["本系统"],
+                "system_managed": False,
+                "plex_present": False,
+                "resolution": "",
+                "can_add": False,
+                "duplicate_reason": "本系统资料库",
+            }
         for key, item in list(tmdb_items.items()):
             local_item = local.get(key) or local_tmdb_index.get(key)
             if local_item is None:
-                local_item = next((candidate for candidate in local.values() if candidate.get("media_type") == item.get("media_type") and int(candidate.get("year") or 0) == int(item.get("year") or 0) and (_title_key(candidate.get("title")) == _title_key(item.get("title")) or _title_key(candidate.get("original_title")) == _title_key(item.get("original_title")))), None)
+                local_item = next(
+                    (
+                        candidate
+                        for candidate in local.values()
+                        if candidate.get("media_type") == item.get("media_type")
+                        and int(candidate.get("year") or 0) == int(item.get("year") or 0)
+                        and (
+                            _title_key(candidate.get("title")) == _title_key(item.get("title"))
+                            or _title_key(candidate.get("original_title"))
+                            == _title_key(item.get("original_title"))
+                        )
+                    ),
+                    None,
+                )
             if local_item:
                 local[key] = local_item
                 if not local_item.get("_real"):
-                    local_item.update({field: item[field] for field in ("title", "original_title", "year", "poster_url", "genres", "imdb_id", "tvdb_id") if field in item and item[field]})
-                local_item["source_labels"] = list(dict.fromkeys((local_item.get("source_labels") or []) + ["本系统"]))
+                    local_item.update(
+                        {
+                            field: item[field]
+                            for field in (
+                                "title",
+                                "original_title",
+                                "year",
+                                "poster_url",
+                                "genres",
+                                "imdb_id",
+                                "tvdb_id",
+                            )
+                            if field in item and item[field]
+                        }
+                    )
+                local_item["source_labels"] = list(
+                    dict.fromkeys((local_item.get("source_labels") or []) + ["本系统"])
+                )
                 local_item["source"] = "merged"
                 local_item["can_add"] = False
                 tmdb_items.pop(key, None)
@@ -1271,23 +1763,35 @@ def create_app() -> Flask:
                     tmdb = TMDBClient(token)
                     parsed = None
                     if query:
-                        try: parsed = parse_line(query)
-                        except ValueError: parsed = None
+                        try:
+                            parsed = parse_line(query)
+                        except ValueError:
+                            parsed = None
                     for kind in wanted_types:
-                        results = []
+                        results: list[dict[str, Any]] = []
                         if query.lower().startswith("tt") or query.lower().startswith("tvdb:"):
                             try:
                                 external_value = query.split(":", 1)[1] if ":" in query else query
                                 external_data = tmdb.find_by_external_id(external_value)
-                                results = (external_data.get("movie_results") or []) if kind == "movie" else (external_data.get("tv_results") or [])
+                                results = (
+                                    (external_data.get("movie_results") or [])
+                                    if kind == "movie"
+                                    else (external_data.get("tv_results") or [])
+                                )
                             except Exception:
                                 results = []
                         elif parsed and parsed.get("kind") in {"id", "url"}:
                             if parsed.get("media_type") in {"", kind}:
-                                try: results = [tmdb.details(kind, int(parsed["id"]))]
-                                except Exception: results = []
+                                try:
+                                    results = [tmdb.details(kind, int(parsed["id"]))]
+                                except Exception:
+                                    results = []
                         elif query:
-                            results = tmdb.search_movie(query, year) if kind == "movie" else tmdb.search_tv(query, year)
+                            results = (
+                                tmdb.search_movie(query, year)
+                                if kind == "movie"
+                                else tmdb.search_tv(query, year)
+                            )
                         else:
                             data = tmdb.discover(kind, year=year, sort_by="popularity.desc")
                             results = data.get("results") or []
@@ -1295,14 +1799,39 @@ def create_app() -> Flask:
                             item = _summary(kind, payload)
                             if not item.get("genres") and payload.get("id"):
                                 try:
-                                    item = _summary(kind, {**payload, **tmdb.details(kind, int(payload["id"]))})
+                                    item = _summary(
+                                        kind, {**payload, **tmdb.details(kind, int(payload["id"]))}
+                                    )
                                 except Exception:
                                     pass
                             if year is not None and item.get("year") != year:
                                 continue
                             key = (kind, int(item["tmdb_id"]))
                             previous = tmdb_items.get(key)
-                            tmdb_items[key] = {"source": "tmdb", "media_type": kind, "tmdb_id": int(item["tmdb_id"]), "imdb_id": item.get("imdb_id") or "", "tvdb_id": item.get("tvdb_id") or "", "title": item["title"], "original_title": item["original_title"], "year": item["year"], "poster_url": f"https://image.tmdb.org/t/p/w342{item['poster_path']}" if item.get("poster_path") else "", "genres": item.get("genres") or [], "library_ids": [], "library_titles": [], "source_labels": list(dict.fromkeys((previous or {}).get("source_labels", []) + ["TMDB"])), "system_managed": False, "plex_present": False, "resolution": "", "can_add": True, "duplicate_reason": ""}
+                            tmdb_items[key] = {
+                                "source": "tmdb",
+                                "media_type": kind,
+                                "tmdb_id": int(item["tmdb_id"]),
+                                "imdb_id": item.get("imdb_id") or "",
+                                "tvdb_id": item.get("tvdb_id") or "",
+                                "title": item["title"],
+                                "original_title": item["original_title"],
+                                "year": item["year"],
+                                "poster_url": f"https://image.tmdb.org/t/p/w342{item['poster_path']}"
+                                if item.get("poster_path")
+                                else "",
+                                "genres": item.get("genres") or [],
+                                "library_ids": [],
+                                "library_titles": [],
+                                "source_labels": list(
+                                    dict.fromkeys((previous or {}).get("source_labels", []) + ["TMDB"])
+                                ),
+                                "system_managed": False,
+                                "plex_present": False,
+                                "resolution": "",
+                                "can_add": True,
+                                "duplicate_reason": "",
+                            }
                 for key, item in tmdb_items.items():
                     local_item = local.get(key) or local_tmdb_index.get(key)
                     if local_item:
@@ -1312,24 +1841,51 @@ def create_app() -> Flask:
                         # year, poster and genres while attaching local
                         # library/resource state.
                         if not local_item.get("_real"):
-                            local_item.update({field: item[field] for field in ("title", "original_title", "year", "poster_url", "genres") if field in item})
-                        local_item["source_labels"] = list(dict.fromkeys((local_item.get("source_labels") or []) + ["TMDB" if item.get("source") == "tmdb" else "本系统"]))
-                        local_item["source"] = "merged"; local_item["can_add"] = False; local_item["duplicate_reason"] = "已存在于媒体库"
-                        local_item["source_labels"] = list(dict.fromkeys(local_item.get("source_labels") or []))
+                            local_item.update(
+                                {
+                                    field: item[field]
+                                    for field in ("title", "original_title", "year", "poster_url", "genres")
+                                    if field in item
+                                }
+                            )
+                        local_item["source_labels"] = list(
+                            dict.fromkeys(
+                                (local_item.get("source_labels") or [])
+                                + ["TMDB" if item.get("source") == "tmdb" else "本系统"]
+                            )
+                        )
+                        local_item["source"] = "merged"
+                        local_item["can_add"] = False
+                        local_item["duplicate_reason"] = "已存在于媒体库"
+                        local_item["source_labels"] = list(
+                            dict.fromkeys(local_item.get("source_labels") or [])
+                        )
                 for key, item in tmdb_items.items():
                     if key not in local:
                         item["can_add"] = item.get("source") == "tmdb"
             except Exception as exc:
                 warning = str(exc)
         merged = list(local.values()) + [item for key, item in tmdb_items.items() if key not in local]
-        return jsonify({"query": {"q": query, "media_type": media_type, "year": year}, "local_count": len(local), "tmdb_count": len(tmdb_items), "results": merged[:limit * len(wanted_types)], "warning": warning})
+        return jsonify(
+            {
+                "query": {"q": query, "media_type": media_type, "year": year},
+                "local_count": len(local),
+                "tmdb_count": len(tmdb_items),
+                "results": merged[: limit * len(wanted_types)],
+                "warning": warning,
+            }
+        )
 
     @servers_bp.post("/api/servers/<int:server_id>/media-library/search/add")
     @login_required
     def add_media_search_result(server_id: int):
         data = request.get_json(force=True) or {}
         try:
-            media_type, tmdb_id, library_id = str(data.get("media_type") or ""), int(data.get("tmdb_id") or 0), int(data.get("library_id") or 0)
+            media_type, tmdb_id, library_id = (
+                str(data.get("media_type") or ""),
+                int(data.get("tmdb_id") or 0),
+                int(data.get("library_id") or 0),
+            )
         except (TypeError, ValueError):
             return api_error("添加参数无效", "invalid_media_search_add", 400)
         if media_type not in {"movie", "tv"} or tmdb_id <= 0 or library_id <= 0:
@@ -1337,22 +1893,34 @@ def create_app() -> Flask:
         with connect() as db:
             if db.execute("SELECT 1 FROM servers WHERE id=? AND enabled=1", (server_id,)).fetchone() is None:
                 return api_error("服务器不存在或已停用", "server_not_found", 404)
-            lib = db.execute("SELECT plex_type FROM media_libraries WHERE server_id=? AND library_id=?", (server_id, library_id)).fetchone()
+            lib = db.execute(
+                "SELECT plex_type FROM media_libraries WHERE server_id=? AND library_id=?",
+                (server_id, library_id),
+            ).fetchone()
             if lib is None or int(lib["plex_type"]) != (1 if media_type == "movie" else 2):
                 return api_error("目标媒体库类型不匹配", "invalid_target_library", 400)
         # Keep the server id in the payload as well as on the job row. The
         # worker uses the payload when it writes the system-maintained item;
         # omitting it made every search-add task fail before doing any work.
-        job_id = manager.create_job("media_library_search_add", server_id, {"server_id": server_id, "media_type": media_type, "tmdb_id": tmdb_id, "library_id": library_id})
+        job_id = manager.create_job(
+            "media_library_search_add",
+            server_id,
+            {"server_id": server_id, "media_type": media_type, "tmdb_id": tmdb_id, "library_id": library_id},
+        )
         return jsonify({"job_id": job_id})
 
     @servers_bp.post("/api/servers/<int:server_id>/media-library/<int:library_id>/refresh")
     @login_required
     def refresh_media_library(server_id: int, library_id: int):
         try:
-            job_id = manager.create_job("media_library_full_refresh", server_id, {"server_id": server_id, "library_id": library_id})
+            job_id = manager.create_job(
+                "media_library_full_refresh", server_id, {"server_id": server_id, "library_id": library_id}
+            )
             with connect() as db:
-                db.execute("UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?", (job_id, utcnow(), server_id, library_id))
+                db.execute(
+                    "UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?",
+                    (job_id, utcnow(), server_id, library_id),
+                )
                 db.commit()
             return jsonify({"id": job_id, "workflow": "plex_then_tmdb"})
         except (TypeError, ValueError) as exc:
@@ -1364,9 +1932,14 @@ def create_app() -> Flask:
         try:
             # Keep the legacy endpoint compatible with older clients while
             # applying the same Plex-first, TMDB-second workflow.
-            job_id = manager.create_job("media_library_full_refresh", server_id, {"server_id": server_id, "library_id": library_id})
+            job_id = manager.create_job(
+                "media_library_full_refresh", server_id, {"server_id": server_id, "library_id": library_id}
+            )
             with connect() as db:
-                db.execute("UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?", (job_id, utcnow(), server_id, library_id))
+                db.execute(
+                    "UPDATE media_libraries SET sync_job_id = ?, sync_status = 'queued', sync_error = '', updated_at = ? WHERE server_id = ? AND library_id = ?",
+                    (job_id, utcnow(), server_id, library_id),
+                )
                 db.commit()
             return jsonify({"id": job_id, "workflow": "plex_then_tmdb"})
         except (TypeError, ValueError) as exc:
@@ -1382,7 +1955,9 @@ def create_app() -> Flask:
             return api_error("缺少媒体库或剧集标识", "invalid_media_recheck", 400)
         try:
             with connect() as db:
-                server = db.execute("SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+                server = db.execute(
+                    "SELECT * FROM servers WHERE id = ? AND enabled = 1", (server_id,)
+                ).fetchone()
             if server is None:
                 return api_error("服务器不存在或已停用", "server_not_found", 404)
             resolved_rating_key = resolve_plex_rating_key(DB_FILE, server_id, library_id, rating_key)
@@ -1390,11 +1965,18 @@ def create_app() -> Flask:
             metadata = plex.get_metadata(resolved_rating_key)
             if str(metadata.get("type") or "") != "show":
                 return api_error("只支持重新检查剧集", "invalid_media_recheck_type", 400)
-            sync_media_library_full(db_file=DB_FILE, server_id=server_id, library_id=library_id,
-                                    rating_keys={resolved_rating_key})
+            sync_media_library_full(
+                db_file=DB_FILE, server_id=server_id, library_id=library_id, rating_keys={resolved_rating_key}
+            )
             with connect() as db:
-                library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
-                row = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, resolved_rating_key)).fetchone()
+                library = db.execute(
+                    "SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?",
+                    (server_id, library_id),
+                ).fetchone()
+                row = db.execute(
+                    "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?",
+                    (server_id, library_id, resolved_rating_key),
+                ).fetchone()
                 if row is None:
                     return api_error("重新检查后未找到真实剧集缓存", "media_item_not_found", 404)
                 return jsonify(_cached_show_payload(db, server_id, library_id, row, library))
@@ -1405,12 +1987,24 @@ def create_app() -> Flask:
     @login_required
     def media_library_quarter_index(server_id: int, library_id: int):
         with connect() as db:
-            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
+            library = db.execute(
+                "SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?",
+                (server_id, library_id),
+            ).fetchone()
             if library is None or int(library["plex_type"]) != 2:
                 return api_error("电视剧库缓存不存在", "library_not_found", 404)
-            shows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'show' ORDER BY title COLLATE NOCASE", (server_id, library_id)).fetchall()
-            season_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'season' ORDER BY parent_rating_key, season_number, id", (server_id, library_id)).fetchall()
-            episode_rows = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode' ORDER BY parent_rating_key, season_number, episode_number", (server_id, library_id)).fetchall()
+            shows = db.execute(
+                "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'show' ORDER BY title COLLATE NOCASE",
+                (server_id, library_id),
+            ).fetchall()
+            season_rows = db.execute(
+                "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'season' ORDER BY parent_rating_key, season_number, id",
+                (server_id, library_id),
+            ).fetchall()
+            episode_rows = db.execute(
+                "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND plex_type = 'episode' ORDER BY parent_rating_key, season_number, episode_number",
+                (server_id, library_id),
+            ).fetchall()
             seasons_by_show: dict[str, dict[int, Any]] = {}
             episodes_by_season: dict[tuple[str, int], dict[int, Any]] = {}
             for row in season_rows:
@@ -1420,46 +2014,78 @@ def create_app() -> Flask:
                 seasons[season_number] = _prefer_cached_child(seasons.get(season_number), row)
             for row in episode_rows:
                 key = (str(row["parent_rating_key"]), int(row["season_number"] or 0))
-                episodes = episodes_by_season.setdefault(key, {})
+                indexed_episodes = episodes_by_season.setdefault(key, {})
                 episode_number = int(row["episode_number"] or 0)
-                episodes[episode_number] = _prefer_cached_child(episodes.get(episode_number), row)
+                indexed_episodes[episode_number] = _prefer_cached_child(indexed_episodes.get(episode_number), row)
             entries, live_items = [], []
-            is_animation_library = _library_is_animation(library["animation_mode"], library["title"], library["plex_type"])
+            is_animation_library = _library_is_animation(
+                library["animation_mode"], library["title"], library["plex_type"]
+            )
             for show in shows:
                 show_seasons = list(seasons_by_show.get(str(show["rating_key"]), {}).values())
                 season_count = len({int(row["season_number"] or 0) for row in show_seasons})
-                episode_count = sum(len(episodes_by_season.get((str(show["rating_key"]), int(row["season_number"] or 0)), [])) for row in show_seasons)
+                episode_count = sum(
+                    len(episodes_by_season.get((str(show["rating_key"]), int(row["season_number"] or 0)), {}))
+                    for row in show_seasons
+                )
                 summary = _cached_show_summary(show, library_id, library, season_count, episode_count)
                 if is_animation_library:
                     for season_row in show_seasons:
                         season_number = int(season_row["season_number"] or 0)
-                        episodes = list(episodes_by_season.get((str(show["rating_key"]), season_number), {}).values())
-                        dates = [str(episode["release_date"] or "")[:10] for episode in episodes if episode["release_date"]]
+                        episodes = list(
+                            episodes_by_season.get((str(show["rating_key"]), season_number), {}).values()
+                        )
+                        dates = [
+                            str(episode["release_date"] or "")[:10]
+                            for episode in episodes
+                            if episode["release_date"]
+                        ]
                         first_date = min(dates) if dates else str(season_row["release_date"] or "")[:10]
                         added = [episode["added_at"] for episode in episodes if episode["added_at"]]
                         missing_count = sum(1 for episode in episodes if _cached_child_is_expected(episode))
-                        entries.append({**summary, "season": season_number, "bucket": "特别篇" if season_number == 0 else _season_bucket(first_date), "release_date": first_date,
-                                        "first_episode_date": first_date, "latest_added_at": max(added) if added else "",
-                                        "episode_count": len(episodes), "missing_count": missing_count,
-                                        "is_special": season_number == 0, "is_undated": not bool(first_date)})
+                        entries.append(
+                            {
+                                **summary,
+                                "season": season_number,
+                                "bucket": "特别篇" if season_number == 0 else _season_bucket(first_date),
+                                "release_date": first_date,
+                                "first_episode_date": first_date,
+                                "latest_added_at": max(added) if added else "",
+                                "episode_count": len(episodes),
+                                "missing_count": missing_count,
+                                "is_special": season_number == 0,
+                                "is_undated": not bool(first_date),
+                            }
+                        )
                 else:
                     live_items.append(summary)
-            groups = {}
+            groups: dict[str, list[dict[str, Any]]] = {}
             for entry in entries:
                 groups.setdefault(entry["bucket"], []).append(entry)
+
             def group_key(label: str):
                 # Normal quarters are always newest-first.  Special episodes
                 # and undated seasons are kept as explicit trailing groups.
-                if label == "特别篇": return (1, 0, 0)
-                if label == "未定档": return (2, 0, 0)
+                if label == "特别篇":
+                    return (1, 0, 0)
+                if label == "未定档":
+                    return (2, 0, 0)
                 try:
                     return (0, -int(label[:4]), -int(label.split("Q", 1)[1].split()[0]))
                 except (TypeError, ValueError, IndexError):
                     return (2, 0, 0)
+
             for group in groups.values():
-                group.sort(key=lambda item: (item.get("first_episode_date") or "9999-99-99", str(item.get("title") or "").casefold()))
+                group.sort(
+                    key=lambda item: (
+                        item.get("first_episode_date") or "9999-99-99",
+                        str(item.get("title") or "").casefold(),
+                    )
+                )
             result = [{"label": label, "items": groups[label]} for label in sorted(groups, key=group_key)]
-        return jsonify({"server_id": server_id, "library_id": library_id, "groups": result, "live_items": live_items})
+        return jsonify(
+            {"server_id": server_id, "library_id": library_id, "groups": result, "live_items": live_items}
+        )
 
     @servers_bp.get("/api/servers/<int:server_id>/media-library/item")
     @login_required
@@ -1472,8 +2098,14 @@ def create_app() -> Flask:
         if not library_id or not rating_key:
             return api_error("缺少媒体库或条目标识", "invalid_media_item", 400)
         with connect() as db:
-            library = db.execute("SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?", (server_id, library_id)).fetchone()
-            row = db.execute("SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?", (server_id, library_id, rating_key)).fetchone()
+            library = db.execute(
+                "SELECT * FROM media_libraries WHERE server_id = ? AND library_id = ?",
+                (server_id, library_id),
+            ).fetchone()
+            row = db.execute(
+                "SELECT * FROM media_library_items WHERE server_id = ? AND library_id = ? AND rating_key = ?",
+                (server_id, library_id, rating_key),
+            ).fetchone()
             if library is None or row is None:
                 return api_error("媒体条目缓存不存在，请先同步媒体库", "media_item_not_found", 404)
             if row["plex_type"] == "show":
@@ -1481,8 +2113,19 @@ def create_app() -> Flask:
             raw = decode_payload(row["raw_json"])
             item = dict(row)
             item.pop("raw_json", None)
-            item.update({"library_id": library_id, "summary": raw.get("summary") or "", "external_ids": raw.get("external_ids") or extract_external_ids(raw), "collections": []})
-            item["tmdb_id"] = int(row["tmdb_id"]) if row["tmdb_id"] else (int(item["external_ids"]["tmdb"]) if item["external_ids"].get("tmdb") else None)
+            item.update(
+                {
+                    "library_id": library_id,
+                    "summary": raw.get("summary") or "",
+                    "external_ids": raw.get("external_ids") or extract_external_ids(raw),
+                    "collections": [],
+                }
+            )
+            item["tmdb_id"] = (
+                int(row["tmdb_id"])
+                if row["tmdb_id"]
+                else (int(item["external_ids"]["tmdb"]) if item["external_ids"].get("tmdb") else None)
+            )
             item["imdb_id"] = row["imdb_id"] or item["external_ids"].get("imdb") or ""
             item["tvdb_id"] = row["tvdb_id"] or item["external_ids"].get("tvdb") or ""
             item["poster_url"] = raw.get("poster_url") or ""
@@ -1507,7 +2150,9 @@ def create_app() -> Flask:
         if not library_id or not tmdb_id or media_type not in {"movie", "tv"}:
             return api_error("缺少有效的媒体库、媒体类型或 TMDB ID", "invalid_media_item_by_tmdb", 400)
         with connect() as db:
-            library = db.execute("SELECT * FROM media_libraries WHERE server_id=? AND library_id=?", (server_id, library_id)).fetchone()
+            library = db.execute(
+                "SELECT * FROM media_libraries WHERE server_id=? AND library_id=?", (server_id, library_id)
+            ).fetchone()
             if library is None:
                 return api_error("媒体库不存在", "library_not_found", 404)
             expected_type = 1 if media_type == "movie" else 2
@@ -1526,30 +2171,44 @@ def create_app() -> Flask:
                 item = _cached_show_payload(db, server_id, library_id, row, library)
                 quarter_entries = []
                 for season in item.get("seasons") or []:
-                    dates = [episode.get("air_date") for episode in season.get("episodes") or [] if episode.get("air_date")]
+                    dates = [
+                        episode.get("air_date")
+                        for episode in season.get("episodes") or []
+                        if episode.get("air_date")
+                    ]
                     first_date = min(dates) if dates else season.get("release_date") or ""
-                    added = [episode.get("added_at") for episode in season.get("episodes") or [] if episode.get("added_at")]
-                    quarter_entries.append({
-                        "label": season.get("bucket") or "未定档",
-                        "season": int(season.get("season") or 0),
-                        "first_episode_date": first_date,
-                        "latest_added_at": max(added) if added else "",
-                        "episode_count": len(season.get("episodes") or []),
-                        "missing_count": sum(1 for episode in season.get("episodes") or [] if episode.get("missing")),
-                        "is_special": int(season.get("season") or 0) == 0,
-                        "is_undated": not bool(first_date),
-                    })
+                    added = [
+                        episode.get("added_at")
+                        for episode in season.get("episodes") or []
+                        if episode.get("added_at")
+                    ]
+                    quarter_entries.append(
+                        {
+                            "label": season.get("bucket") or "未定档",
+                            "season": int(season.get("season") or 0),
+                            "first_episode_date": first_date,
+                            "latest_added_at": max(added) if added else "",
+                            "episode_count": len(season.get("episodes") or []),
+                            "missing_count": sum(
+                                1 for episode in season.get("episodes") or [] if episode.get("missing")
+                            ),
+                            "is_special": int(season.get("season") or 0) == 0,
+                            "is_undated": not bool(first_date),
+                        }
+                    )
                 item["quarter_entries"] = quarter_entries
             else:
                 raw = decode_payload(row["raw_json"])
                 item = dict(row)
                 item.pop("raw_json", None)
-                item.update({
-                    "library_id": library_id,
-                    "summary": raw.get("summary") or "",
-                    "external_ids": raw.get("external_ids") or extract_external_ids(raw),
-                    "collections": [],
-                })
+                item.update(
+                    {
+                        "library_id": library_id,
+                        "summary": raw.get("summary") or "",
+                        "external_ids": raw.get("external_ids") or extract_external_ids(raw),
+                        "collections": [],
+                    }
+                )
                 item["tmdb_id"] = int(row["tmdb_id"]) if row["tmdb_id"] else tmdb_id
                 item["imdb_id"] = row["imdb_id"] or item["external_ids"].get("imdb") or ""
                 item["tvdb_id"] = row["tvdb_id"] or item["external_ids"].get("tvdb") or ""
@@ -1558,10 +2217,12 @@ def create_app() -> Flask:
             item["system_managed"] = bool(row["system_managed"])
             item["plex_present"] = not bool(row["system_managed"])
             item["library_title"] = str(library["title"] or "")
-            item["library_item_count"] = int(db.execute(
-                "SELECT COUNT(*) AS count FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key='' AND plex_type IN ('movie','show','collection')",
-                (server_id, library_id),
-            ).fetchone()["count"])
+            item["library_item_count"] = int(
+                db.execute(
+                    "SELECT COUNT(*) AS count FROM media_library_items WHERE server_id=? AND library_id=? AND parent_rating_key='' AND plex_type IN ('movie','show','collection')",
+                    (server_id, library_id),
+                ).fetchone()["count"]
+            )
         return jsonify(item)
 
     @jobs_bp.post("/api/jobs")
@@ -1570,7 +2231,11 @@ def create_app() -> Flask:
         data = request.get_json(force=True)
         payload = data.get("payload") or {}
         if "mode" in data or "scope" in data:
-            payload = {**payload, "mode": data.get("mode", payload.get("mode")), "scope": data.get("scope", payload.get("scope") or {})}
+            payload = {
+                **payload,
+                "mode": data.get("mode", payload.get("mode")),
+                "scope": data.get("scope", payload.get("scope") or {}),
+            }
         try:
             job_id = manager.create_job(data.get("type") or "all", int(data["server_id"]), payload)
             return jsonify({"id": job_id})
@@ -1599,16 +2264,19 @@ def create_app() -> Flask:
     def get_job_changes(job_id: int):
         limit = max(1, min(int(request.args.get("limit", "500")), 2000))
         with connect() as db:
-            rows = db.execute("SELECT * FROM changes WHERE job_id = ? ORDER BY id ASC LIMIT ?", (job_id, limit)).fetchall()
+            rows = db.execute(
+                "SELECT * FROM changes WHERE job_id = ? ORDER BY id ASC LIMIT ?", (job_id, limit)
+            ).fetchall()
         changes = rows_to_dicts(rows)
         for change in changes:
             change["old_value"] = json.loads(change.get("old_value") or "null")
             change["new_value"] = json.loads(change.get("new_value") or "null")
             if change.get("rollback_status") == "rolled_back":
                 change["status"] = "rolled_back"
-            elif change.get("apply_status") in {"conflict", "failed"} or change.get(
-                "rollback_status"
-            ) in {"conflict", "failed"}:
+            elif change.get("apply_status") in {"conflict", "failed"} or change.get("rollback_status") in {
+                "conflict",
+                "failed",
+            }:
                 change["status"] = "conflict"
             elif change.get("apply_status") == "applied":
                 change["status"] = "applied"
@@ -1790,8 +2458,7 @@ def create_app() -> Flask:
     def update_tags():
         data = request.get_json(force=True)
         if not isinstance(data, dict) or not all(
-            isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip()
-            for k, v in data.items()
+            isinstance(k, str) and k.strip() and isinstance(v, str) and v.strip() for k, v in data.items()
         ):
             return api_error("标签映射必须是非空字符串到非空字符串的 JSON 对象", "invalid_tags", 400)
         save_tags(data)
@@ -1847,7 +2514,9 @@ def create_app() -> Flask:
     @tools_bp.post("/api/diagnostics/<int:server_id>/write-test")
     @login_required
     def diagnostics_write_test(server_id: int):
-        return jsonify({"ok": True, "message": "写入测试入口已保留；为避免误改 Plex 元数据，首版只做只读诊断。"})
+        return jsonify(
+            {"ok": True, "message": "写入测试入口已保留；为避免误改 Plex 元数据，首版只做只读诊断。"}
+        )
 
     def build_diagnostics(server_id: int):
         checks = []
@@ -1855,11 +2524,21 @@ def create_app() -> Flask:
         with connect() as db:
             server = db.execute("SELECT * FROM servers WHERE id = ?", (server_id,)).fetchone()
             if server is None:
-                return {"server_id": server_id, "status": "error", "checks": [{"name": "服务器", "status": "error", "message": "不存在"}]}
+                return {
+                    "server_id": server_id,
+                    "status": "error",
+                    "checks": [{"name": "服务器", "status": "error", "message": "不存在"}],
+                }
             db_size = DB_FILE.stat().st_size if DB_FILE.exists() else 0
-            queued = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").fetchone()["count"]
-            running = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'running'").fetchone()["count"]
-            schedules = db.execute("SELECT COUNT(*) AS count FROM schedules WHERE server_id = ? AND enabled = 1", (server_id,)).fetchone()["count"]
+            queued = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'queued'").fetchone()[
+                "count"
+            ]
+            running = db.execute("SELECT COUNT(*) AS count FROM jobs WHERE status = 'running'").fetchone()[
+                "count"
+            ]
+            schedules = db.execute(
+                "SELECT COUNT(*) AS count FROM schedules WHERE server_id = ? AND enabled = 1", (server_id,)
+            ).fetchone()["count"]
         try:
             plex = PlexServer(server_config_from_row(server), tags=load_tags(), auto_login=False)
             friendly_name = plex.login()
@@ -1878,7 +2557,11 @@ def create_app() -> Flask:
         checks.extend(
             [
                 {"name": "数据库", "status": "ok", "message": f"{db_size} bytes"},
-                {"name": "任务队列", "status": "warning" if queued > 10 else "ok", "message": f"排队 {queued}，运行 {running}"},
+                {
+                    "name": "任务队列",
+                    "status": "warning" if queued > 10 else "ok",
+                    "message": f"排队 {queued}，运行 {running}",
+                },
                 {"name": "定时任务", "status": "ok", "message": f"{schedules} 个启用"},
                 {
                     "name": "Webhook URL",
@@ -1955,7 +2638,7 @@ def create_app() -> Flask:
             rows = db.execute(
                 f"""
                 SELECT DISTINCT server_id, library_id FROM continue_watching_items
-                WHERE id IN ({','.join(['?'] * len(item_ids))}) AND status = 'candidate'
+                WHERE id IN ({",".join(["?"] * len(item_ids))}) AND status = 'candidate'
                 """,
                 item_ids,
             ).fetchall()
@@ -2005,28 +2688,51 @@ def create_app() -> Flask:
                 clauses.append("m.status = ?")
                 params.append(status)
         with connect() as db:
-            total = db.execute(f"SELECT COUNT(*) AS count FROM tmdb_items i {join} WHERE {' AND '.join(clauses)}", params).fetchone()["count"]
+            total = db.execute(
+                f"SELECT COUNT(*) AS count FROM tmdb_items i {join} WHERE {' AND '.join(clauses)}", params
+            ).fetchone()["count"]
             params.extend([(page - 1) * size, size])
-            rows = db.execute(f"SELECT i.*, m.status, m.match_source, m.plex_rating_key FROM tmdb_items i {join} WHERE {' AND '.join(clauses)} ORDER BY i.release_date DESC, i.title LIMIT ? OFFSET ?", params).fetchall()
+            rows = db.execute(
+                f"SELECT i.*, m.status, m.match_source, m.plex_rating_key FROM tmdb_items i {join} WHERE {' AND '.join(clauses)} ORDER BY i.release_date DESC, i.title LIMIT ? OFFSET ?",
+                params,
+            ).fetchall()
         return jsonify({"items": rows_to_dicts(rows), "page": page, "page_size": size, "total": total})
 
     @tools_bp.get("/api/catalog/items/<media_type>/<int:tmdb_id>")
     @login_required
     def catalog_item_detail(media_type: str, tmdb_id: int):
         with connect() as db:
-            row = db.execute("SELECT * FROM tmdb_items WHERE media_type = ? AND tmdb_id = ? ORDER BY season_number, episode_number LIMIT 1", (media_type, tmdb_id)).fetchone()
-            children = db.execute("SELECT * FROM tmdb_items WHERE parent_tmdb_id = ? ORDER BY season_number, episode_number", (tmdb_id,)).fetchall()
+            row = db.execute(
+                "SELECT * FROM tmdb_items WHERE media_type = ? AND tmdb_id = ? ORDER BY season_number, episode_number LIMIT 1",
+                (media_type, tmdb_id),
+            ).fetchone()
+            children = db.execute(
+                "SELECT * FROM tmdb_items WHERE parent_tmdb_id = ? ORDER BY season_number, episode_number",
+                (tmdb_id,),
+            ).fetchall()
         if row is None:
             return api_error("目录项目不存在", "catalog_item_not_found", 404)
-        item = dict(row); item["raw_json"] = decode_payload(item.get("raw_json")); item["children"] = rows_to_dicts(children)
+        item = dict(row)
+        item["raw_json"] = decode_payload(item.get("raw_json"))
+        item["children"] = rows_to_dicts(children)
         return jsonify(item)
 
     @tools_bp.get("/api/catalog/stats")
     @login_required
     def catalog_stats():
         with connect() as db:
-            counts = {row["media_type"]: row["count"] for row in db.execute("SELECT media_type, COUNT(*) AS count FROM tmdb_items GROUP BY media_type").fetchall()}
-            statuses = {row["status"]: row["count"] for row in db.execute("SELECT status, COUNT(*) AS count FROM media_match_results GROUP BY status").fetchall()}
+            counts = {
+                row["media_type"]: row["count"]
+                for row in db.execute(
+                    "SELECT media_type, COUNT(*) AS count FROM tmdb_items GROUP BY media_type"
+                ).fetchall()
+            }
+            statuses = {
+                row["status"]: row["count"]
+                for row in db.execute(
+                    "SELECT status, COUNT(*) AS count FROM media_match_results GROUP BY status"
+                ).fetchall()
+            }
         return jsonify({"items": counts, "matches": statuses})
 
     @tools_bp.post("/api/catalog/sync")
@@ -2042,7 +2748,11 @@ def create_app() -> Flask:
             if row is None:
                 return api_error("请先配置至少一台 Plex 服务器", "server_required", 400)
             server_id = int(row["id"])
-        payload = {"media_types": data.get("media_types") or ["movie", "tv"], "filters": data.get("filters") or {}, "max_pages": data.get("max_pages") or 1}
+        payload = {
+            "media_types": data.get("media_types") or ["movie", "tv"],
+            "filters": data.get("filters") or {},
+            "max_pages": data.get("max_pages") or 1,
+        }
         job_id = manager.create_job("tmdb_catalog_sync", server_id, payload)
         return jsonify({"id": job_id})
 
@@ -2051,7 +2761,9 @@ def create_app() -> Flask:
     def create_inventory_sync():
         data = request.get_json(force=True) or {}
         server_id = int(data.get("server_id") or 0)
-        job_id = manager.create_job("plex_inventory_sync", server_id, {"server_id": server_id, "library_ids": data.get("library_ids")})
+        job_id = manager.create_job(
+            "plex_inventory_sync", server_id, {"server_id": server_id, "library_ids": data.get("library_ids")}
+        )
         return jsonify({"id": job_id})
 
     @tools_bp.get("/api/episode-match-overrides")
@@ -2125,7 +2837,9 @@ def create_app() -> Flask:
         library_id = int(data["library_id"])
         options = data.get("options") or {}
         with connect() as db:
-            server = db.execute("SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)).fetchone()
+            server = db.execute(
+                "SELECT id FROM servers WHERE id = ? AND enabled = 1", (server_id,)
+            ).fetchone()
         if server is None:
             return api_error("服务器不存在或已禁用", "server_not_found", 404)
         job_id = manager.create_job(
@@ -2222,7 +2936,12 @@ def create_app() -> Flask:
         for row in rows:
             item = dict(row)
             item["details"] = decode_payload(item.get("details", "{}"))
-            key = item.get("plex_rating_key") or str(item.get("tmdb_id") or "") or item.get("show_title") or str(item["id"])
+            key = (
+                item.get("plex_rating_key")
+                or str(item.get("tmdb_id") or "")
+                or item.get("show_title")
+                or str(item["id"])
+            )
             group = groups.setdefault(
                 key,
                 {
@@ -2249,7 +2968,9 @@ def create_app() -> Flask:
             if status_value in {"present", "missing", "ignored_missing"}:
                 group["legacy_summary_only"] = False
                 season_key = str(formatted["season"])
-                season = group["seasons"].setdefault(season_key, {"season": formatted["season"], "episodes": []})
+                season = group["seasons"].setdefault(
+                    season_key, {"season": formatted["season"], "episodes": []}
+                )
                 season["episodes"].append(formatted)
             if status_value == "missing":
                 group["missing_count"] += 1
@@ -2269,15 +2990,27 @@ def create_app() -> Flask:
                 group["candidates"] = item["details"].get("candidates") or []
         report_groups = []
         for group in groups.values():
-            group["seasons"] = sorted(group["seasons"].values(), key=lambda season: int(season["season"] or 0))
+            group["seasons"] = sorted(
+                group["seasons"].values(), key=lambda season: int(season["season"] or 0)
+            )
             for season in group["seasons"]:
                 season["episodes"].sort(key=lambda episode: int(episode["episode"] or 0))
-            if group["missing_count"] or group["present_count"] or group["ignored_count"] or group["unmatched"] or group["ambiguous"]:
+            if (
+                group["missing_count"]
+                or group["present_count"]
+                or group["ignored_count"]
+                or group["unmatched"]
+                or group["ambiguous"]
+            ):
                 report_groups.append(group)
-        report_groups.sort(key=lambda group: (0 if group["missing_count"] else 1, group["show_title"].lower()))
+        report_groups.sort(
+            key=lambda group: (0 if group["missing_count"] else 1, group["show_title"].lower())
+        )
         run_data = dict(run)
         run_data["options"] = decode_payload(run_data.get("options", "{}"))
-        legacy_summary_only = bool(report_groups) and not any(not group["legacy_summary_only"] for group in report_groups)
+        legacy_summary_only = bool(report_groups) and not any(
+            not group["legacy_summary_only"] for group in report_groups
+        )
         return jsonify(
             {
                 "run": run_data,
@@ -2300,7 +3033,9 @@ def create_app() -> Flask:
             "id": item.get("id"),
             "season": item.get("season"),
             "episode": item.get("episode"),
-            "label": f"S{int(item['season']):02d}E{int(item['episode']):02d}" if item.get("season") is not None and item.get("episode") is not None else "整部剧",
+            "label": f"S{int(item['season']):02d}E{int(item['episode']):02d}"
+            if item.get("season") is not None and item.get("episode") is not None
+            else "整部剧",
             "air_date": item.get("air_date") or "",
             "title": details.get("episode_title") or "",
             "reason": details.get("ignore_reason") or details.get("reason") or "",
@@ -2419,16 +3154,23 @@ def create_app() -> Flask:
         params: list[Any] = [item["run_id"]]
         if scope == "show":
             clauses.append("(plex_rating_key = ? OR (tmdb_id IS NOT NULL AND tmdb_id = ?) OR show_title = ?)")
-            params.extend([item.get("plex_rating_key") or "", item.get("tmdb_id"), item.get("show_title") or ""])
+            params.extend(
+                [item.get("plex_rating_key") or "", item.get("tmdb_id"), item.get("show_title") or ""]
+            )
         else:
             clauses.append("id = ?")
             params.append(item["id"])
         with connect() as db:
-            rows = db.execute(f"SELECT id, details FROM episode_audit_items WHERE {' AND '.join(clauses)}", params).fetchall()
+            rows = db.execute(
+                f"SELECT id, details FROM episode_audit_items WHERE {' AND '.join(clauses)}", params
+            ).fetchall()
             for row in rows:
                 details = decode_payload(row["details"])
                 details["ignore_reason"] = reason
-                db.execute("UPDATE episode_audit_items SET status = ?, details = ? WHERE id = ?", (status_value, json.dumps(details, ensure_ascii=False), row["id"]))
+                db.execute(
+                    "UPDATE episode_audit_items SET status = ?, details = ? WHERE id = ?",
+                    (status_value, json.dumps(details, ensure_ascii=False), row["id"]),
+                )
             refresh_episode_audit_counts(db, item["run_id"])
             db.commit()
 
@@ -2555,7 +3297,11 @@ def create_app() -> Flask:
             rule = db.execute("SELECT server_id FROM collection_rules WHERE id = ?", (rule_id,)).fetchone()
         if rule is None:
             return api_error("合集规则不存在", "collection_rule_not_found", 404)
-        job_id = manager.create_job("collection_rule", int(rule["server_id"]), {"rule_id": rule_id, "preview": bool(data.get("preview"))})
+        job_id = manager.create_job(
+            "collection_rule",
+            int(rule["server_id"]),
+            {"rule_id": rule_id, "preview": bool(data.get("preview"))},
+        )
         return jsonify({"id": job_id})
 
     @automation_bp.get("/api/webhook-events")
@@ -2591,12 +3337,26 @@ def create_app() -> Flask:
             if rule_id:
                 db.execute(
                     "UPDATE webhook_rules SET server_id = ?, event = ?, action = ?, enabled = ?, updated_at = ? WHERE id = ?",
-                    (int(data["server_id"]), data.get("event") or "library.new", data.get("action") or "localize", 1 if data.get("enabled", True) else 0, now, int(rule_id)),
+                    (
+                        int(data["server_id"]),
+                        data.get("event") or "library.new",
+                        data.get("action") or "localize",
+                        1 if data.get("enabled", True) else 0,
+                        now,
+                        int(rule_id),
+                    ),
                 )
             else:
                 db.execute(
                     "INSERT INTO webhook_rules (server_id, event, action, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (int(data["server_id"]), data.get("event") or "library.new", data.get("action") or "localize", 1 if data.get("enabled", True) else 0, now, now),
+                    (
+                        int(data["server_id"]),
+                        data.get("event") or "library.new",
+                        data.get("action") or "localize",
+                        1 if data.get("enabled", True) else 0,
+                        now,
+                        now,
+                    ),
                 )
             db.commit()
         return jsonify({"ok": True})
@@ -2630,12 +3390,28 @@ def create_app() -> Flask:
             if channel_id:
                 db.execute(
                     "UPDATE notification_channels SET name = ?, channel_type = ?, url = ?, events = ?, enabled = ?, updated_at = ? WHERE id = ?",
-                    (data.get("name") or "Webhook", data.get("channel_type") or "webhook", data.get("url") or "", events, 1 if data.get("enabled", True) else 0, now, int(channel_id)),
+                    (
+                        data.get("name") or "Webhook",
+                        data.get("channel_type") or "webhook",
+                        data.get("url") or "",
+                        events,
+                        1 if data.get("enabled", True) else 0,
+                        now,
+                        int(channel_id),
+                    ),
                 )
             else:
                 db.execute(
                     "INSERT INTO notification_channels (name, channel_type, url, events, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (data.get("name") or "Webhook", data.get("channel_type") or "webhook", data.get("url") or "", events, 1 if data.get("enabled", True) else 0, now, now),
+                    (
+                        data.get("name") or "Webhook",
+                        data.get("channel_type") or "webhook",
+                        data.get("url") or "",
+                        events,
+                        1 if data.get("enabled", True) else 0,
+                        now,
+                        now,
+                    ),
                 )
             db.commit()
         return jsonify({"ok": True})
@@ -2678,8 +3454,10 @@ def create_app() -> Flask:
             return api_error("Webhook 地址无效", "webhook_not_found", 404)
         source_ip = client_ip()
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(minutes=1)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+            (datetime.now(timezone.utc) - timedelta(minutes=1))
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z")
+        )
         with connect() as db:
             db.execute("DELETE FROM webhook_rate_limits WHERE created_at < ?", (cutoff,))
             count = db.execute(
@@ -2748,7 +3526,7 @@ def create_app() -> Flask:
             )
             event_id = int(cur.lastrowid or 0)
             recheck_result = request_recheck(db, server_id, event_name, metadata)
-            db.execute("UPDATE webhook_events SET result=? WHERE id=?", (recheck_result,event_id))
+            db.execute("UPDATE webhook_events SET result=? WHERE id=?", (recheck_result, event_id))
             rules = db.execute(
                 "SELECT * FROM webhook_rules WHERE server_id = ? AND event = ? AND enabled = 1",
                 (server_id, event_name),
@@ -2758,9 +3536,7 @@ def create_app() -> Flask:
             rule["action"] == "localize" for rule in rules
         )
         if should_localize and metadata:
-            manager.create_job(
-                "webhook", server_id, {"metadata": metadata, "webhook_event_id": event_id}
-            )
+            manager.create_job("webhook", server_id, {"metadata": metadata, "webhook_event_id": event_id})
         if any(rule["action"] == "notify" for rule in rules):
             manager.create_job(
                 "notification_event",

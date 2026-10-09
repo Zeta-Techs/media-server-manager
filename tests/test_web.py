@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
-import stat
 import threading
 from types import SimpleNamespace
 
@@ -59,9 +57,10 @@ def test_first_setup_csrf_session_secret_and_server_redaction(tmp_path, monkeypa
     session_data, headers = session_headers(client)
     assert session_data["initialized"] is False
     assert client.post("/api/setup", json={"username": "a", "password": "secure-password"}).status_code == 403
-    assert client.post(
-        "/api/setup", json={"username": "a", "password": "short"}, headers=headers
-    ).status_code == 400
+    assert (
+        client.post("/api/setup", json={"username": "a", "password": "short"}, headers=headers).status_code
+        == 400
+    )
     headers = setup_admin(client)
     server_id = create_server(client, headers)
     servers = client.get("/api/servers").get_json()
@@ -81,12 +80,25 @@ def test_first_setup_csrf_session_secret_and_server_redaction(tmp_path, monkeypa
     )
     assert update.status_code == 200
     with db_module.connect(db_file) as db:
-        assert db.execute("SELECT token FROM servers WHERE id = ?", (server_id,)).fetchone()["token"] == "plex-secret"
-    secret_file = tmp_path / "session_secret"
-    assert secret_file.exists()
-    if os.name != "nt":
-        assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+        assert (
+            db.execute("SELECT token FROM servers WHERE id = ?", (server_id,)).fetchone()["token"]
+            == "plex-secret"
+        )
+    with db_module.connect(db_file) as db:
+        assert db.execute("SELECT value FROM settings WHERE key = 'session_secret'").fetchone()["value"]
+    assert not (tmp_path / "session_secret").exists()
     app.extensions["task_manager"].shutdown()
+
+
+def test_user_preferences_are_persisted_in_database(tmp_path, monkeypatch):
+    _, client, db_file = make_client(tmp_path, monkeypatch)
+    headers = setup_admin(client)
+    payload = {"active_view": "media-library", "show_kinds": {"show-1": "动画"}}
+    assert client.put("/api/preferences", json=payload, headers=headers).status_code == 200
+    assert client.get("/api/preferences").get_json() == payload
+    with db_module.connect(db_file) as db:
+        rows = db.execute("SELECT key, value FROM user_preferences ORDER BY key").fetchall()
+    assert {row["key"] for row in rows} == {"active_view", "show_kinds"}
 
 
 def test_logout_login_rate_limit_and_password_change(tmp_path, monkeypatch):
@@ -101,16 +113,22 @@ def test_logout_login_rate_limit_and_password_change(tmp_path, monkeypatch):
     logout = client.post("/api/auth/logout", json={}, headers=headers)
     headers = {"X-CSRF-Token": logout.get_json()["csrf_token"]}
     for _ in range(5):
-        assert client.post(
+        assert (
+            client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "wrong"},
+                headers=headers,
+            ).status_code
+            == 401
+        )
+    assert (
+        client.post(
             "/api/auth/login",
-            json={"username": "admin", "password": "wrong"},
+            json={"username": "admin", "password": "new-secure-password"},
             headers=headers,
-        ).status_code == 401
-    assert client.post(
-        "/api/auth/login",
-        json={"username": "admin", "password": "new-secure-password"},
-        headers=headers,
-    ).status_code == 429
+        ).status_code
+        == 429
+    )
 
 
 def test_webhook_secret_normalization_and_rate_limit(tmp_path, monkeypatch):
@@ -245,12 +263,18 @@ def test_overview_media_and_thumbnail_proxy_are_authenticated_and_scoped(tmp_pat
     assert image_response.data == b"png-bytes"
     assert image_response.headers["Content-Type"].startswith("image/png")
     assert image_response.headers["Cache-Control"] == "private, max-age=3600"
-    assert client.get(
-        f"/api/servers/{server_id}/media-image?path=https://example.com/image.png"
-    ).get_json()["code"] == "invalid_media_path"
-    assert client.get(
-        f"/api/servers/{server_id}/media-image?path=/library/metadata/42/../secret"
-    ).get_json()["code"] == "invalid_media_path"
+    assert (
+        client.get(f"/api/servers/{server_id}/media-image?path=https://example.com/image.png").get_json()[
+            "code"
+        ]
+        == "invalid_media_path"
+    )
+    assert (
+        client.get(f"/api/servers/{server_id}/media-image?path=/library/metadata/42/../secret").get_json()[
+            "code"
+        ]
+        == "invalid_media_path"
+    )
 
 
 def test_media_library_items_are_paginated_and_quarter_index_is_summary_only(tmp_path, monkeypatch):
@@ -294,13 +318,14 @@ def test_media_library_items_are_paginated_and_quarter_index_is_summary_only(tmp
     assert payload["items"][0]["episode_count"] == 1
     assert payload["items"][0]["missing_count"] == 1
 
-    quarter = client.get(
-        f"/api/servers/{server_id}/media-library/7/quarter-index", headers=headers
-    )
+    quarter = client.get(f"/api/servers/{server_id}/media-library/7/quarter-index", headers=headers)
     assert quarter.status_code == 200
     quarter_payload = quarter.get_json()
     assert quarter_payload["groups"]
-    assert "seasons" not in quarter_payload["groups"][0]["items"][0] or quarter_payload["groups"][0]["items"][0]["seasons"] == []
+    assert (
+        "seasons" not in quarter_payload["groups"][0]["items"][0]
+        or quarter_payload["groups"][0]["items"][0]["seasons"] == []
+    )
     assert quarter_payload["groups"][0]["items"][0]["episode_count"] == 1
     app.extensions["task_manager"].shutdown()
 
@@ -324,14 +349,14 @@ def test_quarter_index_merges_expected_and_real_seasons_and_episodes(tmp_path, m
         # date differs from the placeholder's. Preserve separate shows with
         # identical titles and a second season in the same quarter.
         children = [
-            ("tmdb-season:1:1", "season", "show-a", 1, None, "2023-01-01", '{}'),
-            ("real-a-1", "season", "show-a", 1, None, "2024-10-01", '{}'),
-            ("real-a-2", "season", "show-a", 2, None, "2024-10-02", '{}'),
-            ("tmdb-season:1:2", "season", "show-a", 2, None, "2023-01-02", '{}'),
+            ("tmdb-season:1:1", "season", "show-a", 1, None, "2023-01-01", "{}"),
+            ("real-a-1", "season", "show-a", 1, None, "2024-10-01", "{}"),
+            ("real-a-2", "season", "show-a", 2, None, "2024-10-02", "{}"),
+            ("tmdb-season:1:2", "season", "show-a", 2, None, "2023-01-02", "{}"),
             ("tmdb-season:2:1", "season", "show-b", 1, None, "2025-01-01", '{"expected": true}'),
             ("tmdb:1:1:1", "episode", "show-a", 1, 1, "2023-01-01", '{"expected": true}'),
-            ("real-e-1", "episode", "show-a", 1, 1, "2024-10-01", '{}'),
-            ("real-e-2", "episode", "show-a", 1, 2, "2024-10-02", '{}'),
+            ("real-e-1", "episode", "show-a", 1, 1, "2024-10-01", "{}"),
+            ("real-e-2", "episode", "show-a", 1, 2, "2024-10-02", "{}"),
             ("tmdb:1:1:2", "episode", "show-a", 1, 2, "2023-01-02", '{"expected": true}'),
             ("tmdb:1:1:3", "episode", "show-a", 1, 3, "2024-10-03", '{"expected": true}'),
             ("tmdb:2:1:1", "episode", "show-b", 1, 1, "2025-01-01", '{"expected": true}'),
@@ -348,14 +373,17 @@ def test_quarter_index_merges_expected_and_real_seasons_and_episodes(tmp_path, m
         entries = [item for group in groups for item in group["items"]]
         assert len(entries) == 3
         assert {(item["rating_key"], item["season"]) for item in entries} == {
-            ("show-a", 1), ("show-a", 2), ("show-b", 1),
+            ("show-a", 1),
+            ("show-a", 2),
+            ("show-b", 1),
         }
         assert {group["label"] for group in groups} == {"2024 Q4 / 10月番", "2025 Q1 / 1月番"}
         season_one = next(item for item in entries if item["rating_key"] == "show-a" and item["season"] == 1)
         assert season_one["episode_count"] == 3
         assert season_one["missing_count"] == 1
         details = client.get(
-            f"/api/servers/{server_id}/media-library/item?library_id=7&rating_key=show-a&media_type=show", headers=headers,
+            f"/api/servers/{server_id}/media-library/item?library_id=7&rating_key=show-a&media_type=show",
+            headers=headers,
         ).get_json()
         assert details["season_count"] == 2
         assert details["episode_count"] == 3

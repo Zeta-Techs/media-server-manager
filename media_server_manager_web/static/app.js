@@ -49,17 +49,26 @@ async function bootstrap() {
   }
   showApp();
   await refreshInitial();
-  const requestedView = new URLSearchParams(window.location.search).get("view") || sessionStorage.getItem("msm-active-view") || "overview";
+  const requestedView = new URLSearchParams(window.location.search).get("view") || state.preferences.active_view || "overview";
   const allowedViews = new Set(["overview", "servers", "media-library", "media-library-detail", "localization", "jobs", "automation", "system"]);
   const savedView = window.location.pathname === "/media-library/detail" ? "media-library-detail" : (allowedViews.has(requestedView) ? requestedView : "overview");
   await switchView(savedView);
 }
 
 async function refreshInitial() {
-  await Promise.all([loadOverview(), loadServers(), loadJobs()]);
+  await Promise.all([loadOverview(), loadServers(), loadJobs(), loadPreferences()]);
   state.loadedViews.add("overview");
   state.loadedViews.add("servers");
   state.loadedViews.add("jobs");
+}
+
+async function loadPreferences() { state.preferences = await api("/api/preferences"); }
+let preferenceSaveTimer = null;
+function savePreferences() {
+  if (preferenceSaveTimer) window.clearTimeout(preferenceSaveTimer);
+  preferenceSaveTimer = window.setTimeout(async () => {
+    try { await api("/api/preferences", { method: "PUT", body: JSON.stringify(state.preferences) }); } catch (_) {}
+  }, 250);
 }
 
 async function refreshAll() {
@@ -120,7 +129,7 @@ $$(".tab").forEach((button) => {
 });
 
 async function switchView(view) {
-  if (view !== "media-library-detail") sessionStorage.setItem("msm-active-view", view);
+  if (view !== "media-library-detail") { state.preferences.active_view = view; savePreferences(); }
   if (view !== "media-library") stopMediaLibrarySyncPolling();
   $$(".nav").forEach((item) => item.classList.toggle("active", item.dataset.view === (view === "media-library-detail" ? "media-library" : view)));
   $$(".view").forEach((item) => item.classList.toggle("active", item.id === `view-${view}`));
@@ -426,9 +435,9 @@ function bindMediaLibraryEvents() {
 }
 
 function toggleMediaKind(button) {
-  const marks = JSON.parse(localStorage.getItem("msm-show-kinds") || "{}");
+  const marks = state.preferences.show_kinds || (state.preferences.show_kinds = {});
   marks[button.dataset.ratingKey] = button.textContent.trim() === "动画" ? "真人" : "动画";
-  localStorage.setItem("msm-show-kinds", JSON.stringify(marks));
+  savePreferences();
   const label = marks[button.dataset.ratingKey];
   button.textContent = label;
   button.classList.toggle("anime", label === "动画");
@@ -660,14 +669,15 @@ function renderAnimationQuarterPage(groups, serverId, liveItems = []) {
 }
 
 function saveMediaListState() {
-  sessionStorage.setItem("msm-media-library-state", JSON.stringify({
+  state.preferences.media_library_state = {
     serverId: $("#media-library-server")?.value || "",
     libraryId: state.mediaLibrarySelectedId,
     pageSize: state.mediaLibraryPageSize,
     page: state.mediaLibraryPage,
     sort: state.mediaLibrarySort,
     direction: state.mediaLibraryDirection,
-  }));
+  };
+  savePreferences();
 }
 
 function openMediaDetail(ratingKey, libraryId, mediaType) {
@@ -709,7 +719,7 @@ async function loadMediaDetailFromUrl() {
     const isShow = item.type === "show" || Array.isArray(item.seasons);
     $("#media-detail-content").innerHTML = renderMediaDetail(item, serverId, libraryId, isShow);
     $("#media-detail-back").onclick = () => {
-      const saved = JSON.parse(sessionStorage.getItem("msm-media-library-state") || "{}");
+      const saved = state.preferences.media_library_state || {};
       window.location.href = `/?view=media-library&server_id=${encodeURIComponent(saved.serverId || serverId)}`;
     };
   } catch (error) {
@@ -1034,9 +1044,9 @@ function bindMediaKindToggles() {
     if (button.dataset.toggleBound === "1") return;
     button.dataset.toggleBound = "1";
     button.addEventListener("click", () => {
-    const marks = JSON.parse(localStorage.getItem("msm-show-kinds") || "{}");
+    const marks = state.preferences.show_kinds || (state.preferences.show_kinds = {});
     marks[button.dataset.ratingKey] = button.textContent.trim() === "动画" ? "真人" : "动画";
-    localStorage.setItem("msm-show-kinds", JSON.stringify(marks));
+    savePreferences();
     const label = marks[button.dataset.ratingKey];
     button.textContent = label;
     button.classList.toggle("anime", label === "动画");
@@ -1067,7 +1077,7 @@ async function loadVisibleShowDetails(serverId) {
 }
 
 async function loadMediaLibrary() {
-  const saved = JSON.parse(sessionStorage.getItem("msm-media-library-state") || "{}");
+  const saved = state.preferences.media_library_state || {};
   if (saved.serverId && $("#media-library-server")?.querySelector(`option[value="${CSS.escape(String(saved.serverId))}"]`)) {
     $("#media-library-server").value = String(saved.serverId);
   }
