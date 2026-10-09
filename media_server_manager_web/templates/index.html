@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Media Server Manager WebUI</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='media-card-v2') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='media-card-v3') }}">
   </head>
   <body>
     <div id="auth-screen" class="auth-screen" hidden>
@@ -494,6 +494,6 @@
     <script>
       window.MSM_INITIALIZED = {{ 'true' if initialized else 'false' }};
     </script>
-    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v37') }}"></script>
+    <script type="module" src="{{ url_for('static', filename='app.js', v='media-cache-v45') }}"></script>
   </body>
 </html>

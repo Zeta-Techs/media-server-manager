@@ -1353,6 +1353,7 @@ def create_app() -> Flask:
     @servers_bp.get("/api/servers/<int:server_id>/media-library/<int:library_id>/items")
     @login_required
     def media_library_items(server_id: int, library_id: int):
+        full_mode = str(request.args.get("mode") or "").lower() in {"full", "all", "summary"}
         try:
             offset = max(0, int(request.args.get("offset", 0)))
             limit = min(200, max(1, int(request.args.get("limit", 40))))
@@ -1442,10 +1443,9 @@ def create_app() -> Flask:
                 if tmdb_key[1]:
                     seen_tmdb.add(tmdb_key)
                 raw = decode_payload(item.pop("raw_json", "{}"))
-                item["external_ids"] = raw.get("external_ids") or extract_external_ids(raw)
-                item["poster_url"] = raw.get("poster_url") or ""
-                item["library_id"] = library_id
-                item["show_kind"] = item.get("animation_kind") or (
+                external_ids = raw.get("external_ids") or extract_external_ids(raw)
+                poster_url = str(raw.get("poster_url") or "")
+                show_kind = item.get("animation_kind") or (
                     "动画"
                     if library["plex_type"] == 2
                     and _library_is_animation(
@@ -1453,24 +1453,57 @@ def create_app() -> Flask:
                     )
                     else "真人"
                 )
-                item["system_genres"] = decode_json(item.get("system_genres"), [])
                 aggregate = counts_by_parent.get(str(row["rating_key"]), {})
-                item["season_count"] = int(aggregate.get("season_count") or 0)
-                item["episode_count"] = int(aggregate.get("episode_count") or 0)
-                item["missing_count"] = int(aggregate.get("missing_count") or 0)
-                items.append(item)
+                items.append(
+                    {
+                        "rating_key": str(item.get("rating_key") or ""),
+                        "title": str(item.get("title") or ""),
+                        "original_title": str(item.get("original_title") or ""),
+                        "year": item.get("year"),
+                        "plex_type": str(item.get("plex_type") or ""),
+                        "genre": str(item.get("genre") or ""),
+                        "system_genres": decode_json(item.get("system_genres"), []),
+                        "content_rating": str(item.get("content_rating") or ""),
+                        "summary": str(item.get("summary") or ""),
+                        "duration": item.get("duration") or 0,
+                        "resolution": str(item.get("resolution") or ""),
+                        "rating": item.get("rating"),
+                        "audience_rating": item.get("audience_rating"),
+                        "added_at": item.get("added_at") or "",
+                        "release_date": item.get("release_date") or "",
+                        "thumb": str(item.get("thumb") or ""),
+                        "art": str(item.get("art") or ""),
+                        "poster_url": poster_url,
+                        "tmdb_id": item.get("tmdb_id"),
+                        "tmdb_media_type": str(item.get("tmdb_media_type") or ""),
+                        "imdb_id": str(item.get("imdb_id") or ""),
+                        "tvdb_id": str(item.get("tvdb_id") or ""),
+                        "external_ids": external_ids,
+                        "library_id": library_id,
+                        "show_kind": show_kind,
+                        "source": str(item.get("source") or "plex"),
+                        "system_managed": bool(item.get("system_managed")),
+                        "season_count": int(aggregate.get("season_count") or 0),
+                        "episode_count": int(aggregate.get("episode_count") or 0),
+                        "missing_count": int(aggregate.get("missing_count") or 0),
+                    }
+                )
             items = _sort_items(items, sort, direction)
             total = len(items)
-            page = items[offset : offset + limit]
+            page = items if full_mode else items[offset : offset + limit]
+            response_offset = 0 if full_mode else offset
+            response_limit = total if full_mode else limit
+            response_has_more = False if full_mode else offset + len(page) < total
         return jsonify(
             {
                 "server_id": server_id,
                 "library_id": library_id,
                 "items": page,
                 "total": total,
-                "offset": offset,
-                "limit": limit,
-                "has_more": offset + len(page) < total,
+                "offset": response_offset,
+                "limit": response_limit,
+                "has_more": response_has_more,
+                "mode": "full" if full_mode else "paged",
             }
         )
 

@@ -318,6 +318,21 @@ def test_media_library_items_are_paginated_and_quarter_index_is_summary_only(tmp
     assert payload["items"][0]["episode_count"] == 1
     assert payload["items"][0]["missing_count"] == 1
 
+    full = client.get(
+        f"/api/servers/{server_id}/media-library/7/items?mode=full&sort=name&direction=asc",
+        headers=headers,
+    )
+    assert full.status_code == 200
+    full_payload = full.get_json()
+    assert full_payload["mode"] == "full"
+    assert full_payload["has_more"] is False
+    assert full_payload["offset"] == 0
+    assert full_payload["limit"] == 3
+    assert len(full_payload["items"]) == 3
+    assert all("raw_json" not in item for item in full_payload["items"])
+    assert all("seasons" not in item for item in full_payload["items"])
+    assert {item["title"] for item in full_payload["items"]} == {"Show 0", "Show 1", "Show 2"}
+
     quarter = client.get(f"/api/servers/{server_id}/media-library/7/quarter-index", headers=headers)
     assert quarter.status_code == 200
     quarter_payload = quarter.get_json()

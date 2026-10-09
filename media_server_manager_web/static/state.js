@@ -31,17 +31,23 @@ export const state = {
   mediaLibraryAnimationDirection: "desc",
   mediaLibraryQuarterGroups: null,
   mediaLibraryLiveItems: [],
+  // Page-session caches. These intentionally live in memory so a refresh
+  // starts from the server's current data while switching libraries in the
+  // same page does not repeat large requests.
+  mediaLibraryContentCache: new Map(),
+  mediaLibraryQuarterCache: new Map(),
   mediaLibrarySyncTimer: null,
   mediaLibrarySyncInterval: null,
   mediaLibraryObserver: null,
+  mediaLibraryImageObserver: null,
+  mediaLibraryScrollHandler: null,
   mediaLibraryDetailQueue: [],
   mediaLibraryDetailActive: 0,
   mediaLibraryDetailRequests: new Map(),
-  mediaLibraryItemsOffset: 0,
   mediaLibraryItemsTotal: 0,
-  mediaLibraryItemsHasMore: false,
   mediaLibraryItemsLoading: false,
-  mediaLibraryItemsBatch: 40,
+  mediaLibraryLoadingLibraryId: null,
   mediaLibraryItemsGeneration: 0,
+  mediaLibrarySelectionGeneration: 0,
   mediaLibraryAbortController: null,
 };

@@ -8,7 +8,14 @@ const JOB_LIST_REFRESH_INTERVAL = 2000;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => Array.from(document.querySelectorAll(selector));
 const MEDIA_SEARCH_MAX_ROWS = 100;
+const MEDIA_LIBRARY_SORT_KEYS = new Set(["name", "original_title", "year", "added_at", "release_date", "rating", "audience_rating", "duration", "season_count", "episode_count", "content_rating", "genre"]);
 const mediaSearchState = { rows: [], nextId: 1, version: 0 };
+
+// Keep the state transition code safe when a browser still has an older
+// cached state.js module without the newer generation field.
+if (!Number.isFinite(Number(state.mediaLibrarySelectionGeneration))) {
+  state.mediaLibrarySelectionGeneration = 0;
+}
 
 function createMediaSearchRow(values = {}) {
   return {
@@ -212,6 +219,44 @@ function mediaImageUrl(serverId, path) {
   return path ? `/api/servers/${encodeURIComponent(serverId)}/media-image?path=${encodeURIComponent(path)}` : "";
 }
 
+function deferredMediaImageMarkup(source, alt, className = "") {
+  if (!source) return '<span class="media-poster-fallback" aria-hidden="true">影</span>';
+  const classes = ["deferred-media-image", "media-lightbox-image", className].filter(Boolean).join(" ");
+  return `<img class="${classes}" data-src="${escapeHtml(source)}" data-lightbox-src="${escapeHtml(source)}" alt="${escapeHtml(alt || "封面")}" decoding="async">`;
+}
+
+function bindDeferredMediaImages() {
+  state.mediaLibraryImageObserver?.disconnect();
+  state.mediaLibraryImageObserver = null;
+  const images = Array.from(document.querySelectorAll("img.deferred-media-image[data-src]"));
+  const load = (image) => {
+    if (!image || image.dataset.imageState === "loaded" || image.dataset.imageState === "failed") return;
+    const source = image.dataset.src;
+    if (!source) return;
+    image.dataset.imageState = "loading";
+    image.addEventListener("load", () => { image.dataset.imageState = "loaded"; }, { once: true });
+    image.addEventListener("error", () => {
+      image.dataset.imageState = "failed";
+      image.classList.add("media-image-error");
+      image.removeAttribute("src");
+    }, { once: true });
+    image.src = source;
+  };
+  if (!images.length) return;
+  if (!("IntersectionObserver" in window)) {
+    images.forEach(load);
+    return;
+  }
+  state.mediaLibraryImageObserver = new IntersectionObserver((entries) => {
+    entries.forEach((entry) => {
+      if (!entry.isIntersecting) return;
+      state.mediaLibraryImageObserver?.unobserve(entry.target);
+      load(entry.target);
+    });
+  }, { rootMargin: "700px 0px" });
+  images.forEach((image) => state.mediaLibraryImageObserver.observe(image));
+}
+
 function openMediaImageLightbox(source, alt = "") {
   if (!source) return;
   let lightbox = document.querySelector("#media-image-lightbox");
@@ -310,10 +355,9 @@ async function refreshMediaLibrarySyncStatus(serverId) {
 
 function resetMediaLibraryWindow() {
   state.mediaLibraryItemsGeneration += 1;
-  state.mediaLibraryItemsOffset = 0;
   state.mediaLibraryItemsTotal = 0;
-  state.mediaLibraryItemsHasMore = false;
   state.mediaLibraryItemsLoading = false;
+  state.mediaLibraryLoadingLibraryId = null;
   state.mediaLibraryDetailQueue = [];
   state.mediaLibraryDetailActive = 0;
   state.mediaLibraryDetailRequests.forEach((controller) => controller.abort());
@@ -322,48 +366,120 @@ function resetMediaLibraryWindow() {
   state.mediaLibraryAbortController = null;
   state.mediaLibraryObserver?.disconnect();
   state.mediaLibraryObserver = null;
+  state.mediaLibraryImageObserver?.disconnect();
+  state.mediaLibraryImageObserver = null;
+  if (state.mediaLibraryScrollHandler) window.removeEventListener("scroll", state.mediaLibraryScrollHandler);
+  state.mediaLibraryScrollHandler = null;
 }
 
-function mediaLibraryQuery(serverId, libraryId, offset = 0) {
+function mediaLibraryQuery(serverId, libraryId) {
   const params = new URLSearchParams({
-    offset: String(offset),
-    limit: String(state.mediaLibraryItemsBatch),
+    mode: "full",
     sort: state.mediaLibrarySort || "name",
     direction: state.mediaLibraryDirection || "asc",
   });
   return `/api/servers/${encodeURIComponent(serverId)}/media-library/${encodeURIComponent(libraryId)}/items?${params}`;
 }
 
-async function loadMediaLibraryBatch(serverId, library, replace = false) {
-  if (!library || state.mediaLibraryItemsLoading) return;
+function mediaLibraryCacheKey(serverId, libraryId) {
+  return `${String(serverId)}:${String(libraryId)}:${state.mediaLibrarySort || "name"}:${state.mediaLibraryDirection || "asc"}`;
+}
+
+function mediaLibraryQuarterCacheKey(serverId, libraryId) {
+  return `${String(serverId)}:${String(libraryId)}`;
+}
+
+function invalidateMediaLibraryCache(serverId, libraryId = null) {
+  const serverPrefix = `${String(serverId)}:`;
+  if (libraryId === null || libraryId === undefined) {
+    for (const key of state.mediaLibraryContentCache.keys()) {
+      if (key.startsWith(serverPrefix)) state.mediaLibraryContentCache.delete(key);
+    }
+    for (const key of state.mediaLibraryQuarterCache.keys()) {
+      if (key.startsWith(serverPrefix)) state.mediaLibraryQuarterCache.delete(key);
+    }
+    return;
+  }
+  const libraryPrefix = `${String(serverId)}:${String(libraryId)}:`;
+  for (const key of state.mediaLibraryContentCache.keys()) {
+    if (key.startsWith(libraryPrefix)) state.mediaLibraryContentCache.delete(key);
+  }
+  state.mediaLibraryQuarterCache.delete(mediaLibraryQuarterCacheKey(serverId, libraryId));
+}
+
+function applyMediaLibraryContentCache(serverId, library) {
+  if (!library || (library.kind === "show" && library.is_animation)) return false;
+  const cached = state.mediaLibraryContentCache.get(mediaLibraryCacheKey(serverId, library.id));
+  if (!cached) return false;
+  library.items = cached.items;
+  library.item_count = cached.total || library.item_count;
+  library._itemsLoaded = true;
+  library._itemsSort = cached.sort;
+  library._itemsDirection = cached.direction;
+  state.mediaLibraryItemsTotal = Number(cached.total || library.items.length);
+  return true;
+}
+
+function applyMediaLibraryQuarterCache(serverId, library) {
+  if (!library?.is_animation) return null;
+  const cached = state.mediaLibraryQuarterCache.get(mediaLibraryQuarterCacheKey(serverId, library.id));
+  if (!cached) return null;
+  state.mediaLibraryQuarterGroups = cached.groups;
+  state.mediaLibraryLiveItems = cached.liveItems;
+  return cached;
+}
+
+async function loadMediaLibraryBatch(serverId, library, selectionGeneration = state.mediaLibrarySelectionGeneration) {
+  if (!library) return;
+  if (
+    state.mediaLibraryItemsLoading &&
+    String(state.mediaLibraryLoadingLibraryId) === String(library.id) &&
+    selectionGeneration === state.mediaLibrarySelectionGeneration
+  ) return;
+  if (state.mediaLibraryItemsLoading && state.mediaLibraryAbortController) {
+    state.mediaLibraryAbortController.abort();
+  }
   state.mediaLibraryItemsLoading = true;
+  state.mediaLibraryLoadingLibraryId = library.id;
   const generation = state.mediaLibraryItemsGeneration;
-  const offset = replace ? 0 : state.mediaLibraryItemsOffset;
   const controller = new AbortController();
   state.mediaLibraryAbortController = controller;
   try {
-    const result = await api(mediaLibraryQuery(serverId, library.id, offset), { signal: controller.signal });
-    if (generation !== state.mediaLibraryItemsGeneration) return;
+    const result = await api(mediaLibraryQuery(serverId, library.id), { signal: controller.signal });
+    if (generation !== state.mediaLibraryItemsGeneration || selectionGeneration !== state.mediaLibrarySelectionGeneration) return;
     const incoming = result.items || [];
-    library.items = replace ? incoming : [...(library.items || []), ...incoming];
+    library.items = incoming;
     library._itemsLoaded = true;
-    state.mediaLibraryItemsOffset = Number(result.offset || offset) + incoming.length;
     state.mediaLibraryItemsTotal = Number(result.total || library.item_count || library.items.length);
-    state.mediaLibraryItemsHasMore = Boolean(result.has_more);
+    library._itemsSort = state.mediaLibrarySort;
+    library._itemsDirection = state.mediaLibraryDirection;
+    state.mediaLibraryContentCache.set(mediaLibraryCacheKey(serverId, library.id), {
+      items: incoming,
+      total: state.mediaLibraryItemsTotal,
+      sort: state.mediaLibrarySort,
+      direction: state.mediaLibraryDirection,
+      loadedAt: Date.now(),
+    });
     renderMediaLibraryPage(serverId);
   } catch (error) {
     if (error.name !== "AbortError") setMessage("#media-library-message", error.message, true);
   } finally {
-    if (state.mediaLibraryAbortController === controller) state.mediaLibraryAbortController = null;
-    state.mediaLibraryItemsLoading = false;
+    if (state.mediaLibraryAbortController === controller) {
+      state.mediaLibraryAbortController = null;
+      state.mediaLibraryItemsLoading = false;
+      state.mediaLibraryLoadingLibraryId = null;
+    }
   }
 }
 
 function observeMediaLibraryNodes(serverId) {
   state.mediaLibraryObserver?.disconnect();
+  if (state.mediaLibraryScrollHandler) window.removeEventListener("scroll", state.mediaLibraryScrollHandler);
+  state.mediaLibraryScrollHandler = null;
   const root = $("#media-library-content");
   if (!root || !("IntersectionObserver" in window)) {
     Array.from(root?.querySelectorAll("[data-show-card]") || []).slice(0, 8).forEach((node) => queueMediaLibraryDetail(serverId, node));
+    bindDeferredMediaImages();
     return;
   }
   state.mediaLibraryObserver = new IntersectionObserver((entries) => {
@@ -371,19 +487,13 @@ function observeMediaLibraryNodes(serverId) {
       if (!entry.isIntersecting) continue;
       const node = entry.target;
       state.mediaLibraryObserver.unobserve(node);
-      if (node.dataset.mediaLibrarySentinel) {
-        const library = state.mediaLibraryData.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
-        loadMediaLibraryBatch(serverId, library);
-        continue;
-      }
       if (node.dataset.showCard) queueMediaLibraryDetail(serverId, node);
     }
   }, { rootMargin: "700px 0px" });
   root.querySelectorAll("[data-show-card]").forEach((node) => {
     if (node.querySelector(".show-details-loading")) state.mediaLibraryObserver.observe(node);
   });
-  const sentinel = root.querySelector("[data-media-library-sentinel]");
-  if (sentinel) state.mediaLibraryObserver.observe(sentinel);
+  bindDeferredMediaImages();
 }
 
 function queueMediaLibraryDetail(serverId, card) {
@@ -402,10 +512,14 @@ async function drainMediaLibraryDetailQueue() {
     state.mediaLibraryDetailActive += 1;
     api(`/api/servers/${encodeURIComponent(serverId)}/media-library/item?library_id=${encodeURIComponent(card.dataset.libraryId)}&rating_key=${encodeURIComponent(key)}&media_type=show`, { signal: controller.signal })
       .then((fresh) => {
+        const library = state.mediaLibraryData.find((entry) => String(entry.id) === String(card.dataset.libraryId));
+        const show = library?.items?.find((entry) => String(entry.rating_key) === String(fresh.rating_key));
+        if (show) Object.assign(show, fresh);
         if (!card.isConnected) return;
         const focusSeason = card.dataset.showCard?.startsWith(`${fresh.rating_key}-`) ? Number(card.dataset.showCard.slice(String(fresh.rating_key).length + 1)) : null;
         card.outerHTML = renderShowCard(fresh, serverId, Number.isFinite(focusSeason) ? focusSeason : null);
         bindMediaLibraryEvents();
+        bindDeferredMediaImages();
       })
       .catch((error) => {
         if (error.name !== "AbortError" && card.isConnected) {
@@ -470,7 +584,8 @@ function renderMediaLibrary(libraries, serverId) {
   const syncLibrary = libraries.find((library) => String(library.id) === String(state.mediaLibrarySelectedId));
   renderMediaLibraryAutoRecheck(syncLibrary, serverId);
   if (syncLibrary) {
-    state.mediaLibrarySort = syncLibrary.sort_key || state.mediaLibrarySort;
+    state.mediaLibrarySort = MEDIA_LIBRARY_SORT_KEYS.has(syncLibrary.sort_key) ? syncLibrary.sort_key : state.mediaLibrarySort;
+    if (!MEDIA_LIBRARY_SORT_KEYS.has(state.mediaLibrarySort)) state.mediaLibrarySort = "name";
     state.mediaLibraryDirection = syncLibrary.sort_direction || state.mediaLibraryDirection;
     if (sort) sort.value = state.mediaLibrarySort;
     if (sortDirection) sortDirection.textContent = state.mediaLibraryDirection === "asc" ? "升序" : "降序";
@@ -502,11 +617,10 @@ function renderMediaLibrary(libraries, serverId) {
     });
   });
   $("#media-library-tabs").querySelectorAll("[data-library-tab]").forEach((button) => button.addEventListener("click", () => {
-    state.mediaLibrarySelectedId = button.dataset.libraryTab;
     state.mediaLibraryPage = 1;
-    picker.value = state.mediaLibrarySelectedId;
+    picker.value = button.dataset.libraryTab;
     $("#media-library-tabs").querySelectorAll(".media-library-tab").forEach((item) => item.classList.toggle("active", item === button));
-    selectMediaLibrary(state.mediaLibrarySelectedId, serverId);
+    selectMediaLibrary(button.dataset.libraryTab, serverId);
   }));
   // Animation libraries are rendered from the quarter index below. Avoid
   // briefly showing an empty ordinary library panel while that index loads.
@@ -538,10 +652,16 @@ function renderMediaLibrarySyncProgress(library) {
 
 async function selectMediaLibrary(libraryId, serverId) {
   const previousLibraryId = state.mediaLibrarySelectedId;
+  const selectionGeneration = Number(state.mediaLibrarySelectionGeneration) + 1;
+  state.mediaLibrarySelectionGeneration = selectionGeneration;
   if (String(previousLibraryId) !== String(libraryId)) state.mediaLibraryQuarterSignature = "";
   resetMediaLibraryWindow();
   state.mediaLibrarySelectedId = libraryId;
   state.mediaLibraryPage = 1;
+  state.mediaLibraryQuarterGroups = null;
+  state.mediaLibraryLiveItems = [];
+  const content = $("#media-library-content");
+  if (content) content.innerHTML = '<div class="panel media-empty media-library-loading" role="status"><span class="loading-spinner" aria-hidden="true"></span><span>正在切换媒体库…</span></div>';
   const picker = $("#media-library-picker");
   if (picker) picker.value = String(libraryId);
   $("#media-library-tabs")?.querySelectorAll("[data-library-tab]").forEach((button) => {
@@ -549,6 +669,10 @@ async function selectMediaLibrary(libraryId, serverId) {
   });
   const library = state.mediaLibraryData.find((item) => String(item.id) === String(libraryId));
   renderMediaLibraryAutoRecheck(library, serverId);
+  if (!library?.is_animation && !MEDIA_LIBRARY_SORT_KEYS.has(state.mediaLibrarySort)) {
+    state.mediaLibrarySort = "name";
+    state.mediaLibraryDirection = "asc";
+  }
   if (library?.is_animation) {
     state.mediaLibrarySort = "first_episode_date";
     state.mediaLibraryDirection = "desc";
@@ -557,20 +681,38 @@ async function selectMediaLibrary(libraryId, serverId) {
     const direction = $("#media-library-sort-direction");
     if (direction) direction.textContent = "降序";
   }
-  if (library?.kind === "show" && library.is_animation) {
-    // Selecting the already-visible animation library is common when using
-    // search jump links. Keep the existing quarter DOM in place so the page
-    // does not flash or reflow back to the top.
-    if (String(previousLibraryId) === String(library.id) && document.querySelector("#media-library-content .quarter-layout")) {
-      observeMediaLibraryNodes(serverId);
-      return;
+  try {
+    if (library?.kind === "show" && library.is_animation) {
+      const cached = applyMediaLibraryQuarterCache(serverId, library);
+      const quarter = cached || await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
+      if (selectionGeneration !== state.mediaLibrarySelectionGeneration || String(state.mediaLibrarySelectedId) !== String(libraryId)) return;
+      state.mediaLibraryQuarterGroups = cached ? cached.groups : (quarter.groups || []);
+      state.mediaLibraryLiveItems = cached ? cached.liveItems : (quarter.live_items || []);
+      if (!cached) {
+        state.mediaLibraryQuarterCache.set(mediaLibraryQuarterCacheKey(serverId, library.id), {
+          groups: state.mediaLibraryQuarterGroups,
+          liveItems: state.mediaLibraryLiveItems,
+          loadedAt: Date.now(),
+        });
+      }
+      renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
+    } else {
+      // Replace the previous library's DOM immediately. The new request may
+      // take a moment, but stale quarter cards must never remain visible.
+      renderMediaLibraryPage(serverId);
+      if (applyMediaLibraryContentCache(serverId, library)) renderMediaLibraryPage(serverId);
+      else await loadMediaLibraryBatch(serverId, library, selectionGeneration);
+      if (selectionGeneration === state.mediaLibrarySelectionGeneration && library && !library._itemsLoaded) {
+        // A superseded initial request may still be unwinding while this
+        // selection is already current. Render the correct library shell now;
+        // the guarded request will fill its rows when it completes.
+        renderMediaLibraryPage(serverId);
+      }
     }
-    const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
-    state.mediaLibraryQuarterGroups = quarter.groups || [];
-    state.mediaLibraryLiveItems = quarter.live_items || [];
-    renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
-  } else {
-    await loadMediaLibraryBatch(serverId, library, true);
+  } catch (error) {
+    if (selectionGeneration !== state.mediaLibrarySelectionGeneration) return;
+    setMessage("#media-library-message", error.message || "媒体库加载失败", true);
+    if (content) content.innerHTML = `<div class="panel media-empty error" role="alert">读取媒体库失败：${escapeHtml(error.message || "未知错误")}</div>`;
   }
 }
 
@@ -587,12 +729,12 @@ function renderMediaLibraryPage(serverId) {
   const panel = (() => {
     const collectionMarkup = (library.collections || []).length ? `<div class="library-collections"><div class="section-label">合集 · ${library.collections.length}</div><div class="collection-strip">${library.collections.map((item) => `<div class="collection-chip"><strong>${escapeHtml(item.title)}</strong><span>${item.child_count || 0} 项</span></div>`).join("")}</div></div>` : "";
     if (library.kind === "movie") {
-      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">MOVIES · ${library.item_count || state.mediaLibraryItemsTotal || pageItems.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载 ${pageItems.length} 项${state.mediaLibraryItemsHasMore ? "，继续滚动加载" : ""}</span></div><span class="library-type">电影</span></div>${collectionMarkup}<div class="movie-table-wrap"><table class="movie-table"><thead><tr><th>海报</th><th>标题</th><th>年份</th><th>类型</th><th>标签</th><th>分辨率</th><th>分级</th><th>片长</th><th>操作</th></tr></thead><tbody>${pageItems.map((item) => { const resolution = item.resolution || "×"; const poster = item.thumb ? mediaImageUrl(serverId, item.thumb) : (item.poster_url || ""); return `<tr class="${resolution === "×" ? "resolution-missing" : ""}" data-rating-key="${escapeHtml(item.rating_key)}" data-library-id="${library.id}"><td>${poster ? `<img loading="lazy" decoding="async" class="table-poster media-lightbox-image" data-lightbox-src="${escapeHtml(poster)}" src="${poster}" alt="${escapeHtml(item.title || "封面")}">` : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.plex_type || "电影")}</td><td>${escapeHtml(item.genre || (item.system_genres || []).join(", ") || "-")}</td><td class="resolution-cell">${escapeHtml(resolution)}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><button class="small media-detail-link" type="button" data-library-id="${library.id}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`; }).join("")}</tbody></table></div>${state.mediaLibraryItemsHasMore ? '<div class="media-library-sentinel" data-media-library-sentinel aria-hidden="true"></div>' : ""}</section>`;
+      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">MOVIES · ${library.item_count || state.mediaLibraryItemsTotal || pageItems.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">共 ${pageItems.length} 项</span></div><span class="library-type">电影</span></div>${collectionMarkup}<div class="movie-table-wrap"><table class="movie-table"><thead><tr><th>海报</th><th>标题</th><th>年份</th><th>类型</th><th>标签</th><th>分辨率</th><th>分级</th><th>片长</th><th>操作</th></tr></thead><tbody>${pageItems.map((item) => { const resolution = item.resolution || "×"; const poster = item.thumb ? mediaImageUrl(serverId, item.thumb) : (item.poster_url || ""); return `<tr class="${resolution === "×" ? "resolution-missing" : ""}" data-rating-key="${escapeHtml(item.rating_key)}" data-library-id="${library.id}"><td>${poster ? deferredMediaImageMarkup(poster, item.title || "封面", "table-poster") : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.plex_type || "电影")}</td><td>${escapeHtml(item.genre || (item.system_genres || []).join(", ") || "-")}</td><td class="resolution-cell">${escapeHtml(resolution)}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><button class="small media-detail-link" type="button" data-library-id="${library.id}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`; }).join("")}</tbody></table></div></section>`;
     }
     if (library.kind === "show") {
-      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">SERIES · ${library.item_count || state.mediaLibraryItemsTotal || pageItems.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载 ${pageItems.length} 项${state.mediaLibraryItemsHasMore ? "，继续滚动加载" : ""}</span></div><span class="library-type">剧集</span></div>${collectionMarkup}<div class="show-grid">${pageItems.map((show) => renderShowCard(show, serverId)).join("")}</div>${state.mediaLibraryItemsHasMore ? '<div class="media-library-sentinel" data-media-library-sentinel aria-hidden="true"></div>' : ""}</section>`;
+      return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">SERIES · ${library.item_count || state.mediaLibraryItemsTotal || pageItems.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">共 ${pageItems.length} 项</span></div><span class="library-type">剧集</span></div>${collectionMarkup}<div class="show-grid">${pageItems.map((show) => renderShowCard(show, serverId)).join("")}</div></section>`;
     }
-    return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">COLLECTIONS · ${library.item_count || state.mediaLibraryItemsTotal || pageItems.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">已加载 ${pageItems.length} 项${state.mediaLibraryItemsHasMore ? "，继续滚动加载" : ""}</span></div><span class="library-type">合集</span></div><div class="collection-grid">${pageItems.map((item) => `<article class="collection-card">${item.thumb ? `<img loading="lazy" decoding="async" src="${mediaImageUrl(serverId, item.thumb)}" alt="">` : '<div class="collection-fallback">集</div>'}<div><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.summary || "暂无简介")}</span></div></article>`).join("")}</div>${state.mediaLibraryItemsHasMore ? '<div class="media-library-sentinel" data-media-library-sentinel aria-hidden="true"></div>' : ""}</section>`;
+    return `<section class="panel library-panel"><div class="library-heading"><div><span class="eyebrow">COLLECTIONS · ${library.item_count || state.mediaLibraryItemsTotal || pageItems.length}</span><h3>${escapeHtml(library.title)}</h3><span class="meta">共 ${pageItems.length} 项</span></div><span class="library-type">合集</span></div><div class="collection-grid">${pageItems.map((item) => `<article class="collection-card">${item.thumb ? deferredMediaImageMarkup(mediaImageUrl(serverId, item.thumb), item.title || "封面") : '<div class="collection-fallback">集</div>'}<div><strong>${escapeHtml(item.title)}</strong><span>${escapeHtml(item.summary || "暂无简介")}</span></div></article>`).join("")}</div></section>`;
   })();
   content.innerHTML = panel;
   bindMediaLibraryEvents();
@@ -744,10 +886,12 @@ async function loadVisibleQuarterDetails(serverId, groups) {
     try {
       const fresh = await api(`/api/servers/${serverId}/media-library/item?library_id=${encodeURIComponent(entry.library_id)}&rating_key=${encodeURIComponent(entry.rating_key)}&media_type=show`);
       card.outerHTML = renderShowCard(fresh, serverId, entry.season);
+      bindDeferredMediaImages();
       const replacement = document.querySelector(`[data-show-card="${CSS.escape(cardKey)}"]`);
       replacement?.querySelector(".media-recheck")?.addEventListener("click", handleMediaRecheck);
       replacement?.querySelector(".media-detail-link")?.addEventListener("click", () => openMediaDetail(fresh.rating_key, entry.library_id, "show"));
       bindMediaKindToggles();
+      bindDeferredMediaImages();
       bindSeasonToggles();
     } catch (_) {
       card.querySelector(".show-details-loading")?.replaceWith(Object.assign(document.createElement("div"), { className: "show-details-loading error", textContent: "剧集详情读取失败，可点击“重新检查”重试。" }));
@@ -774,7 +918,7 @@ function sortMediaItems(items) {
 function renderMovieTableRow(item, serverId, libraryId) {
   const resolution = item.resolution || "×";
   const poster = item.thumb ? mediaImageUrl(serverId, item.thumb) : (item.poster_url || "");
-  return `<tr class="${resolution === "×" ? "resolution-missing" : ""}" data-rating-key="${escapeHtml(item.rating_key)}" data-library-id="${libraryId}"><td>${poster ? `<img class="table-poster media-lightbox-image" data-lightbox-src="${escapeHtml(poster)}" src="${escapeHtml(poster)}" alt="${escapeHtml(item.title || "封面")}" loading="lazy" decoding="async">` : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title || "")}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.plex_type || "电影")}</td><td>${escapeHtml(item.genre || (item.system_genres || []).join(", ") || "-")}</td><td class="resolution-cell">${escapeHtml(resolution)}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><button class="small media-detail-link" type="button" data-library-id="${libraryId}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`;
+  return `<tr class="${resolution === "×" ? "resolution-missing" : ""}" data-rating-key="${escapeHtml(item.rating_key)}" data-library-id="${libraryId}"><td>${poster ? deferredMediaImageMarkup(poster, item.title || "封面", "table-poster") : '<span class="table-poster fallback">影</span>'}</td><td><strong>${escapeHtml(item.title || "")}</strong><small>${escapeHtml(item.original_title || "")}</small></td><td>${escapeHtml(item.year || "-")}</td><td>${escapeHtml(item.plex_type || "电影")}</td><td>${escapeHtml(item.genre || (item.system_genres || []).join(", ") || "-")}</td><td class="resolution-cell">${escapeHtml(resolution)}</td><td>${escapeHtml(item.content_rating || "-")}</td><td>${formatMinutes(item.duration)}</td><td><button class="small media-detail-link" type="button" data-library-id="${libraryId}" data-rating-key="${escapeHtml(item.rating_key)}" data-media-type="movie">查看详情</button></td></tr>`;
 }
 
 function refreshMediaLibraryCounts() {
@@ -838,6 +982,7 @@ function bindPatchedMediaItem(item) {
   root?.querySelectorAll(`[data-rating-key="${CSS.escape(String(item.rating_key))}"] .media-detail-link`).forEach((button) => button.addEventListener("click", () => openMediaDetail(button.dataset.ratingKey, button.dataset.libraryId, button.dataset.mediaType)));
   root?.querySelectorAll(`[data-rating-key="${CSS.escape(String(item.rating_key))}"] .media-recheck`).forEach((button) => button.addEventListener("click", handleMediaRecheck));
   bindSeasonToggles();
+  bindDeferredMediaImages();
 }
 
 function patchVisibleMediaItem(item, serverId) {
@@ -952,14 +1097,20 @@ function rerenderSelectedMediaLibrary(serverId) {
 async function reloadSelectedMediaLibrary(serverId) {
   const library = state.mediaLibraryData.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
   resetMediaLibraryWindow();
+  invalidateMediaLibraryCache(serverId, library?.id);
   if (library?.kind === "show" && library.is_animation) {
     const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
     state.mediaLibraryQuarterGroups = quarter.groups || [];
     state.mediaLibraryLiveItems = quarter.live_items || [];
+    state.mediaLibraryQuarterCache.set(mediaLibraryQuarterCacheKey(serverId, library.id), {
+      groups: state.mediaLibraryQuarterGroups,
+      liveItems: state.mediaLibraryLiveItems,
+      loadedAt: Date.now(),
+    });
     renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
     return;
   }
-  await loadMediaLibraryBatch(serverId, library, true);
+  await loadMediaLibraryBatch(serverId, library);
 }
 
 async function handleMediaRecheck(event) {
@@ -982,6 +1133,7 @@ async function handleMediaRecheck(event) {
       replacement?.querySelector(".media-recheck")?.addEventListener("click", handleMediaRecheck);
       replacement?.querySelector(".media-detail-link")?.addEventListener("click", () => openMediaDetail(fresh.rating_key, fresh.library_id, "show"));
       bindMediaKindToggles();
+      bindDeferredMediaImages();
       bindSeasonToggles();
     }
     await refreshMediaLibrarySyncStatus(serverId);
@@ -1017,7 +1169,7 @@ function renderShowCard(show, serverId, focusSeason = null) {
   const cardKey = `${show.rating_key}${focusSeason === null ? "" : `-${focusSeason}`}`;
   const poster = show.thumb ? mediaImageUrl(serverId, show.thumb) : (show.poster_url || "");
   const idMarkup = renderExternalIdBadges(show, "tv", "media-show-ids");
-  return `<article class="show-card" data-show-card="${escapeHtml(cardKey)}" data-rating-key="${escapeHtml(show.rating_key)}" data-library-id="${show.library_id}"><div class="show-card-head">${poster ? `<img class="media-lightbox-image" data-lightbox-src="${escapeHtml(poster)}" loading="lazy" decoding="async" src="${poster}" alt="${escapeHtml(show.title || "封面")}">` : '<div class="show-fallback">剧</div>'}<div class="show-card-title"><div class="show-title-line"><h4>${escapeHtml(show.title)}</h4></div><p>${escapeHtml(show.original_title || "")}</p><span class="meta">${escapeHtml(show.year || "未知年份")} · ${seasons.length ? `${seasons.length} 季 · ${episodeCount} 集` : "详情读取中"}${show.genre ? ` · ${escapeHtml(show.genre)}` : ""}</span>${idMarkup}</div><div class="media-card-actions"><button class="small media-recheck" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}">重新检查</button><button class="small media-detail-link" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}" data-media-type="show">查看详情</button></div></div><div class="season-list">${seasonMarkup}</div></article>`;
+  return `<article class="show-card" data-show-card="${escapeHtml(cardKey)}" data-rating-key="${escapeHtml(show.rating_key)}" data-library-id="${show.library_id}"><div class="show-card-head">${poster ? deferredMediaImageMarkup(poster, show.title || "封面") : '<div class="show-fallback">剧</div>'}<div class="show-card-title"><div class="show-title-line"><h4>${escapeHtml(show.title)}</h4></div><p>${escapeHtml(show.original_title || "")}</p><span class="meta">${escapeHtml(show.year || "未知年份")} · ${seasons.length ? `${seasons.length} 季 · ${episodeCount} 集` : "详情读取中"}${show.genre ? ` · ${escapeHtml(show.genre)}` : ""}</span>${idMarkup}</div><div class="media-card-actions"><button class="small media-recheck" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}">重新检查</button><button class="small media-detail-link" type="button" data-library-id="${show.library_id}" data-rating-key="${escapeHtml(show.rating_key)}" data-media-type="show">查看详情</button></div></div><div class="season-list">${seasonMarkup}</div></article>`;
 }
 
 function episodeAvailability(episode) {
@@ -1070,6 +1222,7 @@ async function loadVisibleShowDetails(serverId) {
       card.outerHTML = renderShowCard(fresh, serverId);
       document.querySelector(`[data-show-card="${CSS.escape(fresh.rating_key)}"] .media-recheck`)?.addEventListener("click", handleMediaRecheck);
       bindMediaKindToggles();
+      bindDeferredMediaImages();
     } catch (_) {
       card.querySelector(".show-details-loading")?.replaceWith(Object.assign(document.createElement("div"), { className: "show-details-loading error", textContent: "剧集详情读取失败，可点击“重新检查”重试。" }));
     }
@@ -1077,6 +1230,7 @@ async function loadVisibleShowDetails(serverId) {
 }
 
 async function loadMediaLibrary() {
+  const loadGeneration = state.mediaLibrarySelectionGeneration;
   const saved = state.preferences.media_library_state || {};
   if (saved.serverId && $("#media-library-server")?.querySelector(`option[value="${CSS.escape(String(saved.serverId))}"]`)) {
     $("#media-library-server").value = String(saved.serverId);
@@ -1097,6 +1251,7 @@ async function loadMediaLibrary() {
       state.mediaLibraryDirection = saved.direction || state.mediaLibraryDirection;
     }
     const result = await api(`/api/servers/${serverId}/media-library`);
+    if (loadGeneration !== state.mediaLibrarySelectionGeneration) return;
     renderMediaLibrary(result.libraries || [], serverId);
     const library = state.mediaLibraryData.find((item) => String(item.id) === String(state.mediaLibrarySelectedId));
     if (library?.is_animation && !library.sort_key && !saved.sort) {
@@ -1105,12 +1260,22 @@ async function loadMediaLibrary() {
     }
     resetMediaLibraryWindow();
     if (library && !(library.kind === "show" && library.is_animation)) {
-      await loadMediaLibraryBatch(serverId, library, true);
+      if (applyMediaLibraryContentCache(serverId, library)) renderMediaLibraryPage(serverId);
+      else await loadMediaLibraryBatch(serverId, library, loadGeneration);
     }
     if (library?.kind === "show" && library.is_animation) {
-      const quarter = await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
-      state.mediaLibraryQuarterGroups = quarter.groups || [];
-      state.mediaLibraryLiveItems = quarter.live_items || [];
+      const cached = applyMediaLibraryQuarterCache(serverId, library);
+      const quarter = cached || await api(`/api/servers/${serverId}/media-library/${library.id}/quarter-index`);
+      if (loadGeneration !== state.mediaLibrarySelectionGeneration || String(state.mediaLibrarySelectedId) !== String(library.id)) return;
+      state.mediaLibraryQuarterGroups = cached ? cached.groups : (quarter.groups || []);
+      state.mediaLibraryLiveItems = cached ? cached.liveItems : (quarter.live_items || []);
+      if (!cached) {
+        state.mediaLibraryQuarterCache.set(mediaLibraryQuarterCacheKey(serverId, library.id), {
+          groups: state.mediaLibraryQuarterGroups,
+          liveItems: state.mediaLibraryLiveItems,
+          loadedAt: Date.now(),
+        });
+      }
       renderAnimationQuarterPage(state.mediaLibraryQuarterGroups, serverId, state.mediaLibraryLiveItems);
     }
     setMessage("#media-library-message", "");
@@ -1142,6 +1307,7 @@ function startMediaLibrarySyncPolling(serverId) {
       }
       if (!hasActive()) {
         state.mediaLibrarySyncTimer = null;
+        invalidateMediaLibraryCache(serverId);
         await loadMediaLibrary();
         return;
       }
@@ -1164,7 +1330,7 @@ $("#media-library-refresh")?.addEventListener("click", async () => {
   const serverId = $("#media-library-server")?.value;
   const libraryId = state.mediaLibrarySelectedId;
   if (!serverId || !libraryId) return;
-  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/refresh`, { method: "POST", body: "{}" }); setMessage("#media-library-message", `已开始同步媒体库、更新 TMDB 数据并检查缺失剧集：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
+  try { const result = await api(`/api/servers/${serverId}/media-library/${libraryId}/refresh`, { method: "POST", body: "{}" }); invalidateMediaLibraryCache(serverId); setMessage("#media-library-message", `已开始同步媒体库、更新 TMDB 数据并检查缺失剧集：${result.id}`); await loadMediaLibrary(); } catch (error) { setMessage("#media-library-message", error.message, true); }
 });
 
 function searchLibraryOptions(kind) {
@@ -1287,7 +1453,7 @@ function renderMediaSearchRowResults(row) {
     const firstLocation = (item.locations || [])[0] || {};
     const label = item.media_type === "movie" ? "电影" : "剧集";
     const posterUrl = item.poster_url || (item.thumb && serverId ? mediaImageUrl(serverId, item.thumb) : "");
-    const poster = posterUrl ? `<img class="search-result-poster media-lightbox-image" data-lightbox-src="${escapeHtml(posterUrl)}" src="${escapeHtml(posterUrl)}" alt="${escapeHtml(item.title || "封面")}" loading="lazy" decoding="async">` : `<span class="search-result-poster fallback">影</span>`;
+    const poster = posterUrl ? deferredMediaImageMarkup(posterUrl, item.title || "封面", "search-result-poster") : `<span class="search-result-poster fallback">影</span>`;
     const action = item.can_add ? `<select class="search-target-library" data-kind="${item.media_type}">${searchLibraryOptions(item.media_type === "movie" ? "movie" : "show")}</select><button class="small primary media-search-add" data-type="${item.media_type}" data-tmdb-id="${item.tmdb_id}">添加到媒体库</button><span class="media-search-add-status meta" hidden></span>` : `<span class="meta">${escapeHtml(item.add_status || item.duplicate_reason || "已存在")}</span>`;
     const jump = item.source !== "tmdb" && ((item.locations || []).length || item.rating_key) ? `<button class="small media-search-jump" type="button" data-result-index="${resultIndex}" title="跳转到媒体库条目">↗</button>` : "";
     const sourceLabels = [...new Set((item.source_labels || (item.source === "merged" ? ["媒体库", "本系统", "TMDB"] : item.source === "tmdb" ? ["TMDB"] : item.source === "catalog" ? ["本系统"] : ["媒体库"])).map((source) => String(source).startsWith("媒体服务器") ? "媒体服务器" : source))];
@@ -1295,7 +1461,8 @@ function renderMediaSearchRowResults(row) {
     return `<article class="media-search-result" data-location-library-id="${escapeHtml(firstLocation.library_id || item.library_id || "")}" data-location-rating-key="${escapeHtml(firstLocation.rating_key || item.rating_key || "")}" data-result-index="${resultIndex}"><div>${poster}</div><div class="search-result-main"><strong>${escapeHtml(item.title || "未命名")}</strong><span>${escapeHtml(item.original_title || "")} · ${escapeHtml(item.year || "未知年份")} · ${label}</span>${ids}<small>${escapeHtml((item.genres || []).join(", ") || "无标签")}</small><small class="media-source-badges">${sourceLabels.map((source) => `<span class="media-source-badge">${escapeHtml(source)}</span>`).join("")}${item.media_type === "movie" && item.resolution ? ` · ${escapeHtml(item.resolution)}` : ""}</small></div><div class="media-card-actions">${jump}${action}</div></article>`;
   }).join("") || (row.status && !row.error ? '<div class="media-empty">没有找到匹配作品。</div>' : "");
 
-  target.querySelectorAll(".media-search-jump").forEach((button) => button.addEventListener("click", async () => {
+   bindDeferredMediaImages();
+   target.querySelectorAll(".media-search-jump").forEach((button) => button.addEventListener("click", async () => {
     button.disabled = true;
     try { await jumpToMediaSearchLocation(results[Number(button.dataset.resultIndex)]); }
     catch (error) { row.status = error.message || "跳转媒体库条目失败"; row.error = true; renderMediaSearchRow(row); }
