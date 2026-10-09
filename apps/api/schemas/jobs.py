@@ -20,3 +20,24 @@ class JobRead(BaseModel):
     server_id: int | None
     status: str
     payload: dict[str, Any]
+    error: str = ""
+    request_id: str = ""
+    created_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+class JobLogRead(BaseModel):
+    id: int
+    message: str
+    level: str
+    created_at: str
+
+
+class JobEventRead(BaseModel):
+    id: int
+    event_id: UUID
+    event_type: str
+    request_id: str
+    payload: dict[str, Any]
+    created_at: str

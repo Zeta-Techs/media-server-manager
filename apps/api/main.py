@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -33,6 +34,14 @@ def create_app() -> FastAPI:
         else:
             message = "internal server error"
         return JSONResponse(status_code=500, content={"error": {"code": "internal_error", "message": message, "details": {}}, "request_id": getattr(request.state, "request_id", "")})
+
+    @app.exception_handler(HTTPException)
+    async def handle_http_exception(request: Request, exc: HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"error": {"code": "http_error", "message": str(exc.detail), "details": {}}, "request_id": getattr(request.state, "request_id", "")})
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(request: Request, exc: RequestValidationError):
+        return JSONResponse(status_code=422, content={"error": {"code": "validation_error", "message": "请求参数无效", "details": exc.errors()}, "request_id": getattr(request.state, "request_id", "")})
 
     @app.get("/healthz", tags=["system"])
     def healthz():

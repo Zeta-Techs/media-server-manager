@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Generator
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException, Path, status
+from fastapi import Depends, Header, HTTPException, Path, Query, status
 from sqlalchemy import text
 
 from packages.domain.tenancy.context import TenantContext
@@ -21,7 +21,9 @@ def get_request_context(x_request_id: str | None = Header(default=None)) -> Requ
     return RequestContext(request_id=x_request_id)
 
 
-def get_current_claims(authorization: str | None = Header(default=None)) -> dict:
+def get_current_claims(authorization: str | None = Header(default=None), access_token: str | None = Query(default=None)) -> dict:
+    if not authorization and access_token:
+        authorization = f"Bearer {access_token}"
     if not authorization:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing authorization")
     scheme, _, token = authorization.partition(" ")
