@@ -22,33 +22,6 @@ Plex library localization, TMDB sync, and automation.
 - `media-server-manager-web`：WebUI、API、OAuth、Webhook 和 SSE 实时状态
 - `media-server-manager-worker`：任务执行、同服务器串行控制、定时任务、清理和心跳
 
-### 模块化架构（v3 基础）
-
-项目现在同时提供面向后续生产扩展的模块化入口：
-
-- `apps/api`：FastAPI、版本化 `/api/v1` 路由、JWT/OIDC 租户上下文和 RBAC。
-- `apps/worker`：Celery Worker 入口，队列按 Plex I/O、媒体同步、目录同步和通知拆分。
-- `apps/migrator`：Alembic 初始化和 SQLite 到 PostgreSQL 的首批服务器配置迁移工具。
-- `packages/domain`、`packages/application`、`packages/infrastructure`、`packages/integrations`：领域、应用服务、数据库/队列基础设施和外部集成边界。
-- `web`：React + TypeScript + Vite 独立前端骨架，开发服务器将 `/api` 代理到 FastAPI。
-
-本地运行模块化 API：
-
-```bash
-python -m pip install -r requirements.txt
-python -m apps.migrator.main --init
-python -m apps.api
-```
-
-生产环境使用 PostgreSQL、Redis 和 Celery：
-
-```bash
-docker compose -f deploy/compose/docker-compose.modular.yml up --build
-alembic upgrade head
-```
-
-模块化 API 使用共享表加 `tenant_id` 隔离租户；生产 PostgreSQL 迁移会为服务器和任务表启用 Row-Level Security。旧 Flask/SQLite 入口继续保留，用于兼容期和迁移。
-
 两者共享 `/app/config/media_server_manager.db`。SQLite 必须位于同一主机的本地文件系统，不支持把数据库放在 NFS、SMB 或其他网络共享目录中。
 
 ## Docker Compose

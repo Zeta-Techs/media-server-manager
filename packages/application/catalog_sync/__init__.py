@@ -1,1 +1,0 @@
-"""Catalog synchronization application services."""

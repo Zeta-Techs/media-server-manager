@@ -1,1 +1,0 @@
-"""Tenant-scoped repository interfaces."""

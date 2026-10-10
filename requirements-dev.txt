@@ -3,5 +3,4 @@ mypy==1.16.1
 playwright==1.53.0
 pytest==8.4.2
 pytest-cov==6.2.1
-httpx==0.28.1
 ruff==0.12.2

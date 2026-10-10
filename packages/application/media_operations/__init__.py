@@ -1,1 +1,0 @@
-"""Media operation application services."""

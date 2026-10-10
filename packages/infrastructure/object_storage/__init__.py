@@ -1,1 +1,0 @@
-"""Object storage adapters."""

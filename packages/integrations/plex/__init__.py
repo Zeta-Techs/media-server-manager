@@ -1,1 +1,0 @@
-"""Plex integration adapters."""
