@@ -3,8 +3,12 @@ import os
 from waitress import serve
 
 from .app import create_app
+from .db import DB_FILE, init_db
+from .migrations import upgrade_head
 
 if __name__ == "__main__":
+    upgrade_head(DB_FILE)
+    init_db(DB_FILE)
     host = os.environ.get("MSM_WEB_HOST", "0.0.0.0")
     port = int(os.environ.get("MSM_WEB_PORT", "8088"))
     threads = max(2, int(os.environ.get("MSM_WEB_THREADS", "8")))

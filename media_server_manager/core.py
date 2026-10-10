@@ -17,7 +17,16 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-CONFIG_DIR = Path(os.environ.get("MSM_CONFIG_DIR", str(BASE_DIR / "config"))).expanduser()
+# ``MSM_DATA_DIR`` is the canonical runtime location.  The two CONFIG names
+# remain accepted so an existing installation can be migrated without a
+# flag-day change to its service definitions.
+_configured_data_dir = (
+    os.environ.get("MSM_DATA_DIR")
+    or os.environ.get("MSM_CONFIG_DIR")
+    or os.environ.get("MSM_CONFIG_PATH")
+)
+CONFIG_DIR = Path(_configured_data_dir or str(BASE_DIR / "data")).expanduser()
+DATA_DIR = CONFIG_DIR
 TEMPLATE_TAGS_FILE = Path(__file__).resolve().with_name("default_tags.json")
 
 TYPE = {"movie": 1, "show": 2, "artist": 8, "album": 9, "track": 10, "photo": 99}

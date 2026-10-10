@@ -1,26 +1,51 @@
-__pycache__/
+# Python
+**/__pycache__/
 *.py[cod]
 *.egg-info/
+
+# Build and frontend dependencies
 build/
 dist/
+**/dist/
+node_modules/
+**/node_modules/
+
+# Test, type-check and lint output
 .pytest_cache/
 .coverage
 htmlcov/
+coverage.xml
+coverage.json
 .mypy_cache/
 .ruff_cache/
+
+# Runtime data and local deployments
 /config/
+/data/
 /logs/
+/.ci-config/
 /.venv/
 /venv/
 /env/
 *.log
+
+# SQLite databases, WAL sidecars and backups
 *.db
+*.db-*
 *.sqlite
 *.sqlite3
+*.sqlite-*
+*.sqlite3-*
 *.db-wal
 *.db-shm
 *.db-journal
+*.bak
+*.backup
+*.backup-*
+
+# Local environment and OS/editor files
 .env
 .env.*
+!.env.example
 .DS_Store
 Thumbs.db

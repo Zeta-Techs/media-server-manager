@@ -19,7 +19,14 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check .
-      - run: python -m mypy media_server_manager media_server_manager_web media_server_manager_worker media_server_manager_admin
+      - run: python -m mypy --explicit-package-bases src/media_server_manager media_server_manager media_server_manager_web media_server_manager_worker media_server_manager_admin
+      - name: Validate Alembic bootstrap
+        shell: bash
+        run: |
+          rm -rf .ci-config
+          mkdir -p .ci-config
+          MSM_DATA_DIR="$PWD/.ci-config" alembic upgrade head
+          MSM_DATA_DIR="$PWD/.ci-config" alembic upgrade head
       - name: Unit tests and core coverage
         run: >-
           python -m pytest
@@ -85,7 +92,7 @@ jobs:
           mkdir -p .ci-config
           sudo chown 10001:10001 .ci-config
           export MSM_IMAGE=media-server-manager:test
-          export MSM_CONFIG_PATH="$PWD/.ci-config"
+          export MSM_DATA_DIR="$PWD/.ci-config"
           docker compose up -d
           trap 'docker compose logs; docker compose down -v' EXIT
           for _ in $(seq 1 30); do

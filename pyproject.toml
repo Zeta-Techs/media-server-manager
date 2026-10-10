@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=78"]
+requires = ["setuptools>=78", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,10 +9,13 @@ description = "Media server management, TMDB catalog sync, and Plex automation"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "alembic==1.15.2",
+  "cryptography==46.0.6",
   "Flask==3.1.3",
   "croniter==6.0.0",
   "pypinyin==0.55.0",
   "requests==2.32.5",
+  "SQLAlchemy==2.0.40",
   "waitress==3.0.2",
 ]
 
@@ -26,10 +29,15 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["media_server_manager*"]
+where = ["src", "."]
+include = ["media_server_manager*", "media_server_manager_web*", "media_server_manager_worker*", "media_server_manager_admin*"]
+
+[project.scripts]
+msm = "media_server_manager.cli:run_cli"
+msm-admin = "media_server_manager_admin.__main__:main"
 
 [tool.setuptools.package-data]
-media_server_manager = ["default_tags.json"]
+media_server_manager = ["default_tags.json", "seeds/*.json"]
 media_server_manager_web = ["templates/*.html", "static/*.css", "static/*.js", "static/views/*.js"]
 
 [tool.pytest.ini_options]

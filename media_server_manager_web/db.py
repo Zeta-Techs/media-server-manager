@@ -13,7 +13,14 @@ from typing import Any, Dict, Iterator, List, Optional
 from media_server_manager.core import CONFIG_DIR, TEMPLATE_TAGS_FILE, ServerConfig, split_skip_libraries
 
 SCHEMA_VERSION = 5
-DB_FILE = CONFIG_DIR / "media_server_manager.db"
+# Keep the legacy filename when an old CONFIG_DIR deployment is explicitly
+# selected.  New deployments use the canonical SQLite filename under
+# MSM_DATA_DIR; this lets the browser and migration tests continue to exercise
+# their isolated legacy fixtures during the transition.
+_legacy_config_env = bool(
+    os.environ.get("MSM_CONFIG_DIR", "").strip() or os.environ.get("MSM_CONFIG_PATH", "").strip()
+)
+DB_FILE = CONFIG_DIR / ("media_server_manager.db" if _legacy_config_env else "media_server_manager.sqlite3")
 DEFAULT_USERNAME = "admin"
 
 
@@ -82,6 +89,10 @@ def _existing_schema_version(db_file: Path) -> int | None:
             row["name"]
             for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         }
+        # Alembic creates this marker before running the first revision.  It is
+        # not application data and must not be mistaken for an old schema.
+        if tables <= {"alembic_version"}:
+            return None
         if not tables:
             return None
         if "schema_meta" not in tables:

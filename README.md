@@ -22,12 +22,12 @@ Plex library localization, TMDB sync, and automation.
 - `media-server-manager-web`：WebUI、API、OAuth、Webhook 和 SSE 实时状态
 - `media-server-manager-worker`：任务执行、同服务器串行控制、定时任务、清理和心跳
 
-两者共享 `/app/config/media_server_manager.db`。SQLite 必须位于同一主机的本地文件系统，不支持把数据库放在 NFS、SMB 或其他网络共享目录中。
+两者共享 `/app/data/media_server_manager.sqlite3`。SQLite 必须位于同一主机的本地文件系统，不支持把数据库放在 NFS、SMB 或其他网络共享目录中。业务数据保存在数据库，TMDB 图片等大文件位于 `/app/data/cache`，可按数据库中的 `tmdb_images` 元数据重建。
 
 ## Docker Compose
 
 1. 创建本地配置目录，并确保容器用户 UID `10001` 可写。
-2. 修改 [compose.yaml](compose.yaml) 中的默认配置路径，或设置 `MSM_CONFIG_PATH=/本机绝对路径/config`。
+2. 修改 [compose.yaml](compose.yaml) 中的默认数据路径，或设置 `MSM_DATA_DIR=/本机绝对路径/data`。
 3. 启动服务：
 
 ```bash
@@ -39,16 +39,18 @@ docker compose up -d
 
 Media Server Manager 不再提供默认账号或固定会话密钥。首次启动会在 SQLite 数据库的 `settings` 表中生成会话密钥；旧版本配置目录中的 `session_secret` 文件只会在首次启动时导入一次并删除。通过 HTTPS 反向代理访问时设置 `MSM_COOKIE_SECURE=1`。
 
-### v1 升级
+### 旧版本升级
 
-v2 不迁移旧数据库。停止服务后执行：
+停止服务后，先导入旧数据库：
 
 ```bash
-docker compose run --rm media-server-manager-web python -m media_server_manager_admin reset-db --backup
+docker compose run --rm media-server-manager-web \
+  python -m media_server_manager_admin migrate-legacy \
+  --source /app/legacy-config/media_server_manager.db
 docker compose up -d
 ```
 
-旧数据库会重命名为带时间戳的备份文件；服务器、Token、任务和规则需要重新配置。Webhook URL 也必须替换为新格式。
+导入过程不会修改旧数据库，会在 `data/` 中创建带时间戳的备份和导入报告。旧版配置目录中的 `session_secret` 会在首次启动时导入数据库并删除。
 
 ## Python 运行
 
@@ -65,7 +67,7 @@ python3 -m media_server_manager_web
 python3 -m media_server_manager_worker
 ```
 
-配置目录默认为仓库中的 `config`，可通过 `MSM_CONFIG_DIR` 指向其他本地目录。
+数据目录默认为仓库中的 `data`，可通过 `MSM_DATA_DIR` 指向其他本地目录。`MSM_CONFIG_DIR` 和 `MSM_CONFIG_PATH` 仅作为迁移期间的兼容别名。
 
 ## CLI
 
@@ -88,7 +90,7 @@ python3 -m media_server_manager --all --enqueue-only
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MSM_CONFIG_DIR` | `./config` | 数据库和可重建缓存目录 |
+| `MSM_DATA_DIR` | `./data` | 数据库、备份和可重建缓存目录 |
 | `MSM_WEB_HOST` | `0.0.0.0` | Web 服务监听地址 |
 | `MSM_WEB_PORT` | `8088` | Web 服务监听端口 |
 | `MSM_WEB_THREADS` | `8` | Web 服务线程数 |
@@ -99,7 +101,7 @@ python3 -m media_server_manager --all --enqueue-only
 | `MSM_WEBHOOK_RETENTION_DAYS` | `30` | Webhook 事件保留天数 |
 | `MSM_COOKIE_SECURE` | `0` | HTTPS 反向代理后设置为 `1` |
 | `MSM_SECRET_KEY` | 自动生成 | 可选的外部会话密钥覆盖 |
-| `MSM_CONFIG_PATH` | Compose 默认路径 | Docker Compose 配置目录 |
+| `MSM_CONFIG_PATH` | 已弃用 | 旧版 Docker Compose 配置目录别名 |
 | `MSM_IMAGE` | `media-server-manager:latest` | Docker Compose 镜像 |
 | `MSM_E2E` | 未设置 | 设置为 `1` 后运行浏览器端到端测试 |
 
@@ -111,10 +113,13 @@ Worker 每 5 秒写入心跳。WebUI 超过 15 秒未收到心跳会显示 Worke
 python3 -m pip install -r requirements-dev.txt
 python3 -m pytest
 ruff check .
-mypy media_server_manager media_server_manager_web media_server_manager_worker media_server_manager_admin
+mypy src/media_server_manager media_server_manager media_server_manager_web media_server_manager_worker media_server_manager_admin
+MSM_DATA_DIR=./data alembic upgrade head
 ```
 
 核心测试覆盖首次设置、CSRF、登录限速、Token 脱敏、Webhook 密钥、音乐库事件、标准 Cron、精确预览、冲突回滚和 Worker 公平调度。
+
+新代码按 `src/media_server_manager` 的 API、应用服务、领域和基础设施层组织。旧版入口包在迁移期间保留兼容。数据库结构由 Alembic 管理，首次迁移会接管现有 schema，旧数据库可使用 `migrate-legacy` 导入到 `MSM_DATA_DIR`。
 
 ## 注意事项
 

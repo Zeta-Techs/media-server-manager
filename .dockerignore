@@ -6,5 +6,16 @@
 __pycache__
 *.pyc
 config/*
+data/*
+logs
+*.db
+*.db-*
+*.sqlite*
+node_modules
+web/node_modules
+web/dist
+.env
+.env.*
+!.env.example
 tests
 requirements-dev.txt

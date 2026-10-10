@@ -5,6 +5,7 @@ import os
 import sys
 
 from media_server_manager_web.db import DB_FILE, init_db
+from media_server_manager_web.migrations import upgrade_head
 
 from .worker import Worker, worker_is_healthy
 
@@ -15,6 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.healthcheck:
         return 0 if worker_is_healthy(DB_FILE) else 1
+    upgrade_head(DB_FILE)
     init_db(DB_FILE)
     concurrency = max(1, int(os.environ.get("MSM_WORKER_CONCURRENCY", "2")))
     Worker(DB_FILE, concurrency=concurrency).run()

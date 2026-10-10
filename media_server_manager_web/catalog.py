@@ -76,7 +76,12 @@ def resolve_plex_rating_key(db_file: Path, server_id: int, library_id: int, rati
 
 
 def _cache_root() -> Path:
-    root = Path(os.environ.get("MSM_CONFIG_DIR", "config")) / "media_cache" / "tmdb"
+    root = Path(
+        os.environ.get("MSM_DATA_DIR")
+        or os.environ.get("MSM_CONFIG_DIR")
+        or os.environ.get("MSM_CONFIG_PATH")
+        or "data"
+    ) / "cache" / "tmdb"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

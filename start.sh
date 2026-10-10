@@ -2,7 +2,7 @@
 
 umask 077
 
-mkdir -p /app/config
+mkdir -p "${MSM_DATA_DIR:-/app/data}"
 
 # 运行 Python 脚本
 exec "$@"

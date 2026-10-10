@@ -11,7 +11,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app
-RUN mkdir -p /app/config \
+RUN mkdir -p /app/data \
     && chown -R msm:msm /app \
     && chmod +x /app/start.sh
 

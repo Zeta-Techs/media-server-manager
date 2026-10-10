@@ -4,11 +4,12 @@ x-msm-common: &msm-common
   image: ${MSM_IMAGE:-media-server-manager:latest}
   environment:
     TZ: Asia/Shanghai
+    MSM_DATA_DIR: /app/data
     MSM_TIMEZONE: Asia/Shanghai
     MSM_WORKER_CONCURRENCY: "2"
     MSM_ITEM_WORKERS: "4"
   volumes:
-    - ${MSM_CONFIG_PATH:-/自定义目录/media-server-manager/config}:/app/config
+    - ${MSM_DATA_DIR:-/自定义目录/media-server-manager/data}:/app/data
   restart: unless-stopped
 
 services:
