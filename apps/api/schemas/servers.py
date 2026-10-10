@@ -10,17 +10,6 @@ class ServerCreate(BaseModel):
     address: str = Field(min_length=1, max_length=1000)
     token: str = Field(min_length=1, max_length=1000)
     enabled: bool = True
-    pinyin_mode: str = "first_letter"
-    skip_libraries: str = ""
-
-
-class ServerUpdate(BaseModel):
-    name: str | None = Field(default=None, max_length=200)
-    address: str | None = Field(default=None, max_length=1000)
-    token: str | None = Field(default=None, max_length=1000)
-    enabled: bool | None = None
-    pinyin_mode: str | None = None
-    skip_libraries: str | None = None
 
 
 class ServerRead(BaseModel):
@@ -30,5 +19,3 @@ class ServerRead(BaseModel):
     address: str
     enabled: bool
     token_configured: bool
-    pinyin_mode: str
-    auth_source: str

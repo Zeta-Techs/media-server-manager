@@ -1,58 +1,38 @@
 name: media-server-manager
 
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: media_server_manager
-      POSTGRES_USER: msm
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
-    volumes: ["postgres-data:/var/lib/postgresql/data"]
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U msm -d media_server_manager"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes: ["redis-data:/data"]
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-  api:
-    build: {context: ., dockerfile: deploy/docker/Dockerfile.modular}
-    environment:
-      MSM_DATABASE_URL: postgresql+psycopg://msm:${POSTGRES_PASSWORD:-change-me}@postgres:5432/media_server_manager
-      MSM_REDIS_URL: redis://redis:6379/0
-      MSM_ENVIRONMENT: production
-    depends_on:
-      postgres: {condition: service_healthy}
-      redis: {condition: service_healthy}
-    ports: ["8080:8080"]
-  worker:
-    build: {context: ., dockerfile: deploy/docker/Dockerfile.modular}
-    command: celery -A apps.worker.main:celery_app worker --loglevel=INFO --queues=plex_io,media_sync,catalog_sync,notifications,maintenance,webhook
-    environment:
-      MSM_DATABASE_URL: postgresql+psycopg://msm:${POSTGRES_PASSWORD:-change-me}@postgres:5432/media_server_manager
-      MSM_REDIS_URL: redis://redis:6379/0
-      MSM_ENVIRONMENT: production
-    depends_on:
-      postgres: {condition: service_healthy}
-      redis: {condition: service_healthy}
-  beat:
-    build: {context: ., dockerfile: deploy/docker/Dockerfile.modular}
-    command: python -m apps.scheduler.main
-    environment:
-      MSM_DATABASE_URL: postgresql+psycopg://msm:${POSTGRES_PASSWORD:-change-me}@postgres:5432/media_server_manager
-      MSM_REDIS_URL: redis://redis:6379/0
-      MSM_ENVIRONMENT: production
-    depends_on:
-      postgres: {condition: service_healthy}
-      redis: {condition: service_healthy}
+x-msm-common: &msm-common
+  image: ${MSM_IMAGE:-media-server-manager:latest}
+  environment:
+    TZ: Asia/Shanghai
+    MSM_TIMEZONE: Asia/Shanghai
+    MSM_WORKER_CONCURRENCY: "2"
+    MSM_ITEM_WORKERS: "4"
+  volumes:
+    - ${MSM_CONFIG_PATH:-/自定义目录/media-server-manager/config}:/app/config
+  restart: unless-stopped
 
-volumes:
-  postgres-data:
-  redis-data:
+services:
+  media-server-manager-web:
+    <<: *msm-common
+    container_name: media-server-manager-web
+    command: python -m media_server_manager_web
+    ports:
+      - "8088:8088"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8088/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  media-server-manager-worker:
+    <<: *msm-common
+    container_name: media-server-manager-worker
+    command: python -m media_server_manager_worker
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "-m", "media_server_manager_worker", "--healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

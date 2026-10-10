@@ -10,9 +10,6 @@ from .worker import Worker, worker_is_healthy
 
 
 def main(argv: list[str] | None = None) -> int:
-    if os.environ.get("MSM_ENABLE_LEGACY_RUNTIME") != "1":
-        print("Legacy SQLite Worker is disabled. Start Celery with apps.worker.main:celery_app.", file=sys.stderr)
-        return 2
     parser = argparse.ArgumentParser(description="Media Server Manager 持久任务 Worker")
     parser.add_argument("--healthcheck", action="store_true")
     args = parser.parse_args(argv)

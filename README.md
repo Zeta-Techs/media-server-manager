@@ -17,7 +17,10 @@ Plex library localization, TMDB sync, and automation.
 
 ## 架构
 
-默认部署使用 FastAPI API、React 前端、PostgreSQL、Redis、Celery Worker 和 Celery Beat。旧 Flask Web 与 SQLite Worker 仅保留为迁移参考，默认不会接受流量或启动。
+默认部署包含两个进程：
+
+- `media-server-manager-web`：WebUI、API、OAuth、Webhook 和 SSE 实时状态
+- `media-server-manager-worker`：任务执行、同服务器串行控制、定时任务、清理和心跳
 
 ### 模块化架构（v3 基础）
 
@@ -44,14 +47,9 @@ docker compose -f deploy/compose/docker-compose.modular.yml up --build
 alembic upgrade head
 ```
 
-模块化 API 使用共享表加 `tenant_id` 隔离租户；生产 PostgreSQL 迁移会为服务器、任务、日志、事件和 outbox 表启用 Row-Level Security。任务创建先提交 PostgreSQL，再由 outbox dispatcher 投递到 Celery；Redis 暂时不可用时任务保持 queued。
+模块化 API 使用共享表加 `tenant_id` 隔离租户；生产 PostgreSQL 迁移会为服务器和任务表启用 Row-Level Security。旧 Flask/SQLite 入口继续保留，用于兼容期和迁移。
 
-生产环境不共享 SQLite 文件。SQLite 只用于迁移输入和本地开发；迁移命令支持 dry-run 和记录数校验：
-
-```bash
-python -m apps.migrator.main --sqlite /path/to/media_server_manager.db \
-  --tenant-slug default --tenant-name "Default Tenant" --verify
-```
+两者共享 `/app/config/media_server_manager.db`。SQLite 必须位于同一主机的本地文件系统，不支持把数据库放在 NFS、SMB 或其他网络共享目录中。
 
 ## Docker Compose
 
@@ -79,20 +77,19 @@ docker compose up -d
 
 旧数据库会重命名为带时间戳的备份文件；服务器、Token、任务和规则需要重新配置。Webhook URL 也必须替换为新格式。
 
-## Python 运行（开发）
+## Python 运行
 
 需要 Python 3.11 或更高版本：
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 -m apps.migrator.main --init
-python3 -m apps.api
+python3 -m media_server_manager_web
 ```
 
-在另一个终端启动 Celery Worker：
+在另一个终端启动 Worker：
 
 ```bash
-celery -A apps.worker.main:celery_app worker --loglevel=INFO --queues=plex_io,media_sync,catalog_sync,notifications,maintenance,webhook
+python3 -m media_server_manager_worker
 ```
 
 配置目录默认为仓库中的 `config`，可通过 `MSM_CONFIG_DIR` 指向其他本地目录。
@@ -102,14 +99,14 @@ celery -A apps.worker.main:celery_app worker --loglevel=INFO --queues=plex_io,me
 CLI 使用 WebUI 的同一数据库和 Worker，不再读取 `config.ini`：
 
 ```bash
-# 为指定租户的所有启用服务器入队并等待完成
-python3 -m media_server_manager --all --tenant-id <tenant-uuid>
+# 为所有启用服务器入队并等待完成
+python3 -m media_server_manager --all
 
 # 只处理指定服务器
-python3 -m media_server_manager --all --tenant-id <tenant-uuid> --server-id 1
+python3 -m media_server_manager --all --server-id 1
 
 # 仅入队，不等待 Worker
-python3 -m media_server_manager --all --tenant-id <tenant-uuid> --enqueue-only
+python3 -m media_server_manager --all --enqueue-only
 ```
 
 `media-server-manager.py` 是命令行入口。独立的 `--new` 模式已删除，新增项目统一由 WebUI 的带密钥 Webhook 接收。

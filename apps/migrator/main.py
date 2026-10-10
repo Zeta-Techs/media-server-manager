@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-import uuid
 from pathlib import Path
 
 from sqlalchemy import text
@@ -11,19 +10,40 @@ from sqlalchemy import text
 from packages.infrastructure.db.session import engine
 
 DDL = """
-CREATE TABLE IF NOT EXISTS tenants (id TEXT PRIMARY KEY, slug VARCHAR(100) NOT NULL UNIQUE, name VARCHAR(200) NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'active', plan VARCHAR(64) NOT NULL DEFAULT 'standard', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS users_v2 (id TEXT PRIMARY KEY, oidc_subject VARCHAR(255) NOT NULL UNIQUE, email VARCHAR(320) NOT NULL DEFAULT '', display_name VARCHAR(200) NOT NULL DEFAULT '', status VARCHAR(32) NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS tenant_memberships (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users_v2(id) ON DELETE CASCADE, role VARCHAR(64) NOT NULL DEFAULT 'viewer', status VARCHAR(32) NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(tenant_id, user_id));
+CREATE TABLE IF NOT EXISTS tenants (
+  id TEXT PRIMARY KEY, slug VARCHAR(100) NOT NULL UNIQUE, name VARCHAR(200) NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'active', plan VARCHAR(64) NOT NULL DEFAULT 'standard',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS users_v2 (
+  id TEXT PRIMARY KEY, oidc_subject VARCHAR(255) NOT NULL UNIQUE, email VARCHAR(320) NOT NULL DEFAULT '',
+  display_name VARCHAR(200) NOT NULL DEFAULT '', status VARCHAR(32) NOT NULL DEFAULT 'active',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS tenant_memberships (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  user_id TEXT NOT NULL REFERENCES users_v2(id) ON DELETE CASCADE, role VARCHAR(64) NOT NULL DEFAULT 'viewer',
+  status VARCHAR(32) NOT NULL DEFAULT 'active', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(tenant_id, user_id)
+);
 CREATE TABLE IF NOT EXISTS roles (id TEXT PRIMARY KEY, name VARCHAR(64) NOT NULL UNIQUE, scope VARCHAR(32) NOT NULL DEFAULT 'tenant');
 CREATE TABLE IF NOT EXISTS permissions (id TEXT PRIMARY KEY, name VARCHAR(128) NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS role_permissions (role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE, permission_id TEXT NOT NULL REFERENCES permissions(id) ON DELETE CASCADE, PRIMARY KEY(role_id, permission_id));
 CREATE TABLE IF NOT EXISTS refresh_tokens (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users_v2(id) ON DELETE CASCADE, token_hash VARCHAR(128) NOT NULL UNIQUE, device_name VARCHAR(200) NOT NULL DEFAULT '', expires_at TIMESTAMP NOT NULL, revoked_at TIMESTAMP, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS msm_servers (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, name VARCHAR(200) NOT NULL, address TEXT NOT NULL, token TEXT NOT NULL, webhook_secret TEXT NOT NULL DEFAULT '', skip_libraries TEXT NOT NULL DEFAULT '', pinyin_mode VARCHAR(32) NOT NULL DEFAULT 'first_letter', auth_source VARCHAR(32) NOT NULL DEFAULT 'manual', enabled BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(tenant_id, name));
-CREATE TABLE IF NOT EXISTS msm_jobs (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, type VARCHAR(100) NOT NULL, server_id INTEGER REFERENCES msm_servers(id) ON DELETE SET NULL, retry_of TEXT REFERENCES msm_jobs(id) ON DELETE SET NULL, status VARCHAR(32) NOT NULL DEFAULT 'queued', payload TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '{}', request_id VARCHAR(128) NOT NULL DEFAULT '', started_at TIMESTAMP, finished_at TIMESTAMP, cancel_requested_at TIMESTAMP, idempotency_key VARCHAR(255), created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(tenant_id, idempotency_key));
+CREATE TABLE IF NOT EXISTS msm_servers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  name VARCHAR(200) NOT NULL, address TEXT NOT NULL, token TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(tenant_id, name)
+);
+CREATE TABLE IF NOT EXISTS msm_jobs (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  type VARCHAR(100) NOT NULL, server_id INTEGER REFERENCES msm_servers(id) ON DELETE SET NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'queued', payload TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '',
+  idempotency_key VARCHAR(255), created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(tenant_id, idempotency_key)
+);
 CREATE INDEX IF NOT EXISTS ix_msm_jobs_tenant_status ON msm_jobs(tenant_id, status, created_at);
-CREATE TABLE IF NOT EXISTS msm_job_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, job_id TEXT NOT NULL REFERENCES msm_jobs(id) ON DELETE CASCADE, message TEXT NOT NULL, level VARCHAR(16) NOT NULL DEFAULT 'info', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS msm_job_events (id INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, job_id TEXT NOT NULL REFERENCES msm_jobs(id) ON DELETE CASCADE, event_type VARCHAR(64) NOT NULL, request_id VARCHAR(128) NOT NULL DEFAULT '', payload TEXT NOT NULL DEFAULT '{}', created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS msm_job_dispatch_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE, job_id TEXT NOT NULL UNIQUE REFERENCES msm_jobs(id) ON DELETE CASCADE, queue VARCHAR(64) NOT NULL, status VARCHAR(32) NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '', next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, dispatched_at TIMESTAMP);
 """
 
 
@@ -35,89 +55,26 @@ def initialize() -> None:
         for statement in ddl.split(";\n"):
             if statement.strip():
                 connection.execute(text(statement))
-        if engine.dialect.name == "sqlite":
-            columns = {row[1] for row in connection.execute(text("PRAGMA table_info(msm_jobs)"))}
-            if "retry_of" not in columns:
-                connection.execute(text("ALTER TABLE msm_jobs ADD COLUMN retry_of TEXT"))
 
 
-def _value(row: sqlite3.Row, key: str, default=None):
-    return row[key] if key in row.keys() else default
-
-
-def _legacy_uuid(kind: str, value: object, tenant_id: str) -> str:
-    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"msm-legacy-{kind}:{value}:{tenant_id}"))
-
-
-def import_sqlite(path: Path, slug: str, name: str, *, dry_run: bool = False, verify: bool = False) -> dict[str, object]:
-    if not dry_run:
-        initialize()
+def import_sqlite(path: Path, slug: str, name: str) -> dict[str, int | str]:
+    initialize()
     source = sqlite3.connect(path)
     source.row_factory = sqlite3.Row
-    tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    tenant_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"msm-tenant:{slug}"))
-    users = list(source.execute("SELECT * FROM users")) if "users" in tables else []
-    servers = list(source.execute("SELECT * FROM servers")) if "servers" in tables else []
-    jobs = list(source.execute("SELECT * FROM jobs")) if "jobs" in tables else []
-    logs = list(source.execute("SELECT * FROM job_logs ORDER BY id")) if "job_logs" in tables else []
-    counts = {key: {"source": len(rows), "imported": 0, "skipped": 0, "errors": 0} for key, rows in (("users", users), ("servers", servers), ("jobs", jobs), ("job_logs", logs))}
-    server_id_map: dict[int, int] = {}
-    job_id_map: dict[int, str] = {}
-    if not dry_run:
-        with engine.begin() as target:
-            target.execute(text("INSERT INTO tenants (id, slug, name) VALUES (:id, :slug, :name) ON CONFLICT (slug) DO NOTHING"), {"id": tenant_id, "slug": slug, "name": name})
-            for row in users:
-                username = str(_value(row, "username", "legacy-user"))
-                user_id = _legacy_uuid("user", username, tenant_id)
-                result = target.execute(text("INSERT INTO users_v2 (id, oidc_subject, email, display_name) VALUES (:id, :subject, :email, :display_name) ON CONFLICT (oidc_subject) DO NOTHING"), {"id": user_id, "subject": username, "email": str(_value(row, "email", "") or ""), "display_name": str(_value(row, "display_name", username) or username)})
-                counts["users"]["imported"] += int(result.rowcount or 0)
-                counts["users"]["skipped"] += int(result.rowcount == 0)
-                target.execute(text("INSERT INTO tenant_memberships (id, tenant_id, user_id, role) VALUES (:id, :tenant_id, :user_id, 'tenant_admin') ON CONFLICT (tenant_id, user_id) DO NOTHING"), {"id": _legacy_uuid("membership", username, tenant_id), "tenant_id": tenant_id, "user_id": user_id})
-            for row in servers:
-                values = dict(row)
-                legacy_id = int(values["id"])
-                params = {"tenant_id": tenant_id, "name": values.get("name") or "Plex Server", "address": values.get("address") or "", "token": values.get("token") or "", "webhook_secret": values.get("webhook_secret") or uuid.uuid5(uuid.NAMESPACE_URL, f"webhook:{legacy_id}:{tenant_id}").hex, "skip_libraries": values.get("skip_libraries") or "", "pinyin_mode": values.get("pinyin_mode") or "first_letter", "auth_source": values.get("auth_source") or "manual", "enabled": values.get("enabled", 1)}
-                result = target.execute(text("INSERT INTO msm_servers (tenant_id, name, address, token, webhook_secret, skip_libraries, pinyin_mode, auth_source, enabled) VALUES (:tenant_id, :name, :address, :token, :webhook_secret, :skip_libraries, :pinyin_mode, :auth_source, :enabled) ON CONFLICT (tenant_id, name) DO NOTHING"), params)
-                counts["servers"]["imported"] += int(result.rowcount or 0)
-                counts["servers"]["skipped"] += int(result.rowcount == 0)
-                server_id_map[legacy_id] = int(target.execute(text("SELECT id FROM msm_servers WHERE tenant_id=:tenant_id AND name=:name"), params).scalar())
-            for row in jobs:
-                values = dict(row)
-                legacy_id = int(values["id"])
-                job_id = _legacy_uuid("job", legacy_id, tenant_id)
-                job_id_map[legacy_id] = job_id
-                state = values.get("status") or "queued"
-                state = "interrupted" if state == "running" else state
-                if state not in {"queued", "dispatching", "running", "cancelling", "succeeded", "failed", "cancelled", "interrupted"}:
-                    state = "interrupted"
-                old_retry = _value(row, "retry_of")
-                result = target.execute(text("INSERT INTO msm_jobs (id, tenant_id, type, server_id, retry_of, status, payload, error, result, request_id, started_at, finished_at, cancel_requested_at, created_at) VALUES (:id, :tenant_id, :type, :server_id, :retry_of, :status, :payload, :error, :result, :request_id, :started_at, :finished_at, :cancel_requested_at, :created_at) ON CONFLICT (id) DO NOTHING"), {"id": job_id, "tenant_id": tenant_id, "type": values.get("type") or "unknown", "server_id": server_id_map.get(int(values["server_id"])) if values.get("server_id") is not None else None, "retry_of": job_id_map.get(int(old_retry)) if old_retry is not None else None, "status": state, "payload": values.get("payload") or "{}", "error": values.get("error") or ("Worker migration interrupted" if state == "interrupted" else ""), "result": values.get("result") or "{}", "request_id": values.get("request_id") or "migration", "started_at": values.get("started_at"), "finished_at": values.get("finished_at"), "cancel_requested_at": values.get("cancel_requested_at"), "created_at": values.get("created_at")})
-                counts["jobs"]["imported"] += int(result.rowcount or 0)
-                counts["jobs"]["skipped"] += int(result.rowcount == 0)
-            for row in jobs:
-                values = dict(row)
-                old_retry = _value(row, "retry_of")
-                if old_retry is not None and int(old_retry) in job_id_map:
-                    target.execute(text("UPDATE msm_jobs SET retry_of=:retry_of WHERE id=:id"), {"id": job_id_map[int(values["id"])], "retry_of": job_id_map[int(old_retry)]})
-            for row in logs:
-                values = dict(row)
-                mapped_job = job_id_map.get(int(values.get("job_id")))
-                if not mapped_job:
-                    counts["job_logs"]["skipped"] += 1
-                    continue
-                log_params = {"tenant_id": tenant_id, "job_id": mapped_job, "message": str(values.get("message") or ""), "level": str(_value(row, "level", "info") or "info"), "created_at": values.get("created_at")}
-                result = target.execute(text("INSERT INTO msm_job_logs (tenant_id, job_id, message, level, created_at) SELECT :tenant_id, :job_id, :message, :level, :created_at WHERE NOT EXISTS (SELECT 1 FROM msm_job_logs WHERE tenant_id=:tenant_id AND job_id=:job_id AND message=:message AND level=:level AND created_at=:created_at)"), log_params)
-                counts["job_logs"]["imported"] += int(result.rowcount or 0)
-                counts["job_logs"]["skipped"] += int(result.rowcount == 0)
+    with engine.begin() as target:
+        tenant_id = target.execute(text("SELECT id FROM tenants WHERE slug=:slug"), {"slug": slug}).scalar()
+        if not tenant_id:
+            import uuid
+            tenant_id = str(uuid.uuid4())
+            target.execute(text("INSERT INTO tenants (id, slug, name) VALUES (:id, :slug, :name)"), {"id": tenant_id, "slug": slug, "name": name})
+    server_count = 0
+    if "servers" in {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}: 
+        for row in source.execute("SELECT name, address, token, enabled FROM servers"):
+            with engine.begin() as target:
+                target.execute(text("INSERT INTO msm_servers (tenant_id, name, address, token, enabled) VALUES (:tenant_id, :name, :address, :token, :enabled) ON CONFLICT DO NOTHING"), {"tenant_id": tenant_id, **dict(row)})
+            server_count += 1
     source.close()
-    result: dict[str, object] = {"tenant_id": tenant_id, "dry_run": dry_run, "users": len(users), "servers": len(servers), "jobs": len(jobs), "job_logs": len(logs), "counts": counts}
-    if verify and not dry_run:
-        with engine.begin() as target:
-            result["target_servers"] = int(target.execute(text("SELECT COUNT(*) FROM msm_servers WHERE tenant_id=:tenant_id"), {"tenant_id": tenant_id}).scalar() or 0)
-            result["target_jobs"] = int(target.execute(text("SELECT COUNT(*) FROM msm_jobs WHERE tenant_id=:tenant_id"), {"tenant_id": tenant_id}).scalar() or 0)
-            result["target_job_logs"] = int(target.execute(text("SELECT COUNT(*) FROM msm_job_logs WHERE tenant_id=:tenant_id"), {"tenant_id": tenant_id}).scalar() or 0)
-        result["verified"] = result["target_servers"] == len(servers) and result["target_jobs"] == len(jobs) and result["target_job_logs"] == len(logs)
-    return result
+    return {"tenant_id": tenant_id, "servers": server_count}
 
 
 def main() -> None:
@@ -126,14 +83,12 @@ def main() -> None:
     parser.add_argument("--sqlite", type=Path)
     parser.add_argument("--tenant-slug", default="default")
     parser.add_argument("--tenant-name", default="Default Tenant")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--verify", action="store_true")
     args = parser.parse_args()
     if args.init:
         initialize()
         print(json.dumps({"initialized": True}))
     elif args.sqlite:
-        print(json.dumps(import_sqlite(args.sqlite, args.tenant_slug, args.tenant_name, dry_run=args.dry_run, verify=args.verify), ensure_ascii=False))
+        print(json.dumps(import_sqlite(args.sqlite, args.tenant_slug, args.tenant_name)))
     else:
         parser.error("choose --init or --sqlite")
 
