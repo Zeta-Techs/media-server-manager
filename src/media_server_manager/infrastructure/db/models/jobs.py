@@ -16,10 +16,19 @@ class Job(Base):
     server_id: Mapped[int] = mapped_column(ForeignKey("servers.id", ondelete="CASCADE"), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     stage: Mapped[str] = mapped_column(String(100), nullable=False, default="")
+    current_library: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    changes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    errors: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     payload: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     error: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    worker_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    retry_of: Mapped[int | None] = mapped_column(ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(nullable=False)
+    claimed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
 
 
@@ -52,7 +61,9 @@ class Schedule(Base):
     schedule_value: Mapped[str] = mapped_column(Text, nullable=False)
     payload: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
     enabled: Mapped[bool] = mapped_column(nullable=False, default=True)
-    next_run_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    last_run_at: Mapped[datetime | None] = mapped_column(nullable=True)
-    created_at: Mapped[datetime] = mapped_column(nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(nullable=False)
+    # Legacy SQLite stores schedule timestamps as ISO text; retain that wire
+    # format while the rest of the application uses UTC strings consistently.
+    next_run_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_run_at: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[str] = mapped_column(Text, nullable=False)

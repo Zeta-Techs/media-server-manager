@@ -46,11 +46,14 @@ Media Server Manager 不再提供默认账号或固定会话密钥。首次启�
 ```bash
 docker compose run --rm media-server-manager-web \
   python -m media_server_manager_admin migrate-legacy \
-  --source /app/legacy-config/media_server_manager.db
+  --source /app/legacy-config/media_server_manager.db \
+  --destination /app/data/media_server_manager.sqlite3 \
+  --encryption-key-file /app/secrets/msm.key \
+  --report /app/data/backups/migration-report.json
 docker compose up -d
 ```
 
-导入过程不会修改旧数据库，会在 `data/` 中创建带时间戳的备份和导入报告。旧版配置目录中的 `session_secret` 会在首次启动时导入数据库并删除。
+导入过程以只读方式打开旧数据库，按表导入并校验行数、外键和 SQLite 完整性；源数据库不会被修改。目标数据库已存在时命令会拒绝覆盖。先用 `backup-db` 创建一致性备份，再执行迁移。旧版配置目录中的 `session_secret` 会在首次启动时导入数据库并删除。
 
 ## Python 运行
 
@@ -71,20 +74,30 @@ python3 -m media_server_manager_worker
 
 ## CLI
 
-CLI 使用 WebUI 的同一数据库和 Worker，不再读取 `config.ini`：
+安装后优先使用标准入口 `msm` 和 `msm-admin`。CLI 使用 WebUI 的同一数据库和 Worker，不再读取 `config.ini`：
 
 ```bash
 # 为所有启用服务器入队并等待完成
-python3 -m media_server_manager --all
+msm --all
 
 # 只处理指定服务器
-python3 -m media_server_manager --all --server-id 1
+msm --all --server-id 1
 
 # 仅入队，不等待 Worker
-python3 -m media_server_manager --all --enqueue-only
+msm --all --enqueue-only
 ```
 
-`media-server-manager.py` 是命令行入口。独立的 `--new` 模式已删除，新增项目统一由 WebUI 的带密钥 Webhook 接收。
+管理员命令通过 `msm-admin` 执行数据库升级、旧库导入、备份恢复、完整性检查和密钥轮换：
+
+```bash
+msm-admin upgrade-db
+msm-admin migrate-legacy --source ./config/media_server_manager.db --destination ./data/media_server_manager.sqlite3
+msm-admin backup-db
+msm-admin check-db
+msm-admin rotate-secrets --old-key-file old.key --new-key-file new.key
+```
+
+`python -m media_server_manager_admin`、`python -m media_server_manager_web` 和 `python -m media_server_manager_worker` 仍作为兼容入口；`media-server-manager.py` 也继续转发到 `msm`。独立的 `--new` 模式已删除，新增项目统一由 WebUI 的带密钥 Webhook 接收。
 
 ## 环境变量
 
@@ -100,8 +113,10 @@ python3 -m media_server_manager --all --enqueue-only
 | `MSM_JOB_RETENTION_DAYS` | `90` | 已结束任务保留天数 |
 | `MSM_WEBHOOK_RETENTION_DAYS` | `30` | Webhook 事件保留天数 |
 | `MSM_COOKIE_SECURE` | `0` | HTTPS 反向代理后设置为 `1` |
+| `MSM_LOCAL_ENCRYPTION_KEY` | 无 | 生产环境必填，用于加密 Token、Webhook 和外部凭据 |
 | `MSM_SECRET_KEY` | 自动生成 | 可选的外部会话密钥覆盖 |
 | `MSM_CONFIG_PATH` | 已弃用 | 旧版 Docker Compose 配置目录别名 |
+| `MSM_CONFIG_DIR` | 已弃用 | 旧版配置目录别名；迁移周期结束后移除 |
 | `MSM_IMAGE` | `media-server-manager:latest` | Docker Compose 镜像 |
 | `MSM_E2E` | 未设置 | 设置为 `1` 后运行浏览器端到端测试 |
 
@@ -113,13 +128,27 @@ Worker 每 5 秒写入心跳。WebUI 超过 15 秒未收到心跳会显示 Worke
 python3 -m pip install -r requirements-dev.txt
 python3 -m pytest
 ruff check .
-mypy src/media_server_manager media_server_manager media_server_manager_web media_server_manager_worker media_server_manager_admin
+python3 -m mypy --explicit-package-bases src media_server_manager_web media_server_manager_worker media_server_manager_admin --ignore-missing-imports
 MSM_DATA_DIR=./data alembic upgrade head
+python3 scripts/check_schema.py
+python3 scripts/check_architecture.py
+python3 -m media_server_manager_admin check-db
+python3 -m media_server_manager_admin backup-db
+python3 -m media_server_manager_admin restore-db --source ./data/backups/media_server_manager-YYYYMMDD-HHMMSS.sqlite3
+```
+
+敏感字段密钥轮换使用一次性事务完成，旧值无法解密时会回滚：
+
+```bash
+python3 -m media_server_manager_admin rotate-secrets \
+  --old-key-file old.key --new-key-file new.key
 ```
 
 核心测试覆盖首次设置、CSRF、登录限速、Token 脱敏、Webhook 密钥、音乐库事件、标准 Cron、精确预览、冲突回滚和 Worker 公平调度。
 
 新代码按 `src/media_server_manager` 的 API、应用服务、领域和基础设施层组织。旧版入口包在迁移期间保留兼容。数据库结构由 Alembic 管理，首次迁移会接管现有 schema，旧数据库可使用 `migrate-legacy` 导入到 `MSM_DATA_DIR`。
+
+完整的停机迁移、密钥轮换、备份和恢复步骤见 [`docs/migration.md`](docs/migration.md)。
 
 ## 注意事项
 

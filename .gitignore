@@ -24,6 +24,7 @@ coverage.json
 /data/
 /logs/
 /.ci-config/
+/media_cache/
 /.venv/
 /venv/
 /env/
@@ -39,6 +40,8 @@ coverage.json
 *.db-wal
 *.db-shm
 *.db-journal
+*.migration-complete.json
+*.restore-tmp
 *.bak
 *.backup
 *.backup-*

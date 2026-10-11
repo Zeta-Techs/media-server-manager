@@ -4,8 +4,11 @@ import argparse
 import sys
 import time
 
-from media_server_manager_web.db import DB_FILE, connect, init_db
-from media_server_manager_web.services import TERMINAL_JOB_STATUSES, JobQueue
+from media_server_manager.application.job_orchestration.queue import TERMINAL_JOB_STATUSES, JobQueue
+from media_server_manager.application.server_management.service import ServerManagementService
+from media_server_manager.config import settings
+from media_server_manager.infrastructure.db.runtime import init_db
+from media_server_manager.infrastructure.db.session import Database
 
 
 def run_cli(argv: list[str] | None = None) -> int:
@@ -18,21 +21,17 @@ def run_cli(argv: list[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    init_db(DB_FILE)
-    queue = JobQueue(DB_FILE)
+    database = settings.database_path
+    init_db(database)
+    queue = JobQueue(database)
     if not args.enqueue_only and not queue.worker_status()["online"]:
         print("任务 Worker 离线；请先启动 media-server-manager-worker，或使用 --enqueue-only。", file=sys.stderr)
         return 2
 
-    with connect(DB_FILE) as db:
-        if args.server_id:
-            placeholders = ",".join("?" for _ in args.server_id)
-            rows = db.execute(
-                f"SELECT id, name FROM servers WHERE enabled = 1 AND id IN ({placeholders}) ORDER BY id",
-                args.server_id,
-            ).fetchall()
-        else:
-            rows = db.execute("SELECT id, name FROM servers WHERE enabled = 1 ORDER BY id").fetchall()
+    with Database.for_path(database).session() as db:
+        servers = ServerManagementService(db).enabled_servers()
+        selected = set(args.server_id or [])
+        rows = [server for server in servers if not selected or server.id in selected]
     if not rows:
         print("没有找到启用的 Plex 服务器。", file=sys.stderr)
         return 1
@@ -40,9 +39,9 @@ def run_cli(argv: list[str] | None = None) -> int:
     scope = {"fields": ["titleSort", "genre", "style", "mood", "collections"]}
     job_ids = []
     for row in rows:
-        job_id = queue.create_job("localize", int(row["id"]), {"mode": "apply", "scope": scope})
+        job_id = queue.create_job("localize", int(row.id), {"mode": "apply", "scope": scope})
         job_ids.append(job_id)
-        print(f"已为 {row['name']} 创建任务 #{job_id}")
+        print(f"已为 {row.name} 创建任务 #{job_id}")
     if args.enqueue_only:
         return 0
 

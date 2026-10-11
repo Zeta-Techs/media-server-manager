@@ -1,1 +1,1 @@
-"""External service adapters."""
+"""External service integrations."""

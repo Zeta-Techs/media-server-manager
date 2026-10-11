@@ -43,4 +43,6 @@ class Setting(Base):
     __tablename__ = "settings"
 
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
-    value: Mapped[str] = mapped_column(Text, nullable=False)
+    # Settings contains API keys, session material, and integration secrets.
+    # EncryptedText keeps legacy plaintext readable while encrypting writes.
+    value: Mapped[str] = mapped_column(EncryptedText, nullable=False)

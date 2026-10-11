@@ -36,6 +36,11 @@ class Settings:
     timezone: str
     cookie_secure: bool
     encryption_key: str
+    environment: str = "development"
+    item_workers: int = 4
+    worker_concurrency: int = 2
+    job_retention_days: int = 90
+    webhook_retention_days: int = 30
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +57,11 @@ class Settings:
             timezone=os.environ.get("MSM_TIMEZONE", "Asia/Shanghai"),
             cookie_secure=os.environ.get("MSM_COOKIE_SECURE", "0") == "1",
             encryption_key=os.environ.get("MSM_LOCAL_ENCRYPTION_KEY", ""),
+            environment=os.environ.get("MSM_ENV", "development").strip().lower(),
+            item_workers=max(1, int(os.environ.get("MSM_ITEM_WORKERS", "4"))),
+            worker_concurrency=max(1, int(os.environ.get("MSM_WORKER_CONCURRENCY", "2"))),
+            job_retention_days=max(1, int(os.environ.get("MSM_JOB_RETENTION_DAYS", "90"))),
+            webhook_retention_days=max(1, int(os.environ.get("MSM_WEBHOOK_RETENTION_DAYS", "30"))),
         )
 
     @property
@@ -61,9 +71,20 @@ class Settings:
         return Path(self.database_url.removeprefix("sqlite:///"))
 
     def ensure_directories(self) -> None:
+        if self.environment in {"production", "prod"} and not self.encryption_key.strip():
+            raise RuntimeError("生产环境必须配置 MSM_LOCAL_ENCRYPTION_KEY")
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "cache" / "tmdb").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "backups").mkdir(parents=True, exist_ok=True)
+        # SQLite contains credentials and account data.  Tighten permissions
+        # whenever an existing database is opened; newly created files are
+        # created by SQLite under the process umask and are tightened by the
+        # database bootstrap immediately afterwards.
+        if self.database_url.startswith("sqlite:///"):
+            database = self.database_path
+            database.parent.mkdir(parents=True, exist_ok=True)
+            if database.exists():
+                database.chmod(0o600)
 
 
 settings = Settings.from_env()

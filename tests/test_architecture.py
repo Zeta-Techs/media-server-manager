@@ -12,7 +12,7 @@ from media_server_manager_web.db import init_db
 from src.media_server_manager.infrastructure.db.models import Server
 from src.media_server_manager.infrastructure.db.session import Base
 from src.media_server_manager.infrastructure.security import SecretBox
-from src.media_server_manager.infrastructure.storage.backup import backup_sqlite
+from src.media_server_manager.infrastructure.storage.backup import backup_sqlite, restore_sqlite
 
 
 def test_secret_box_round_trip_and_legacy_passthrough() -> None:
@@ -57,6 +57,27 @@ def test_sqlite_backup_is_consistent(tmp_path: Path) -> None:
     with sqlite3.connect(backup) as db:
         assert db.execute("SELECT value FROM settings WHERE key='test'").fetchone()[0] == "value"
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+
+
+def test_sqlite_restore_keeps_safety_backup(tmp_path: Path) -> None:
+    source = tmp_path / "source.sqlite3"
+    restored = tmp_path / "restored.sqlite3"
+    init_db(source)
+    with sqlite3.connect(source) as db:
+        db.execute("INSERT INTO settings(key, value) VALUES ('restore_source', 'yes')")
+        db.commit()
+    backup = backup_sqlite(source, tmp_path / "backups")
+    init_db(restored)
+    db = sqlite3.connect(restored)
+    try:
+        db.execute("INSERT INTO settings(key, value) VALUES ('old_value', 'keep-in-backup')")
+        db.commit()
+    finally:
+        db.close()
+    previous = restore_sqlite(backup, restored)
+    assert previous is not None and previous.exists()
+    with sqlite3.connect(restored) as db:
+        assert db.execute("SELECT value FROM settings WHERE key='restore_source'").fetchone()[0] == "yes"
 
 
 def test_legacy_migration_preserves_business_rows(tmp_path: Path) -> None:

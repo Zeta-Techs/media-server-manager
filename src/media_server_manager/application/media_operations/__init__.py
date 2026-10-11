@@ -1,1 +1,1 @@
-"""Media operation use cases."""
+"""Media-library application operations."""

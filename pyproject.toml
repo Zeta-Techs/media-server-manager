@@ -29,16 +29,26 @@ dev = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["src", "."]
+where = ["src"]
+# The three legacy names below are packaging-only forwarding shims.  All
+# business implementation lives in the canonical media_server_manager package.
 include = ["media_server_manager*", "media_server_manager_web*", "media_server_manager_worker*", "media_server_manager_admin*"]
 
 [project.scripts]
 msm = "media_server_manager.cli:run_cli"
-msm-admin = "media_server_manager_admin.__main__:main"
+msm-admin = "media_server_manager.cli.admin:main"
+msm-web = "media_server_manager.cli.web:main"
+msm-worker = "media_server_manager.worker.entrypoint:main"
 
 [tool.setuptools.package-data]
-media_server_manager = ["default_tags.json", "seeds/*.json"]
-media_server_manager_web = ["templates/*.html", "static/*.css", "static/*.js", "static/views/*.js"]
+media_server_manager = [
+  "seeds/*.json",
+  "api/templates/*.html",
+  "api/static/*.css",
+  "api/static/*.js",
+  "api/static/*.svg",
+  "api/static/views/*.js",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

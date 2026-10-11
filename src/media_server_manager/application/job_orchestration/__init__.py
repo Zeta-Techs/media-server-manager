@@ -1,1 +1,5 @@
-"""Job orchestration use cases."""
+"""Job orchestration services and task execution adapters."""
+
+from .service import JobExecutionService
+
+__all__ = ["JobExecutionService"]

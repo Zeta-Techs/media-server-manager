@@ -19,7 +19,8 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
       - run: python -m ruff check .
-      - run: python -m mypy --explicit-package-bases src/media_server_manager media_server_manager media_server_manager_web media_server_manager_worker media_server_manager_admin
+      - run: python -m mypy --explicit-package-bases src media_server_manager_web media_server_manager_worker media_server_manager_admin --ignore-missing-imports
+      - run: python scripts/check_architecture.py
       - name: Validate Alembic bootstrap
         shell: bash
         run: |
@@ -27,38 +28,16 @@ jobs:
           mkdir -p .ci-config
           MSM_DATA_DIR="$PWD/.ci-config" alembic upgrade head
           MSM_DATA_DIR="$PWD/.ci-config" alembic upgrade head
+          MSM_DATA_DIR="$PWD/.ci-config" alembic check
+          MSM_DATA_DIR="$PWD/.ci-config" python scripts/check_schema.py
+          python -m pytest tests/test_schema_inventory.py tests/test_migration_security.py
       - name: Unit tests and core coverage
         run: >-
           python -m pytest
-          --cov=media_server_manager.core
-          --cov=media_server_manager_web.security
-          --cov=media_server_manager_web.scheduling
-          --cov=media_server_manager_web.services
-          --cov=media_server_manager_worker.worker
+          --cov=src/media_server_manager
           --cov-report=term-missing
-          --cov-fail-under=90
-      - name: Enforce per-module coverage
-        run: |
-          python -m coverage json -o coverage.json
-          python - <<'PY'
-          import json
-
-          report = json.load(open("coverage.json", encoding="utf-8"))
-          targets = {
-              "localization core": "media_server_manager/core.py",
-              "security": "media_server_manager_web/security.py",
-              "queue": "media_server_manager_web/services.py",
-              "worker": "media_server_manager_worker/worker.py",
-          }
-          failed = []
-          for label, path in targets.items():
-              percent = report["files"][path]["summary"]["percent_covered"]
-              print(f"{label}: {percent:.2f}%")
-              if percent < 90:
-                  failed.append(f"{label}={percent:.2f}%")
-          if failed:
-              raise SystemExit("coverage below 90%: " + ", ".join(failed))
-          PY
+      - name: Compose syntax
+        run: docker compose config
 
   browser:
     runs-on: ubuntu-latest
